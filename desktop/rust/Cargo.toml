@@ -4,7 +4,7 @@ version = "0.4.1"
 edition = "2024"
 rust-version = "1.99"
 publish = false
-description = "Nimbo Windows host shell (checkpoint 1: WebView2 window, policies; no bridge/capture/login/updater)"
+description = "Nimbo Windows host shell (CP1 WebView2 window and policies; CP2 S1 bridge v1 with interim login answer; no capture/login/updater)"
 
 [features]
 # Debug-only isolated loopback test host. build.rs and a compile_error! reject release builds.
