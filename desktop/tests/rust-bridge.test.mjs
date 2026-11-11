@@ -135,6 +135,7 @@ test(LABEL + 'adversarial controls: no reply within 200 ms and the exact fixed c
   await h.expectDrop('bridge-malformed', () => h.sendRaw('{"v":1,'));
   await h.expectDrop('bridge-unknown-method', () => h.send(call(100, { method: 'nimbo:capture:start' })));
   await h.expectDrop('bridge-malformed', () => h.send(call(100, { method: 'nimbo:audio:stop', args: [123] })));
+  // 5 KiB with an extra key (key-shape AND size); the exact size boundary is tested separately.
   await h.expectDrop('bridge-malformed', () => h.send(call(100, { pad: 'x'.repeat(5 * 1024) })));
   await h.expectDrop('bridge-duplicate-hello', () => h.send({ v: 1, kind: 'hello' }));
   h.send(call(200));
@@ -149,6 +150,47 @@ test(LABEL + 'adversarial controls: no reply within 200 ms and the exact fixed c
   h.control('disable bridge-test-disabled');
   await h.expectDrop('bridge-disabled', () => h.send({ v: 1, kind: 'hello' }));
   assert.deepEqual(await h.dump(), { audio_wanted: false, generation: 2, document: 'disabled', last_id: null });
+});
+
+// Tester F1: valid-shaped messages padded with JSON whitespace to an exact byte length, sent as
+// the exact raw text, so ONLY the inbound size limit can reject the 4097-byte copy.
+const padded = (msg, bytes) => {
+  const text = JSON.stringify(msg);
+  const out = text.slice(0, -1) + ' '.repeat(bytes - Buffer.byteLength(text)) + '}';
+  assert.equal(Buffer.byteLength(out), bytes);
+  assert.deepEqual(JSON.parse(out), msg);
+  return out;
+};
+
+test(LABEL + 'inbound limit: valid 4096-byte hello/invoke accepted, 4097-byte copies dropped without reply', async (t) => {
+  const h = await createBridgeHost(t);
+  // Deterministic no-reply check: `flush` is a stdout round trip, so any reply to the raw line
+  // arrives before it resolves; the fixed code (stderr) is awaited separately.
+  const drop = async (code, raw) => {
+    h.control('tick 1000');
+    const replies = h.toPage.length, from = h.codes.length;
+    h.sendRaw(raw);
+    await h.flush();
+    assert.deepEqual(h.toPage.slice(replies), [], 'no reply for ' + code);
+    await h.waitCode(code, from);
+  };
+  const accept = async (raw) => {
+    const replies = h.toPage.length, from = h.codes.length;
+    h.sendRaw(raw);
+    await h.flush();
+    assert.deepEqual(h.codes.slice(from), [], 'no drop code');
+    return h.toPage.slice(replies);
+  };
+  const hello = { v: 1, kind: 'hello' };
+  await drop('bridge-malformed', padded(hello, 4097));
+  await drop('bridge-malformed', JSON.stringify({ v: 1, kind: 'hello', gen: 1 }));
+  assert.deepEqual(await h.dump(), { audio_wanted: false, generation: 1, document: 'awaiting-hello', last_id: null });
+  assert.deepEqual(plain(await accept(padded(hello, 4096))), [{ v: 1, kind: 'ready', gen: 1 }]);
+  const call = { v: 1, kind: 'invoke', id: 5, gen: 1, method: 'nimbo:capture:audio', args: [true] };
+  await drop('bridge-malformed', padded(call, 4097));
+  assert.deepEqual(await h.dump(), { audio_wanted: false, generation: 1, document: 'ready', last_id: 0 });
+  assert.deepEqual(plain(await accept(padded(call, 4096))), [{ v: 1, kind: 'result', id: 5, gen: 1, ok: true }]);
+  assert.deepEqual(await h.dump(), { audio_wanted: true, generation: 1, document: 'ready', last_id: 5 });
 });
 
 test(LABEL + '65 queued before ready and 65 in flight: the 65th is "Ponte ocupada."; timers released', async (t) => {

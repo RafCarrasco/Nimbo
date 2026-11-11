@@ -374,6 +374,122 @@ fn size_and_shape_limits_drop_without_reply() {
     assert_eq!(d.document(), DocumentState::Ready { last_id: 1 });
 }
 
+/// Pads a valid message with insignificant JSON whitespace to exactly `len` bytes: the key
+/// shape stays valid, so only the inbound byte limit can reject it (Tester F1).
+fn padded(msg: &Value, len: usize) -> String {
+    let text = msg.to_string();
+    let body = text.strip_suffix('}').expect("a JSON object");
+    let out = format!("{body}{}}}", " ".repeat(len - text.len()));
+    assert_eq!(out.len(), len);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).expect("valid JSON"),
+        *msg
+    );
+    out
+}
+
+#[test]
+fn inbound_limit_is_exactly_4096_bytes_for_valid_shaped_messages() {
+    assert_eq!(MAX_INBOUND_BYTES, 4096);
+    let hello = json!({"v":1,"kind":"hello"});
+    assert!(parse(&padded(&hello, MAX_INBOUND_BYTES)).is_ok());
+    assert_eq!(
+        parse(&padded(&hello, MAX_INBOUND_BYTES + 1)).err(),
+        Some("bridge-malformed")
+    );
+    let mut d = fresh();
+    let g = d.generation();
+    let attr = top(&d);
+    // 4097 bytes: dropped with the fixed code, no reply, the document stays AwaitingHello.
+    let out = d.receive(&attr, &padded(&hello, MAX_INBOUND_BYTES + 1), now());
+    dropped(&out, "bridge-malformed");
+    assert_eq!(d.document(), DocumentState::AwaitingHello);
+    // Exactly 4096 bytes of the same message: accepted.
+    let out = d.receive(&attr, &padded(&hello, MAX_INBOUND_BYTES), now());
+    assert_eq!(replies(&out), vec![json!({"v":1,"kind":"ready","gen":g})]);
+    assert!(codes(&out).is_empty());
+    // The same boundary for a state-changing invoke.
+    let call = invoke(5, g, "nimbo:capture:audio", json!([true]));
+    let out = d.receive(&attr, &padded(&call, MAX_INBOUND_BYTES + 1), now());
+    dropped(&out, "bridge-malformed");
+    assert_eq!(d.document(), DocumentState::Ready { last_id: 0 });
+    assert!(!d.audio_wanted());
+    let out = d.receive(&attr, &padded(&call, MAX_INBOUND_BYTES), now());
+    assert_eq!(
+        replies(&out),
+        vec![json!({"v":1,"kind":"result","id":5,"gen":g,"ok":true})]
+    );
+    assert!(codes(&out).is_empty());
+    assert_eq!(d.document(), DocumentState::Ready { last_id: 5 });
+    assert!(d.audio_wanted());
+}
+
+/// Tester F3: `hello` has exactly two keys; any extra key is malformed and activates nothing.
+#[test]
+fn hello_with_extra_keys_is_malformed_and_never_activates() {
+    let mut d = fresh();
+    let g = d.generation();
+    let extras = [
+        json!({"v":1,"kind":"hello","gen":1}),
+        json!({"v":1,"kind":"hello","gen":g}),
+        json!({"v":1,"kind":"hello","id":1}),
+        json!({"v":1,"kind":"hello","nonce":"synthetic"}),
+    ];
+    for msg in &extras {
+        dropped(&send(&mut d, msg), "bridge-malformed");
+        assert_eq!(d.document(), DocumentState::AwaitingHello, "{msg}");
+    }
+    dropped(
+        &send(&mut d, &invoke(1, g, "nimbo:audio:start", json!([]))),
+        "bridge-not-ready",
+    );
+    assert_eq!(ready(&mut d), g);
+    // In Ready the same messages are still malformed (not a duplicate hello).
+    for msg in &extras {
+        dropped(&send(&mut d, msg), "bridge-malformed");
+    }
+    assert_eq!(d.document(), DocumentState::Ready { last_id: 0 });
+}
+
+/// Tester F3: a clock that goes backwards must neither re-open the per-window budget nor lose
+/// or double-count suppressed drops.
+#[test]
+fn clock_rollback_never_reopens_the_log_budget_and_accounting_is_exact() {
+    let mut d = fresh();
+    let attr = d.main_frame_request("https://evil.test/");
+    let t0 = 50 * LOG_WINDOW_MS;
+    let mut logged = Vec::new();
+    for _ in 0..1000 {
+        let out = d.receive(&attr, "{}", t0);
+        assert!(replies(&out).is_empty());
+        logged.extend(out);
+    }
+    assert_eq!(
+        logged,
+        vec![Outbound::Code("bridge-unauthorized"); LOG_BUDGET as usize]
+    );
+    let first = 1000 - u64::from(LOG_BUDGET);
+    let earlier = [0, 1, t0 / 2, t0 - LOG_WINDOW_MS, t0 - 1];
+    for i in 0..5000 {
+        let at = earlier[i % earlier.len()];
+        assert_eq!(d.receive(&attr, "{}", at), vec![], "rollback to {at}");
+    }
+    for at in earlier {
+        assert_eq!(d.tick(at), vec![], "tick rollback to {at}");
+    }
+    assert_eq!(d.tick(t0 + LOG_WINDOW_MS - 1), vec![]);
+    // The next forward window reports every suppressed drop exactly once.
+    assert_eq!(
+        d.tick(t0 + LOG_WINDOW_MS),
+        vec![Outbound::Suppressed(first + 5000)]
+    );
+    assert_eq!(d.tick(t0 + LOG_WINDOW_MS), vec![]);
+    assert_eq!(
+        d.receive(&attr, "{}", t0 + LOG_WINDOW_MS),
+        vec![Outbound::Code("bridge-unauthorized")]
+    );
+}
+
 #[test]
 fn generation_is_bounded_to_exact_javascript_integers_without_wrap() {
     let limit = 1u64 << 53;

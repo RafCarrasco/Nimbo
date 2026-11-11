@@ -73,31 +73,87 @@ if (role === 'top') {
 </script>"#;
 const AUTOPLAY_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; media-src blob:; connect-src 'self'; frame-src http://localhost:*";
 
-/// CP2 S1 bridge: the app-origin top page must see `nimboDesktop` and get answers; a
-/// same-origin iframe and a foreign (`localhost`) iframe must see no bridge and get no reply to
-/// messages they post themselves. Results go to /report (values URL-encoded).
+/// CP2 S1 bridge (Tester F2). The host only ever replies to the TOP-LEVEL document, so the
+/// discriminating observer is the top page: it records every `result` id on its own
+/// `chrome.webview` and knows which ids its bridge issued (1, 2, ...). After a real `ready` and
+/// the first answer (which also yields the current `gen`), each iframe (same-origin `/frame`,
+/// foreign `localhost`) is told to post a VALID, fresh, state-changing invoke: current gen,
+/// distinctive high id, `nimbo:capture:audio [true]`, no hello. If the host attributed it to the
+/// main frame it would answer the top page (an unissued result id) and advance `last_id`, so the
+/// next bridge call (id 2) would be a dropped replay. The top page observes the same-origin
+/// iframe directly and the foreign one through a bounded `postMessage` report. Positive control
+/// (last, so legitimate ids stay ordered): the top page posts the same request with id
+/// 4000000100 itself; the observer must see exactly that unissued id. Values are URL-encoded.
 const BRIDGE_PAGE: &str = r#"<!doctype html><meta charset=utf-8><title>bridge</title><body>
 <script>
 const report = (k, x) => fetch('/report?' + k + '=' + encodeURIComponent(x)).catch(() => {});
 const role = location.pathname !== '/frame' ? 'top' : location.hostname === 'localhost' ? 'foreign' : 'same';
+const appOrigin = 'http://127.0.0.1:' + location.port, foreignOrigin = 'http://localhost:' + location.port;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const within = (p, ms) => Promise.race([p, sleep(ms).then(() => 'timeout')]);
+const probe = (gen, id) => ({ v: 1, kind: 'invoke', id, gen, method: 'nimbo:capture:audio', args: [true] });
 report(role + '-bridge', typeof window.nimboDesktop);
-if (role === 'top') {
-  report('top-keys', Object.keys(window.nimboDesktop || {}).sort().join(','));
-  window.nimboDesktop.startAudio().then((r) => report('top-start', JSON.stringify(r)), (e) => report('top-start', 'error ' + e.message));
-  for (const src of ['/frame', 'http://localhost:' + location.port + '/frame']) {
+if (role === 'top') (async () => {
+  const bridge = window.nimboDesktop;
+  report('top-keys', Object.keys(bridge || {}).sort().join(','));
+  if (!bridge || !window.chrome || !window.chrome.webview) return report('top-observer', 'no-bridge');
+  const results = [];
+  let gen = null, issued = 0;
+  window.chrome.webview.addEventListener('message', (e) => {
+    const m = e.data;
+    if (!m || m.kind !== 'result') return;
+    results.push(m.id);
+    if (m.id === 1) gen = m.gen;
+  });
+  const unexpected = () => results.filter((id) => !(id >= 1 && id <= issued));
+  const list = (ids) => ids.join(',') || 'none';
+  const call = () => { issued++; return bridge.startAudio().then((r) => JSON.stringify(r), (e) => 'error ' + e.message); };
+  report('top-start', await within(call(), 5000));
+  report('top-gen', String(gen));
+  if (gen === null) return;
+  const frame = (src) => new Promise((resolve) => {
     const f = document.createElement('iframe');
+    f.onload = () => resolve(f);
     f.src = src;
     document.body.appendChild(f);
+  });
+  const same = await within(frame('/frame'), 10000);
+  const foreign = await within(frame(foreignOrigin + '/frame'), 10000);
+  let samePost = 'timeout', foreignPost = 'timeout';
+  if (same !== 'timeout') {
+    same.contentWindow.postMessage({ probe: { gen, id: 4000000000 } }, appOrigin);
+    for (let i = 0; i < 50 && samePost === 'timeout'; i++) {
+      await sleep(100);
+      samePost = same.contentWindow.nimboProbe || 'timeout';
+    }
   }
-} else if (window.chrome && window.chrome.webview) {
-  let replies = 0;
-  window.chrome.webview.addEventListener('message', () => { replies++; });
-  window.chrome.webview.postMessage({ v: 1, kind: 'hello' });
-  window.chrome.webview.postMessage({ v: 1, kind: 'invoke', id: 1, gen: 1, method: 'nimbo:audio:start', args: [] });
-  setTimeout(() => report(role + '-replies', String(replies)), 1500);
-} else {
-  report(role + '-replies', 'no-webview');
-}
+  if (foreign !== 'timeout') {
+    const answered = new Promise((resolve) => window.addEventListener('message', (e) => {
+      if (e.origin === foreignOrigin && e.source === foreign.contentWindow && e.data && e.data.nimboProbe) resolve(String(e.data.nimboProbe));
+    }));
+    foreign.contentWindow.postMessage({ probe: { gen, id: 4000000001 } }, foreignOrigin);
+    foreignPost = await within(answered, 5000);
+  }
+  report('same-post', samePost);
+  report('foreign-post', foreignPost);
+  await sleep(1500);
+  report('top-unexpected', list(unexpected()));
+  report('top-after', await within(call(), 5000));
+  window.chrome.webview.postMessage(probe(gen, 4000000100));
+  for (let i = 0; i < 50 && !unexpected().length; i++) await sleep(100);
+  report('top-control', list(unexpected()));
+  report('top-results', list(results));
+})();
+else window.addEventListener('message', (e) => {
+  if (e.origin !== appOrigin || e.source !== window.parent || !e.data || !e.data.probe) return;
+  let state = 'no-webview';
+  if (window.chrome && window.chrome.webview) {
+    window.chrome.webview.postMessage(probe(e.data.probe.gen, e.data.probe.id));
+    state = 'sent';
+  }
+  window.nimboProbe = state;
+  if (role === 'foreign') window.parent.postMessage({ nimboProbe: state }, appOrigin);
+});
 </script>"#;
 const BRIDGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-src 'self' http://localhost:*";
 
@@ -682,7 +738,8 @@ fn app_origin_autoplays_without_gesture_foreign_iframe_does_not() -> TestResult<
 }
 
 /// CP2 S1 NATIVE-GATE (user-run on Windows): bridge v1 is present only in the app-origin main
-/// frame; iframes (same-origin and `localhost`) see none and never receive a reply.
+/// frame; iframes (same-origin and `localhost`) see none, and a valid state-changing invoke they
+/// post is never answered to (nor changes the state of) the top-level document; see BRIDGE_PAGE.
 #[test]
 #[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
 fn bridge_present_in_main_frame_absent_in_iframes() -> TestResult<()> {
@@ -702,14 +759,19 @@ fn bridge_present_in_main_frame_absent_in_iframes() -> TestResult<()> {
     let top = wait_until("top bridge", || report("top-bridge"))?;
     let keys = wait_until("top keys", || report("top-keys"))?;
     let start = wait_until("top startAudio", || report("top-start"))?;
+    let generation = wait_until("top generation", || report("top-gen"))?;
     let same = wait_until("same-origin iframe bridge", || report("same-bridge"))?;
     let foreign = wait_until("foreign iframe bridge", || report("foreign-bridge"))?;
-    let same_replies = wait_until("same-origin iframe replies", || report("same-replies"))?;
-    let foreign_replies = wait_until("foreign iframe replies", || report("foreign-replies"))?;
+    let same_post = wait_until("same-origin iframe probe", || report("same-post"))?;
+    let foreign_post = wait_until("foreign iframe probe", || report("foreign-post"))?;
+    let unexpected = wait_until("top observer after iframes", || report("top-unexpected"))?;
+    let after = wait_until("top call after iframes", || report("top-after"))?;
+    let control = wait_until("positive control", || report("top-control"))?;
+    let results = wait_until("top result ids", || report("top-results"))?;
     let log = events(&dir);
     println!("EVENTS_LOG_BEGIN\n{log}EVENTS_LOG_END");
     println!(
-        "BRIDGE_RESULTS top={top} start={start} same={same} foreign={foreign} same_replies={same_replies} foreign_replies={foreign_replies}"
+        "BRIDGE_RESULTS top={top} start={start} gen={generation} same={same} foreign={foreign} same_post={same_post} foreign_post={foreign_post} unexpected={unexpected} after={after} control={control} results={results}"
     );
     assert_eq!(top, "object");
     assert_eq!(
@@ -717,15 +779,44 @@ fn bridge_present_in_main_frame_absent_in_iframes() -> TestResult<()> {
         "cancelSignIn,installUpdate,onAudio,onGameEnded,onGameState,onUpdateProgress,setCaptureAudio,signIn,startAudio,startGameWatch,stopAudio,stopGameWatch,version,watchUpdate"
     );
     assert_eq!(start, r#"{"ok":true,"value":null}"#);
+    assert!(
+        generation.parse::<u64>().is_ok_and(|g| g >= 1),
+        "{generation}"
+    );
     assert_eq!(same, "undefined", "no bridge in a same-origin iframe");
     assert_eq!(foreign, "undefined", "no bridge in a foreign iframe");
-    for replies in [&same_replies, &foreign_replies] {
+    // Each iframe really posted the valid probe, or has no chrome.webview at all (then nothing
+    // can be attributed); a probe that was never attempted fails the test.
+    for post in [&same_post, &foreign_post] {
         assert!(
-            replies == "0" || replies == "no-webview",
-            "iframe got a reply: {replies}"
+            post == "sent" || post == "no-webview",
+            "iframe probe: {post}"
         );
     }
-    assert!(!log.contains("bridge-frame-id-unavailable"));
+    // Discriminating observation at the top level: no unissued result id, and the next bridge
+    // id (2) was still fresh, i.e. `last_id` did not jump to an iframe's 4000000000/1.
+    assert_eq!(unexpected, "none", "an iframe message was answered");
+    assert_eq!(
+        after, r#"{"ok":true,"value":null}"#,
+        "state changed by an iframe"
+    );
+    // Positive control: the same valid request from the top document IS observed.
+    assert_eq!(control, "4000000100", "observer must see an accepted probe");
+    assert_eq!(results, "1,2,4000000100");
+    // A message posted from an iframe yields `bridge-unauthorized` or nothing; every other
+    // drop code would mean an iframe message reached the main-frame dispatcher.
+    for code in [
+        "bridge-frame-id-unavailable",
+        "bridge-replayed-id",
+        "bridge-stale",
+        "bridge-malformed",
+        "bridge-not-ready",
+        "bridge-disabled",
+        "bridge-duplicate-hello",
+        "bridge-unknown-method",
+    ] {
+        assert!(!log.contains(code), "unexpected {code}");
+    }
     // SAFETY: test-owned child window.
     unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
     let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
