@@ -194,11 +194,13 @@ fn shell_permission_matrix_is_app_origin_only() {
     let c = Config::release();
     let app = "https://golive-ad118.web.app/room";
     // Electron ALLOWED_PERMISSIONS minus display-capture (native picker not proven yet).
+    // Plus explicit WebView2 AUTOPLAY (user decision CP1-F3-autoplay: Electron parity).
     for p in [
         Permission::Camera,
         Permission::Microphone,
         Permission::Fullscreen,
         Permission::SanitizedClipboardWrite,
+        Permission::Autoplay,
     ] {
         assert_eq!(c.shell_permission(app, app, p), PermissionDecision::Allow);
         for (top, requester) in [
@@ -223,6 +225,210 @@ fn shell_permission_matrix_is_app_origin_only() {
         Permission::Other,
     ] {
         assert_eq!(c.shell_permission(app, app, p), PermissionDecision::Deny);
+    }
+}
+
+// ---- CP1-F3-autoplay (resolved user decision: keep Electron automatic sound, app origin only) ----
+
+#[test]
+fn autoplay_is_allowed_only_for_app_top_level_and_app_requester() {
+    let c = Config::release();
+    let app = "https://golive-ad118.web.app/live/abc";
+    for (top, requester) in [
+        (HOSTED_URL, HOSTED_URL),
+        (app, app),
+        (HOSTED_URL, "https://GOLIVE-AD118.web.app:443/x"),
+    ] {
+        assert_eq!(
+            c.shell_permission(top, requester, Permission::Autoplay),
+            PermissionDecision::Allow,
+            "{top} {requester}"
+        );
+    }
+    let foreign = [
+        "https://evil.test/",
+        "https://golive-ad118.web.app.evil.test/",
+        "https://sub.golive-ad118.web.app/",
+        "http://golive-ad118.web.app/",
+        "https://golive-ad118.web.app:444/",
+        "https://user@golive-ad118.web.app/",
+        "wss://golive-ad118.web.app/",
+        "blob:https://golive-ad118.web.app/0f0e",
+        "data:text/html,x",
+        "javascript:play()",
+        "file:///c:/x.html",
+        "about:blank",
+        "about:srcdoc",
+        "null",
+        "",
+        " https://golive-ad118.web.app/",
+    ];
+    for other in foreign {
+        // Foreign/iframe/opaque requester inside the app document.
+        assert_eq!(
+            c.shell_permission(app, other, Permission::Autoplay),
+            PermissionDecision::Deny,
+            "requester {other:?}"
+        );
+        // App-origin requester but a foreign or stale top-level document.
+        assert_eq!(
+            c.shell_permission(other, app, Permission::Autoplay),
+            PermissionDecision::Deny,
+            "top {other:?}"
+        );
+        assert_eq!(
+            c.shell_permission(other, other, Permission::Autoplay),
+            PermissionDecision::Deny,
+            "both {other:?}"
+        );
+    }
+    // The app origin is the configured one: a loopback test origin is not the release origin.
+    let t = Config::for_test("http://127.0.0.1:4173/").expect("test config");
+    let local = "http://127.0.0.1:4173/";
+    assert_eq!(
+        t.shell_permission(local, local, Permission::Autoplay),
+        PermissionDecision::Allow
+    );
+    for (top, requester) in [
+        (local, "http://localhost:4173/frame"),
+        (local, "http://127.0.0.1:4174/"),
+        (local, HOSTED_URL),
+        (HOSTED_URL, HOSTED_URL),
+    ] {
+        assert_eq!(
+            t.shell_permission(top, requester, Permission::Autoplay),
+            PermissionDecision::Deny,
+            "{top} {requester}"
+        );
+    }
+}
+
+#[test]
+fn autoplay_does_not_widen_other_permissions_or_capture() {
+    let c = Config::release();
+    for p in [
+        Permission::Other,
+        Permission::DisplayCapture,
+        Permission::ClipboardRead,
+    ] {
+        assert_eq!(
+            c.shell_permission(HOSTED_URL, HOSTED_URL, p),
+            PermissionDecision::Deny,
+            "{p:?}"
+        );
+    }
+    assert_eq!(c.screen_capture(), CaptureDecision::NativeCancel);
+    // Camera/microphone keep their existing app-origin rule; no foreign grant appears.
+    for p in [Permission::Camera, Permission::Microphone] {
+        assert_eq!(
+            c.shell_permission(HOSTED_URL, "https://evil.test/", p),
+            PermissionDecision::Deny
+        );
+    }
+    // The native-request (bridge) authorization matrix is unchanged: autoplay is not a command
+    // permission there.
+    assert!(!c.permission(&main_frame(), 1, Permission::Autoplay));
+    // No process-wide relaxation: the Electron switches stay exact, no --autoplay-policy.
+    assert!(!BROWSER_ARGUMENTS.contains("autoplay"));
+}
+
+#[test]
+fn webview2_permission_kind_mapping_is_explicit() {
+    use nimbo_desktop::policy::webview2_permission_kind as k;
+    // COREWEBVIEW2_PERMISSION_KIND numeric values (WebView2 SDK, pinned webview2-com-sys 0.39.1).
+    assert_eq!(
+        (k::MICROPHONE, k::CAMERA, k::CLIPBOARD_READ, k::AUTOPLAY),
+        (1, 2, 6, 9)
+    );
+    let named = [
+        (k::MICROPHONE, "Microphone"),
+        (k::CAMERA, "Camera"),
+        (k::CLIPBOARD_READ, "ClipboardRead"),
+        (k::AUTOPLAY, "Autoplay"),
+    ];
+    for (kind, name) in named {
+        assert_eq!(format!("{:?}", webview2_permission(kind)), name);
+    }
+    // UNKNOWN(0), GEOLOCATION(3), NOTIFICATIONS(4), OTHER_SENSORS(5), MULTIPLE_AUTOMATIC_DOWNLOADS(7),
+    // FILE_READ_WRITE(8), LOCAL_FONTS(10), MIDI_SYSEX(11), WINDOW_MANAGEMENT(12),
+    // PERSISTENT_STORAGE(13) and any future/invalid value stay Other => DENY.
+    for kind in [0, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, -1, i32::MIN, i32::MAX] {
+        let p = webview2_permission(kind);
+        assert!(matches!(p, Permission::Other), "{kind} -> {p:?}");
+        assert_eq!(
+            Config::release().shell_permission(HOSTED_URL, HOSTED_URL, p),
+            PermissionDecision::Deny
+        );
+    }
+    // Exhaustive (no wildcard): a new Permission variant must be classified here first.
+    for p in [
+        Permission::Camera,
+        Permission::Microphone,
+        Permission::Fullscreen,
+        Permission::SanitizedClipboardWrite,
+        Permission::DisplayCapture,
+        Permission::ClipboardRead,
+        Permission::Autoplay,
+        Permission::Other,
+    ] {
+        let native_kind = match p {
+            Permission::Camera => Some(k::CAMERA),
+            Permission::Microphone => Some(k::MICROPHONE),
+            Permission::ClipboardRead => Some(k::CLIPBOARD_READ),
+            Permission::Autoplay => Some(k::AUTOPLAY),
+            // Not WebView2 PermissionRequested kinds (fullscreen/clipboard-write/display
+            // capture use other WebView2 surfaces); Other is the deny bucket.
+            Permission::Fullscreen
+            | Permission::SanitizedClipboardWrite
+            | Permission::DisplayCapture
+            | Permission::Other => None,
+        };
+        if let Some(kind) = native_kind {
+            assert_eq!(format!("{:?}", webview2_permission(kind)), format!("{p:?}"));
+        }
+    }
+}
+
+#[test]
+fn host_maps_webview2_kinds_through_the_portable_table() {
+    // SOURCE WIRING check only (not runtime proof): host.rs delegates to the portable mapping and
+    // const-asserts every distinguished binding value, so a renamed/renumbered kind fails to build.
+    let src: String = include_str!("../src/shell/windows/host.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        src.contains("webview2_permission(kind.0)"),
+        "host must use the portable mapping"
+    );
+    for (binding, portable) in [
+        ("COREWEBVIEW2_PERMISSION_KIND_MICROPHONE.0", "MICROPHONE"),
+        ("COREWEBVIEW2_PERMISSION_KIND_CAMERA.0", "CAMERA"),
+        (
+            "COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ.0",
+            "CLIPBOARD_READ",
+        ),
+        ("COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY.0", "AUTOPLAY"),
+    ] {
+        assert!(
+            src.contains(&format!(
+                "assert!({binding}==webview2_permission_kind::{portable})"
+            )),
+            "missing const assertion for {binding}"
+        );
+    }
+    assert!(
+        !src.contains("_=>Permission::Other"),
+        "no host-local wildcard mapping"
+    );
+    assert!(!src.contains("autoplay-policy"));
+    // The decision is still written with SavesInProfile(false) and an explicit ALLOW/DENY.
+    for needle in [
+        "SetSavesInProfile(false)",
+        "PermissionDecision::Allow=>COREWEBVIEW2_PERMISSION_STATE_ALLOW",
+        "PermissionDecision::Deny=>COREWEBVIEW2_PERMISSION_STATE_DENY",
+    ] {
+        assert!(src.contains(needle), "{needle}");
     }
 }
 

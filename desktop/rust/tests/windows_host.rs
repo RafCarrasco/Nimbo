@@ -46,6 +46,33 @@ document.addEventListener('click', () => {
 });
 </script>"#;
 
+const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'";
+
+/// CP1-F3-autoplay: NO click. The top document (app origin) plays locally synthesized silent PCM
+/// (blob:, no network media) and embeds the same page from `localhost` (a different origin than
+/// the 127.0.0.1 app origin) as the foreign-iframe negative control. Results go to /report.
+const AUTOPLAY_PAGE: &str = r#"<!doctype html><meta charset=utf-8><title>autoplay</title><body>
+<script>
+const report = (k, x) => fetch('/report?' + k + '=' + encodeURIComponent(x)).catch(() => {});
+const role = location.pathname === '/frame' ? 'frame' : 'top';
+const n = 4000, buf = new ArrayBuffer(44 + n * 2), d = new DataView(buf);
+const tag = (o, t) => { for (let i = 0; i < t.length; i++) d.setUint8(o + i, t.charCodeAt(i)); };
+tag(0, 'RIFF'); d.setUint32(4, 36 + n * 2, true); tag(8, 'WAVE'); tag(12, 'fmt ');
+d.setUint32(16, 16, true); d.setUint16(20, 1, true); d.setUint16(22, 1, true);
+d.setUint32(24, 8000, true); d.setUint32(28, 16000, true); d.setUint16(32, 2, true);
+d.setUint16(34, 16, true); tag(36, 'data'); d.setUint32(40, n * 2, true);
+report(role + '-activation', navigator.userActivation ? String(navigator.userActivation.hasBeenActive) : 'unsupported');
+const audio = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+audio.muted = false;
+audio.play().then(() => report(role + '-play', 'played'), (e) => report(role + '-play', e.name));
+if (role === 'top') {
+  const f = document.createElement('iframe');
+  f.src = 'http://localhost:' + location.port + '/frame';
+  document.body.appendChild(f);
+}
+</script>"#;
+const AUTOPLAY_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; media-src blob:; connect-src 'self'; frame-src http://localhost:*";
+
 struct Fixture {
     url: String,
     log: Arc<Mutex<Vec<String>>>,
@@ -54,6 +81,10 @@ struct Fixture {
 }
 impl Fixture {
     fn start() -> std::io::Result<Self> {
+        Self::serve(PAGE, CSP)
+    }
+    /// Serves `page` at `/` (and `/frame`, used only by the autoplay page) with `csp`.
+    fn serve(page: &'static str, csp: &'static str) -> std::io::Result<Self> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         let url = format!("http://127.0.0.1:{}/", listener.local_addr()?.port());
         listener.set_nonblocking(true)?;
@@ -78,15 +109,15 @@ impl Fixture {
                         if let Ok(mut log) = sink.lock() {
                             log.push(format!("{path} UA={ua}"));
                         }
-                        let (status, body) = if path == "/" {
-                            ("200 OK", PAGE)
+                        let (status, body) = if path == "/" || path == "/frame" {
+                            ("200 OK", page)
                         } else if path.starts_with("/report?") {
                             ("204 No Content", "")
                         } else {
                             ("404 Not Found", "")
                         };
                         let response = format!(
-                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/html\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/html\r\nContent-Security-Policy: {csp}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                         let _ = socket.write_all(response.as_bytes());
@@ -459,5 +490,60 @@ fn startup_failure_discards_quit_before_reporting() -> TestResult<()> {
     drop(fixture);
     remove_scratch(&dir);
     println!("STARTUP_FAILURE_REPORT_OK pid={pid}");
+    Ok(())
+}
+
+/// CP1-F3-autoplay (user decision: Electron parity). With NO user input, the app-origin page's
+/// unmuted `audio.play()` of silent synthetic PCM must resolve, while a foreign-origin iframe
+/// (localhost vs the 127.0.0.1 app origin, no `allow=autoplay`) must not gain playback. Proves
+/// the policy on this WebView2 Runtime only; real live sound stays an operator check (row 32).
+#[test]
+#[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
+fn app_origin_autoplays_without_gesture_foreign_iframe_does_not() -> TestResult<()> {
+    let dir = owned_scratch("nimbo-autoplay")?;
+    let fixture = Fixture::serve(AUTOPLAY_PAGE, AUTOPLAY_CSP)?;
+    let mut app = App(launch(&fixture, &dir)?);
+    let pid = app.0.id();
+    let main = wait_until("main window", || main_window(pid))?;
+    let report = |key: &str| {
+        let prefix = format!("/report?{key}=");
+        fixture.requests().iter().find_map(|r| {
+            r.strip_prefix(&prefix)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_owned)
+        })
+    };
+    let top_activation = wait_until("top activation report", || report("top-activation"))?;
+    let top = wait_until("top play result", || report("top-play"))?;
+    let frame = wait_until("frame play result", || report("frame-play"))?;
+    let log = events(&dir);
+    println!("EVENTS_LOG_BEGIN\n{log}EVENTS_LOG_END");
+    println!(
+        "AUTOPLAY_RESULTS top_activation={top_activation} top={top} frame={frame} permission_event_allow={} permission_event_deny={}",
+        log.contains("permission Autoplay Allow"),
+        log.contains("permission Autoplay Deny")
+    );
+    assert_ne!(
+        top_activation, "true",
+        "no user gesture may precede the play"
+    );
+    assert_eq!(
+        top, "played",
+        "AUTOPLAY_RUNTIME_GATE: app-origin play() without gesture was rejected ({top}); \
+         the app-origin AUTOPLAY ALLOW alone is insufficient on this runtime: coordinator decision"
+    );
+    assert_ne!(
+        frame, "played",
+        "a foreign-origin iframe must not gain autoplay"
+    );
+    assert!(!log.contains("permission Other Allow"));
+    // SAFETY: test-owned child window.
+    unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
+    let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    assert!(exit.success());
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
+    println!("AUTOPLAY_APP_ORIGIN_OK pid={pid}");
     Ok(())
 }

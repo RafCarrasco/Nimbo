@@ -203,7 +203,8 @@ impl Config {
     }
     /// WebView2 PermissionRequested decision (main.cjs:662-678). Both the current top-level
     /// document and the requesting origin must be the app origin; never a WebView2 prompt.
-    /// `display-capture` stays denied until the native picker is proven.
+    /// `display-capture` stays denied until the native picker is proven. `Autoplay` is allowed
+    /// under the same app-origin rule (CP1-F3-autoplay); no process-wide autoplay switch.
     pub fn shell_permission(
         &self,
         top_level: &str,
@@ -216,6 +217,7 @@ impl Config {
                 | Permission::Microphone
                 | Permission::Fullscreen
                 | Permission::SanitizedClipboardWrite
+                | Permission::Autoplay
         );
         if allowed_kind
             && self.navigation(top_level) == Navigation::Allow
@@ -251,5 +253,31 @@ pub enum Permission {
     SanitizedClipboardWrite,
     DisplayCapture,
     ClipboardRead,
+    /// WebView2 AUTOPLAY: `<audio>/<video>` autoplay/`play()` and Web Audio `start()` without a
+    /// user gesture. Allowed for the app origin only (user decision CP1-F3-autoplay: Electron's
+    /// `autoplayPolicy: no-user-gesture-required` parity for live sound).
+    Autoplay,
     Other,
+}
+
+/// `COREWEBVIEW2_PERMISSION_KIND` values the shell distinguishes (WebView2 SDK enum; pinned
+/// webview2-com-sys 0.39.1 bindings.rs:571-597). The Windows host const-asserts each one
+/// against the bindings, so the portable mapping below is the single source of truth.
+pub mod webview2_permission_kind {
+    pub const MICROPHONE: i32 = 1;
+    pub const CAMERA: i32 = 2;
+    pub const CLIPBOARD_READ: i32 = 6;
+    pub const AUTOPLAY: i32 = 9;
+}
+/// Every other kind (unknown, geolocation, notifications, sensors, downloads, files, fonts,
+/// MIDI, window management, storage, future values) is `Other` and therefore denied.
+pub fn webview2_permission(kind: i32) -> Permission {
+    use webview2_permission_kind as k;
+    match kind {
+        k::CAMERA => Permission::Camera,
+        k::MICROPHONE => Permission::Microphone,
+        k::CLIPBOARD_READ => Permission::ClipboardRead,
+        k::AUTOPLAY => Permission::Autoplay,
+        _ => Permission::Other,
+    }
 }

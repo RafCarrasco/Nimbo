@@ -81,7 +81,7 @@ resolved in either direction, and the Rust code is not changed to "match" withou
 | 29 | Mouse back/forward buttons (XButton1/XButton2) | same, with a 5-button mouse | | WebView2 default history navigation, not handled by the host; decide | | |
 | 30 | Ctrl+S | on the login screen | | WebView2 default (not handled by the host; may open a save-page dialog); decide | | |
 | 31 | Ctrl+Shift+R | on the login screen | | reload once (same handler as Ctrl+R; Shift ignored, like Electron's `key.toLowerCase()==='r'`); normal reload, not a cache bypass | | |
-| 32 | Autoplay with sound (live tile audio without a prior click) | needs a signed-in live view: NOT testable at CP1 without login; CARRY FORWARD to the live checkpoint. Electron's documented default is `autoplayPolicy: no-user-gesture-required` (not overridden in `desktop/main.cjs`, not part of its permission handler); record what is actually heard | | PENDING USER DECISION `CP1-F3-autoplay` (parity vs explicit gesture), not accepted either way. Current code, unchanged in this cycle: the WebView2 AUTOPLAY permission kind maps to `Permission::Other` and is explicitly DENIED; no `--autoplay-policy` switch. `src/components/LiveTile.tsx` mutes the tile on `NotAllowedError` | | expected difference from the documented Electron default until decided; not a hardening |
+| 32 | Autoplay with sound (live tile audio without a prior click) | needs a signed-in live view: NOT testable at CP1 without login; CARRY FORWARD to the live checkpoint. Electron's documented default is `autoplayPolicy: no-user-gesture-required` (not overridden in `desktop/main.cjs`, not part of its permission handler); record what is actually heard, and whether the tile starts muted | | USER DECISION RESOLVED `CP1-F3-autoplay` = parity ("Sim"): automatic live sound like Electron, no extra click. Rust intent: the WebView2 AUTOPLAY permission kind (9) maps to `Permission::Autoplay` and is ALLOWED only when the top-level document AND the requesting origin are both the app origin (same rule as camera/microphone); foreign/iframe/opaque/other-port/http origins and every other kind stay DENIED; `SavesInProfile(false)`; NO `--autoplay-policy` switch. Policy unit-tested only; runtime behavior NOT VERIFIED (see autoplay gate below). `src/components/LiveTile.tsx` mutes the tile on `NotAllowedError`, so a muted tile is a FAIL | | parity intended; NOT an observed Windows PASS until both the autoplay host test and this row are recorded |
 
 ## Automated interactive host test (test-host build, loopback fixture only)
 
@@ -110,6 +110,26 @@ The same command also runs the two startup-lifecycle regressions from review cor
   `fatal-dialog webview2-unavailable` recorded in that order. The test host records the dialog
   path instead of showing it, so this does not prove the real MessageBox stays visible (row 26 and
   F1 operator check below).
+
+It also runs the autoplay policy regression (own fresh `nimbo-autoplay-<pid>` directory):
+
+- `app_origin_autoplays_without_gesture_foreign_iframe_does_not` (row 32, user decision
+  `CP1-F3-autoplay`): no input is sent. The 127.0.0.1 app page calls unmuted `audio.play()` on
+  locally synthesized silent PCM (`blob:`, no network media) and embeds the same page from
+  `localhost` (a foreign origin) without `allow="autoplay"`. Pass line `AUTOPLAY_APP_ORIGIN_OK`:
+  `top_activation` not `true`, `top=played`, `frame` not `played`, no `permission Other Allow`.
+  Record the printed `AUTOPLAY_RESULTS` line (including whether `permission Autoplay Allow/Deny`
+  events were raised) and the `events.log`. A failure with `AUTOPLAY_RUNTIME_GATE` means the
+  app-origin ALLOW alone does not enable no-gesture playback on that WebView2 Runtime: report it
+  to the coordinator; do not add `--autoplay-policy` or any other process-wide relaxation without a
+  new decision (it would also apply to foreign documents).
+
+## Autoplay operator gate (row 32, RELEASE build, after login is available)
+
+NOT VERIFIED. The host test above proves only the loopback fixture on one runtime. Accept row 32 only
+after a signed-in live view in the Rust release build plays the live audio without any click (tile
+not muted), side by side with Electron, with the WebView2 Runtime version recorded. Until then the
+row is "user decision resolved, parity intended", not a Windows PASS.
 
 ## Startup lifecycle operator checks (RELEASE build, review correction cycle 1)
 

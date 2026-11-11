@@ -7,7 +7,8 @@
 //! file under an owned scratch directory and records external opens instead of launching them.
 use crate::policy::{
     BROWSER_ARGUMENTS, CaptureDecision, Config, KeyAction, KeyInput, MAIN_WINDOW, Navigation,
-    Permission, PermissionDecision, accelerator, user_agent,
+    Permission, PermissionDecision, accelerator, user_agent, webview2_permission,
+    webview2_permission_kind,
 };
 use crate::shell::{
     AsyncWaitEnd, Guards, InstanceIdentity, InstanceRequest, Rect, Startup, StartupFailure,
@@ -569,13 +570,18 @@ fn read_pwstr(read: impl FnOnce(&mut PWSTR) -> Result<()>) -> Result<String> {
     Ok(take_pwstr(value))
 }
 
+// The portable table must match the pinned bindings exactly (build fails otherwise).
+const _: () = {
+    assert!(COREWEBVIEW2_PERMISSION_KIND_MICROPHONE.0 == webview2_permission_kind::MICROPHONE);
+    assert!(COREWEBVIEW2_PERMISSION_KIND_CAMERA.0 == webview2_permission_kind::CAMERA);
+    assert!(
+        COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ.0 == webview2_permission_kind::CLIPBOARD_READ
+    );
+    assert!(COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY.0 == webview2_permission_kind::AUTOPLAY);
+};
+
 fn permission_kind(kind: COREWEBVIEW2_PERMISSION_KIND) -> Permission {
-    match kind {
-        COREWEBVIEW2_PERMISSION_KIND_CAMERA => Permission::Camera,
-        COREWEBVIEW2_PERMISSION_KIND_MICROPHONE => Permission::Microphone,
-        COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ => Permission::ClipboardRead,
-        _ => Permission::Other,
-    }
+    webview2_permission(kind.0)
 }
 
 fn args_or_pointer<T>(args: Option<T>) -> Result<T> {
