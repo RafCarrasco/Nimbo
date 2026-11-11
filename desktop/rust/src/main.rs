@@ -1,15 +1,18 @@
+// Release builds are a GUI app (no console window), like the Electron executable.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 fn main() -> std::process::ExitCode {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     #[cfg(windows)]
-    if let Err(error) = nimbo_desktop::shell::windows::probe() {
-        eprintln!("Nimbo native API probe failed: {error}");
-        return std::process::ExitCode::FAILURE;
+    {
+        nimbo_desktop::shell::windows::host::run(&args)
     }
     #[cfg(not(windows))]
-    println!("Nimbo checkpoint-2 policy probe: native host requires Windows x64.");
-    let config = nimbo_desktop::policy::Config::release();
-    println!("Configured release site: {}", config.start_url());
-    eprintln!(
-        "RETURN: capture source -> real MediaStream is not implemented/proven; remote navigation disabled. Electron distribution is unchanged."
-    );
-    std::process::ExitCode::from(2)
+    {
+        let _ = args;
+        eprintln!(
+            "Nimbo desktop host requires Windows x64; this platform runs portable tests only."
+        );
+        std::process::ExitCode::from(2)
+    }
 }

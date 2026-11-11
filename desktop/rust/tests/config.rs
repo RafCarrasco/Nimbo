@@ -40,3 +40,19 @@ fn loopback_is_explicit_and_never_a_release_override() {
         Navigation::Allow
     );
 }
+
+#[cfg(feature = "test-host")]
+#[test]
+fn test_host_config_is_loopback_only_like_for_test() {
+    assert!(Config::test_host("http://127.0.0.1:5173/").is_ok());
+    for url in [
+        "https://golive-ad118.web.app/",
+        "http://0.0.0.0:5173/",
+        "http://127.0.0.1/",
+        "http://127.0.0.1:5173/x",
+        "http://user@127.0.0.1:5173/",
+        "http://localhost.evil:5173/",
+    ] {
+        assert!(Config::test_host(url).is_err(), "{url}");
+    }
+}

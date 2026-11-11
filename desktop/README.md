@@ -39,3 +39,35 @@ O link de login sai no terminal; abra-o com `&devUser=nome` para entrar com uma 
 ## Limites
 
 Jogos em tela cheia exclusiva podem aparecer pretos: use janela sem bordas.
+
+## App em Rust (prévia, ainda não substitui o app atual)
+
+`desktop/rust/` contém o novo app nativo (Rust + WebView2), construído por etapas. O app Electron
+descrito acima continua sendo o único distribuído; nada aqui altera o instalador, as atualizações
+ou o site.
+
+Estado da etapa 1: uma janela Windows (1280×800, mínimo 850×590, título e ícone do Nimbo, fundo
+`#0b1020`) abre o Nimbo publicado no WebView2, com as mesmas regras do Electron para links externos,
+pop-ups, permissões, recarregar (F5/Ctrl+R), versão no user agent e instância única. Ainda **não**
+existem: ponte `nimboDesktop`, login pelo navegador, link `golive://`, seletor/captura de tela,
+áudio sem eco, modo jogo, instalador e atualização automática. Requer o Microsoft Edge WebView2
+Runtime.
+
+Testes portáveis (qualquer sistema, Rust 1.99.1 fixado em `desktop/rust/rust-toolchain.toml`):
+
+```powershell
+cargo +1.99.1 test --manifest-path desktop/rust/Cargo.toml --locked
+cargo +1.99.1 test --manifest-path desktop/rust/Cargo.toml --locked --features test-host
+node --test desktop/tests/scope.test.mjs desktop/tests/windows-workflow.test.mjs desktop/tests/release-guard.test.mjs
+```
+
+Gerar no Windows x64 (Visual Studio Build Tools com MSVC e Windows SDK):
+
+```powershell
+cargo +1.99.1 build --manifest-path desktop/rust/Cargo.toml --locked --release
+```
+
+Saída: `desktop/rust/target/release/nimbo-desktop.exe` (prévia, não é instalador nem release). O
+recurso `test-host` só compila em depuração; com `--release` o build falha de propósito. O teste
+interativo do app (servidor local `127.0.0.1`, sem site publicado, sem login) e a matriz de paridade
+com o Electron estão em `desktop/rust/README.md` e `desktop/tests/e2e/shell-parity.md`.

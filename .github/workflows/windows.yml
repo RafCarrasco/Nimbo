@@ -1,12 +1,12 @@
-name: Nimbo Rust Windows DIAGNOSTIC not capture
+name: Nimbo Rust Windows PREVIEW not release
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  diagnostic:
+  preview:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         shell: pwsh
@@ -20,16 +20,20 @@ jobs:
         run: cargo +1.99.1 fmt --manifest-path desktop/rust/Cargo.toml --all -- --check
       - name: Lint locked Rust targets
         run: cargo +1.99.1 clippy --manifest-path desktop/rust/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Lint locked Rust targets with debug-only test host
+        run: cargo +1.99.1 clippy --manifest-path desktop/rust/Cargo.toml --locked --all-targets --features test-host -- -D warnings
       - name: Test locked Rust crate on Windows
         run: cargo +1.99.1 test --manifest-path desktop/rust/Cargo.toml --locked
-      - name: Link release diagnostic only
+      - name: Test locked Rust crate with debug-only test host (interactive tests stay ignored)
+        run: cargo +1.99.1 test --manifest-path desktop/rust/Cargo.toml --locked --features test-host
+      - name: Build release host shell
         run: cargo +1.99.1 build --manifest-path desktop/rust/Cargo.toml --locked --release
-      - name: Collect diagnostic without executing it
+      - name: Collect preview without executing it
         run: |
           $ErrorActionPreference = 'Stop'
-          $output = 'diagnostic-windows'
+          $output = 'preview-windows'
           New-Item -ItemType Directory -Path $output | Out-Null
-          $binary = Join-Path $output 'nimbo-rust-windows-DIAGNOSTIC-not-capture.exe'
+          $binary = Join-Path $output 'nimbo-rust-windows-PREVIEW-not-release.exe'
           Copy-Item 'desktop/rust/target/release/nimbo-desktop.exe' $binary
           $metadata = [ordered]@{
             commit = $env:GITHUB_SHA
@@ -43,21 +47,22 @@ jobs:
           }
           $metadata | ConvertTo-Json | Set-Content (Join-Path $output 'metadata.json') -Encoding utf8
           @'
-          Nimbo Rust Windows DIAGNOSTIC - NOT CAPTURE - NOT AN INSTALLER
+          Nimbo Rust Windows PREVIEW - not an installer, not a release
 
-          No GUI, real capture, audio, login or installer is implemented.
-          This diagnostic verifies native linking/API probe only, not media functionality.
-          CI builds and tests the crate but does not execute this diagnostic executable.
-          WebView2 detection differences are not capture proof.
-          Runtime API probe results require a separate observed Windows execution.
-          The current diagnostic intentionally returns exit 2 (RETURN), or 1 on probe failure.
-          Do not use this as a Nimbo installer or replace an existing installation.
+          Checkpoint 1 host shell: opens https://golive-ad118.web.app in a WebView2 window.
+          No desktop bridge, login, deep link, screen capture, app audio, game watch,
+          installer or automatic update is implemented in this preview.
+          Requires the Microsoft Edge WebView2 Runtime.
+          CI builds and tests the crate but does not execute this executable.
+          GUI behavior requires a separate observed Windows run and operator evidence.
+          Do not sign in or enter production credentials while evaluating this preview.
+          Do not use this to replace an existing Nimbo installation.
           No release, production upload, signing, deployment or update is performed.
           metadata.json records the commit, SHA256 and binary size in bytes.
           '@ | Set-Content (Join-Path $output 'README.txt') -Encoding utf8
       - uses: actions/upload-artifact@v4
         with:
-          name: Nimbo-Rust-Windows-DIAGNOSTIC-not-capture
-          path: diagnostic-windows/
+          name: Nimbo-Rust-Windows-PREVIEW-not-release
+          path: preview-windows/
           if-no-files-found: error
           retention-days: 7

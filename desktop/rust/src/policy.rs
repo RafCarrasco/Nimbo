@@ -1,8 +1,92 @@
 //! Portable decisions, not claims of installed native hooks or media parity.
 use url::Url;
 
+// A release-profile binary can never carry test hooks. build.rs additionally rejects any
+// release-derived profile (PROFILE=release) even when debug assertions are forced on.
+#[cfg(all(feature = "test-host", not(debug_assertions)))]
+compile_error!(
+    "NIMBO_TEST_HOST_REQUIRES_DEBUG_ASSERTIONS: the test-host feature is debug-only and must never reach a release binary"
+);
+
 pub const APP_ID: &str = "app.nimbo.desktop";
 pub const HOSTED_URL: &str = "https://golive-ad118.web.app/";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// desktop/main.cjs:24-27. `backgroundThrottling:false` (706) is covered by the same switches.
+pub const BROWSER_ARGUMENTS: &str = "--disable-renderer-backgrounding --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling";
+/// Checkpoint 1 installs NO `nimboDesktop` bridge, not even a stub: the page sees a plain browser.
+pub const BRIDGE_INSTALLED: bool = false;
+
+/// Electron puts `Nimbo/x.y.z` in the UA; the page derives `APP_VERSION`/title from it
+/// (src/lib/version.ts:6, src/main.tsx:11).
+pub fn user_agent(default: &str) -> String {
+    let suffix = format!(" Nimbo/{APP_VERSION}");
+    if default.ends_with(&suffix) {
+        default.to_owned()
+    } else {
+        format!("{default}{suffix}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyInput {
+    /// Win32 virtual-key code (layout-mapped, like Electron's `input.key`).
+    pub virtual_key: u32,
+    /// KeyDown or SystemKeyDown (Electron `keyDown`, auto-repeat included).
+    pub key_down: bool,
+    pub control: bool,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Host reloads and marks the key handled (avoids a second WebView2 built-in reload).
+    Reload,
+    /// Leave to WebView2 defaults until the parity matrix (task 1.4) decides otherwise.
+    Default,
+}
+const VK_F5: u32 = 0x74;
+const VK_R: u32 = 0x52;
+/// desktop/main.cjs:722-725.
+pub fn accelerator(k: KeyInput) -> KeyAction {
+    if k.key_down && (k.virtual_key == VK_F5 || (k.control && k.virtual_key == VK_R)) {
+        KeyAction::Reload
+    } else {
+        KeyAction::Default
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {
+    Capture,
+    Audio,
+    GameWatch,
+    Update,
+}
+/// Per-feature availability replacing the old process-level "capture not proven" refusal.
+/// No constructor can mark a feature available until its checkpoint is proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Features {
+    _private: (),
+}
+impl Features {
+    pub const fn current() -> Self {
+        Self { _private: () }
+    }
+    pub const fn available(&self, feature: Feature) -> bool {
+        match feature {
+            Feature::Capture | Feature::Audio | Feature::GameWatch | Feature::Update => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Deny,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureDecision {
+    /// Cancel WebView2's own screen-capture UI: getDisplayMedia() rejects.
+    NativeCancel,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct WindowConfig {
@@ -66,6 +150,11 @@ impl Config {
         }
         Ok(Self { start: u })
     }
+    /// Debug-only isolated host fixture (same loopback rules as `for_test`).
+    #[cfg(feature = "test-host")]
+    pub fn test_host(raw: &str) -> Result<Self, &'static str> {
+        Self::for_test(raw)
+    }
     pub fn start_url(&self) -> &str {
         self.start.as_str()
     }
@@ -111,6 +200,35 @@ impl Config {
     }
     pub fn command(&self, r: &NativeRequest<'_>, generation: u64, command: &str) -> bool {
         self.authorize(r, generation) && command == "nimbo:capture:stop"
+    }
+    /// WebView2 PermissionRequested decision (main.cjs:662-678). Both the current top-level
+    /// document and the requesting origin must be the app origin; never a WebView2 prompt.
+    /// `display-capture` stays denied until the native picker is proven.
+    pub fn shell_permission(
+        &self,
+        top_level: &str,
+        requester: &str,
+        p: Permission,
+    ) -> PermissionDecision {
+        let allowed_kind = matches!(
+            p,
+            Permission::Camera
+                | Permission::Microphone
+                | Permission::Fullscreen
+                | Permission::SanitizedClipboardWrite
+        );
+        if allowed_kind
+            && self.navigation(top_level) == Navigation::Allow
+            && self.navigation(requester) == Navigation::Allow
+        {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Deny
+        }
+    }
+    /// WebView2 ScreenCaptureStarting: always cancelled while `Feature::Capture` is unavailable.
+    pub fn screen_capture(&self) -> CaptureDecision {
+        CaptureDecision::NativeCancel
     }
 }
 

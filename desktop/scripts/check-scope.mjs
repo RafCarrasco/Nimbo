@@ -1,5 +1,5 @@
-// Approved checkpoints 1–2: base blobs stay immutable except the exact manual
-// Windows diagnostic below. No other workflow, legacy or shared manifest edits.
+// Approved checkpoints: base blobs stay immutable except the exact {path, oid}
+// exceptions below. No other workflow, legacy or shared manifest edits.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, lstatSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -10,11 +10,22 @@ import { fileURLToPath } from 'node:url';
 export const BASE = '3c16cbbf2a4e6fcd5ce2274bafb3a3a73c4ad6eb';
 // Exact Git blob allowlist, not a path/regex/YAML-key bypass. Any changed byte,
 // including commands hidden in multiline scalars, requires separate approval.
-export const WINDOWS_DIAGNOSTIC = Object.freeze({
+// A pair only authorizes that blob at that path; modes must stay the base mode.
+export const WINDOWS_PREVIEW = Object.freeze({
   path: '.github/workflows/windows.yml',
-  oid: '23a8e22cd0a421cf2fde97267556b872e7319bbd',
+  oid: 'bfcea98e83177ec568dfb79ca31723ce176bb060',
 });
-const approvedDiagnostic = (name, oid) => name === WINDOWS_DIAGNOSTIC.path && oid === WINDOWS_DIAGNOSTIC.oid;
+export const APPROVED_EXCEPTIONS = Object.freeze([
+  // Legacy manual diagnostic (approved checkpoint 1 of the previous plan), retained.
+  Object.freeze({ path: '.github/workflows/windows.yml', oid: '23a8e22cd0a421cf2fde97267556b872e7319bbd' }),
+  // Checkpoint 1 (Rust host shell): manual PREVIEW artifact, never a release.
+  WINDOWS_PREVIEW,
+  // Checkpoint 1: Rust app status/build/test section appended; Electron docs unchanged.
+  Object.freeze({ path: 'desktop/README.md', oid: '9dd4dd8379c4afbe202602828c7029493b35f1f6' }),
+]);
+// New (non-base) files are allowed only below these exact directory prefixes.
+export const APPROVED_NEW_PATHS = Object.freeze(['desktop/rust/', 'desktop/tests/', 'desktop/scripts/']);
+const approvedException = (name, oid) => APPROVED_EXCEPTIONS.some((e) => e.path === name && e.oid === oid);
 const git = (root, ...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
 export function enumerateBase(root) {
   return git(root, 'ls-tree', '-rz', BASE).split('\0').filter(Boolean).map((entry) => {
@@ -53,7 +64,7 @@ export function checkScope(root) {
   }));
   for (const blob of blobs) {
     const staged = index.get(blob.path);
-    if (!staged || staged.stage !== '0' || staged.mode !== blob.mode || (staged.oid !== blob.oid && !approvedDiagnostic(blob.path, staged.oid))) {
+    if (!staged || staged.stage !== '0' || staged.mode !== blob.mode || (staged.oid !== blob.oid && !approvedException(blob.path, staged.oid))) {
       violations.push(`${blob.path}: immutable base blob/mode changed in index`);
     }
     const file = path.join(root, blob.path);
@@ -63,7 +74,7 @@ export function checkScope(root) {
       const bytes = readFileSync(file);
       const oid = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
       const mode = stat.mode & 0o111 ? '100755' : '100644';
-      if ((oid !== blob.oid && !approvedDiagnostic(blob.path, oid)) || mode !== blob.mode) violations.push(`${blob.path}: immutable base blob/mode changed`);
+      if ((oid !== blob.oid && !approvedException(blob.path, oid)) || mode !== blob.mode) violations.push(`${blob.path}: immutable base blob/mode changed`);
     } catch (error) {
       violations.push(`${blob.path}: missing/unreadable (${error.code || error.message})`);
     }
@@ -74,8 +85,8 @@ export function checkScope(root) {
   const current = git(root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard').split('\0').filter(Boolean);
   for (const name of new Set(current)) {
     if (basePaths.has(name)) continue;
-    if (!/^(desktop\/tests\/|desktop\/scripts\/|desktop\/rust\/)/.test(name)) {
-      violations.push(`${name}: unauthorized new path for checkpoints 1–2`);
+    if (!APPROVED_NEW_PATHS.some((prefix) => name.startsWith(prefix))) {
+      violations.push(`${name}: unauthorized new path (approved prefixes: ${APPROVED_NEW_PATHS.join(', ')})`);
       continue;
     }
     try {
@@ -99,6 +110,6 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const root = args.length ? path.resolve(args[1]) : fileURLToPath(new URL('../../', import.meta.url));
     const violations = checkScope(root);
     if (violations.length) { console.error(violations.join('\n')); process.exitCode = 1; }
-    else console.log(`CHECKPOINT_2_SCOPE_OK base=${BASE} base_blobs=${enumerateBase(root).length} exact_diagnostic_exception=${WINDOWS_DIAGNOSTIC.path}@${WINDOWS_DIAGNOSTIC.oid}`);
+    else console.log(`SCOPE_OK base=${BASE} base_blobs=${enumerateBase(root).length} exact_exceptions=${APPROVED_EXCEPTIONS.map((e) => `${e.path}@${e.oid}`).join(',')} new_path_prefixes=${APPROVED_NEW_PATHS.join(',')}`);
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

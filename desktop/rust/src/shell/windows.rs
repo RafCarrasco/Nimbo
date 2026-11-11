@@ -1,5 +1,7 @@
-//! Windows-only diagnostic host and deny-all WebView2 guard skeleton.
-//! No remote document or IPC dispatcher is created by the diagnostic executable.
+//! Windows-only WebView2 support: the checkpoint-1 host shell (`host`) plus the retained
+//! diagnostic probe and deny-all guard used by the capture diagnostics.
+pub mod host;
+
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_PERMISSION_STATE_DENY, GetAvailableCoreWebView2BrowserVersionString,
     ICoreWebView2, ICoreWebView2_17, ICoreWebView2_27, ICoreWebView2Controller,

@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, unlinkSync
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BASE, enumerateBase, checkScope, packageViolations } from '../scripts/check-scope.mjs';
+import { BASE, APPROVED_EXCEPTIONS, APPROVED_NEW_PATHS, enumerateBase, checkScope, packageViolations } from '../scripts/check-scope.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -128,39 +128,83 @@ test('checkpoint 1 pins entire lockfile, including web transitive graph', (t) =>
   assert.ok(checkScope(dir).some((v) => v.includes('package.json')), 'even permitted future desktop edits require a later checkpoint');
 });
 
-test('only exact approved Windows diagnostic bytes are admitted in worktree and index', (t) => {
+test('exception list is exact {path, oid} pairs and new paths are three fixed prefixes', () => {
+  assert.deepEqual(APPROVED_EXCEPTIONS, [
+    { path: '.github/workflows/windows.yml', oid: '23a8e22cd0a421cf2fde97267556b872e7319bbd' },
+    { path: '.github/workflows/windows.yml', oid: 'bfcea98e83177ec568dfb79ca31723ce176bb060' },
+    { path: 'desktop/README.md', oid: '9dd4dd8379c4afbe202602828c7029493b35f1f6' },
+  ]);
+  assert.ok(Object.isFrozen(APPROVED_EXCEPTIONS) && APPROVED_EXCEPTIONS.every(Object.isFrozen));
+  assert.deepEqual(APPROVED_NEW_PATHS, ['desktop/rust/', 'desktop/tests/', 'desktop/scripts/']);
+  assert.ok(Object.isFrozen(APPROVED_NEW_PATHS));
+  for (const { oid } of APPROVED_EXCEPTIONS) assert.match(oid, /^[0-9a-f]{40}$/, 'full oid, never a prefix/wildcard');
+});
+
+function exactBlobCases(t, name, approvedBytes, otherPaths) {
   const dir = fixture(t);
-  const name = '.github/workflows/windows.yml';
-  const approved = readFileSync(path.join(root, name), 'utf8');
-  put(dir, name, approved);
-  assert.deepEqual(checkScope(dir), []);
-  git(dir, 'add', '--', name);
-  assert.deepEqual(checkScope(dir), []);
-  for (const changed of [
-    approved.replace('workflow_dispatch:', 'push:'),
-    approved.replace('contents: read', 'contents: write'),
-    approved.replace('1.99.1', 'stable'),
-    approved.replace('cargo +1.99.1 test', 'npm run desktop:pack'),
-    approved.replace("          $ErrorActionPreference = 'Stop'", "          $ErrorActionPreference = 'Stop'\n          gh release create forbidden"),
-    approved + '\n  hidden:\n    runs-on: windows-latest\n    steps:\n      - run: |\n          npm run desktop:pack\n',
-    approved + '\nenv:\n  TOKEN: ${{ secrets.FORBIDDEN }}\n',
-    approved + '\n# even an unapproved comment is outside the exact exception\n',
-  ]) {
+  for (const bytes of approvedBytes) {
+    put(dir, name, bytes);
+    assert.deepEqual(checkScope(dir), [], `${name}: approved bytes admitted`);
+    git(dir, 'add', '--', name);
+    assert.deepEqual(checkScope(dir), [], `${name}: approved bytes admitted in index`);
+  }
+  const approved = approvedBytes.at(-1);
+  for (const changed of [approved + '\n', approved.slice(0, -1), approved.replace(/a/, 'b'), approved + '# unapproved comment\n', '']) {
     put(dir, name, changed);
-    assert.ok(checkScope(dir).some((v) => v.includes(name)), 'reject unapproved workflow bytes');
+    assert.ok(checkScope(dir).some((v) => v.includes(name)), `${name}: reject unapproved bytes`);
     git(dir, 'add', '--', name);
     put(dir, name, approved);
-    assert.ok(checkScope(dir).some((v) => v.includes(name) && v.includes('index')), 'restoring worktree cannot hide staged commands');
+    assert.ok(checkScope(dir).some((v) => v.includes(name) && v.includes('index')), 'restoring worktree cannot hide staged bytes');
     git(dir, 'add', '--', name);
   }
-  for (const forbidden of ['src/desktop.ts', '.github/workflows/community-check.yml', '.github/workflows/diagnostic-copy.yml']) {
+  for (const forbidden of otherPaths) {
     const file = path.join(dir, forbidden);
-    const original = forbidden.endsWith('diagnostic-copy.yml') ? null : readFileSync(file);
+    const original = readFileSync(file);
     put(dir, forbidden, approved);
-    assert.ok(checkScope(dir).some((v) => v.includes(forbidden)), 'approved bytes never authorize another path');
-    if (original) writeFileSync(file, original);
-    else unlinkSync(file);
+    assert.ok(checkScope(dir).some((v) => v.includes(forbidden)), `approved ${name} bytes never authorize ${forbidden}`);
+    writeFileSync(file, original);
   }
+  put(dir, '.github/workflows/diagnostic-copy.yml', approved);
+  assert.ok(checkScope(dir).some((v) => v.includes('diagnostic-copy.yml')), 'no workflow wildcard');
+  unlinkSync(path.join(dir, '.github/workflows/diagnostic-copy.yml'));
   chmodSync(path.join(dir, name), 0o755);
   assert.ok(checkScope(dir).some((v) => v.includes(name)), 'exception never permits mode changes');
+  chmodSync(path.join(dir, name), 0o644);
+  git(dir, 'update-index', '--chmod=+x', '--', name);
+  assert.ok(checkScope(dir).some((v) => v.includes(name) && v.includes('index')), 'staged mode change rejected');
+}
+
+test('windows.yml admits only the legacy diagnostic and the frozen PREVIEW blob', (t) => {
+  const legacy = git(root, 'cat-file', 'blob', '23a8e22cd0a421cf2fde97267556b872e7319bbd') + '\n';
+  const preview = readFileSync(path.join(root, '.github/workflows/windows.yml'), 'utf8');
+  assert.notEqual(legacy, preview);
+  exactBlobCases(t, '.github/workflows/windows.yml', [legacy, preview], ['src/desktop.ts', '.github/workflows/community-check.yml', 'desktop/README.md']);
+  const dir = fixture(t);
+  const workflow = readFileSync(path.join(root, '.github/workflows/windows.yml'), 'utf8');
+  for (const changed of [
+    workflow.replace('workflow_dispatch:', 'push:'),
+    workflow.replace('contents: read', 'contents: write'),
+    workflow.replace('persist-credentials: false', 'persist-credentials: true'),
+    workflow.replace('cargo +1.99.1 test', 'npm run desktop:pack'),
+    workflow + '\nenv:\n  TOKEN: ${{ secrets.FORBIDDEN }}\n',
+  ]) {
+    put(dir, '.github/workflows/windows.yml', changed);
+    assert.ok(checkScope(dir).some((v) => v.includes('.github/workflows/windows.yml')));
+  }
+});
+
+test('desktop/README.md admits only the frozen documentation blob', (t) => {
+  const readme = readFileSync(path.join(root, 'desktop/README.md'), 'utf8');
+  const base = git(root, 'show', `${BASE}:desktop/README.md`) + '\n';
+  assert.ok(readme.startsWith(base), 'every Electron instruction retained verbatim');
+  exactBlobCases(t, 'desktop/README.md', [readme], ['README.md', 'src/desktop.ts', '.github/workflows/windows.yml']);
+});
+
+test('legacy diagnostic bytes are not valid at desktop/README.md and README bytes are not a workflow', (t) => {
+  const dir = fixture(t);
+  put(dir, 'desktop/README.md', readFileSync(path.join(root, '.github/workflows/windows.yml')));
+  put(dir, '.github/workflows/windows.yml', readFileSync(path.join(root, 'desktop/README.md')));
+  const violations = checkScope(dir);
+  assert.ok(violations.some((v) => v.includes('desktop/README.md')));
+  assert.ok(violations.some((v) => v.includes('.github/workflows/windows.yml')));
 });
