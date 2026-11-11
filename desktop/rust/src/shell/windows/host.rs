@@ -920,14 +920,17 @@ fn run_window(launch: &Launch) -> std::result::Result<(), StartupFailure> {
             Ok(())
         }
         Err(failure) => {
-            // A user close already destroyed the window inside the startup pump; never call
-            // DestroyWindow on a stale handle. Otherwise WM_DESTROY closes any controller (its
-            // PostQuitMessage is discarded before a dialog by `report_startup_failure`).
+            // Liveness is probed BEFORE our own cleanup: a window already destroyed inside the
+            // startup pump was closed by the user (review R1: e.g. the controller completes with
+            // E_ABORT inside that DestroyWindow), so the failure settles to a quiet close. Never
+            // call DestroyWindow on a stale handle. Otherwise WM_DESTROY closes any controller
+            // (its PostQuitMessage is discarded before a dialog by `report_startup_failure`).
             // SAFETY: our own window on its owning thread.
-            unsafe {
-                if IsWindow(Some(main)).as_bool() {
-                    let _ = DestroyWindow(main);
-                }
+            let alive = unsafe { IsWindow(Some(main)).as_bool() };
+            let failure = failure.settle(alive);
+            if alive {
+                // SAFETY: as above; the window is still alive.
+                let _ = unsafe { DestroyWindow(main) };
             }
             Err(failure)
         }
@@ -942,6 +945,12 @@ fn start_webview(launch: &Launch, main: HWND) -> std::result::Result<(), Startup
     use StartupFailure::Fatal;
     let environment = create_environment(&launch.user_data)
         .map_err(|end| StartupFailure::from_wait(end, "webview2-unavailable"))?;
+    // A close processed while the environment completion was already queued: never hand a
+    // destroyed parent to WebView2 (review R1).
+    // SAFETY: our own window on its owning thread.
+    if !unsafe { IsWindow(Some(main)) }.as_bool() {
+        return Err(StartupFailure::ClosedDuringStartup);
+    }
     let controller = create_controller(&environment, main)
         .map_err(|end| StartupFailure::from_wait(end, "webview2-controller-failed"))?;
     with_state(|s| s.controller = Some(controller.clone()));

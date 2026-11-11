@@ -96,14 +96,21 @@ Pass requires the line `REAL_WINDOWS_HOST_POLICY_OK`. Record the full output, ex
 `events.log` beneath the printed `ISOLATED_HOST_DIR`. Delete that directory only after the test-host
 and its WebView2 processes have exited. Enforce an external timeout if the run hangs.
 
-The same command also runs the two startup-lifecycle regressions from review correction cycle 1
-(each uses its own fresh `nimbo-close-<pid>` / `nimbo-fatal-<pid>` directory, prints its
+The same command also runs the startup-lifecycle regressions from review correction cycles 1 and 2
+(each uses its own fresh `nimbo-close-<pid>` / `nimbo-close-controller-<pid>` / `nimbo-fatal-<pid>` directory, prints its
 `events.log`, kills the host process tree on a timeout and removes its directory when released):
 
 - `close_during_startup_quits_quietly` (F2): WM_CLOSE as soon as the main window exists, on a cold
   profile. Pass line `CLOSE_DURING_STARTUP_OK`: exit 0, `closed-during-startup` recorded, no
   `webview2-unavailable` / `webview2-controller-failed` / `fatal-dialog`. If WebView2 started first,
   the test fails as INCONCLUSIVE; rerun it, never record that as a pass.
+- `close_during_controller_creation_quits_quietly` (review R1, correction cycle 2; own fresh
+  `nimbo-close-controller-<pid>` directory): waits until WebView2 has added a child window to the
+  main window (controller creation in flight) while `started` is not logged, then posts WM_CLOSE.
+  Pass line `CLOSE_DURING_CONTROLLER_CREATION_OK`: exit 0, `closed-during-startup` recorded, no
+  `webview2-unavailable` / `webview2-controller-failed` / `fatal-` event. Record the printed
+  `CONTROLLER_PHASE_TARGET` line. If the controller finished first, the test fails as
+  INCONCLUSIVE; rerun it, never record that as a pass.
 - `startup_failure_discards_quit_before_reporting` (F1): the child alone gets
   `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` pointing at a missing folder. Pass line
   `STARTUP_FAILURE_REPORT_OK`: exit 1 (not 101), and `webview2-unavailable`, `fatal-quit-discarded`,
@@ -139,7 +146,7 @@ NOT VERIFIED until performed. Record exit codes with
 | # | Case | How to test | Expected (Rust intent) | Observed | Exit code |
 |---|---|---|---|---|---|
 | F1 | WebView2 Runtime missing or unusable | disposable VM without the runtime (row 26) | error dialog "O Nimbo não conseguiu abrir…" stays open until OK is pressed (does not flash and vanish); then exit 1 | | |
-| F2 | Close during startup | Windows user without `%LOCALAPPDATA%\Nimbo\WebView2` (cold profile; do not delete an existing one), press Alt+F4 or X as soon as the window appears | window closes, no error dialog, no crash/abort dialog, process exits 0, no leftover `nimbo-desktop.exe` in Task Manager | | |
+| F2 | Close during startup | Windows user without `%LOCALAPPDATA%\Nimbo\WebView2` (cold profile; do not delete an existing one), press Alt+F4 or X as soon as the window appears; repeat on another cold profile (another Windows user or disposable VM each time; never delete a profile) closing ~1–2 s later while the window is still blank (controller creation, review R1), and once more at the latest moment before the page appears | every time: window closes, no error dialog, no crash/abort dialog, process exits 0, no leftover `nimbo-desktop.exe` in Task Manager | | |
 
 ## Screenshot checklist (operator evidence, not stored in the repository)
 

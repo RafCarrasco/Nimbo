@@ -155,19 +155,7 @@ fn startup_closed_by_user_is_quiet_success_not_a_webview2_error() {
 /// Every genuine startup failure keeps its fixed code, reports the error dialog and exits 1.
 #[test]
 fn genuine_startup_failures_report_and_exit_one() {
-    for code in [
-        "webview2-unavailable",
-        "webview2-controller-failed",
-        "webview2-core-failed",
-        "guard-install-failed",
-        "guards-incomplete",
-        "webview2-visibility-failed",
-        "navigate-failed",
-        "window-failed",
-        "com-init-failed",
-        "user-data-unavailable",
-        "single-instance-failed",
-    ] {
+    for code in FATAL_CODES {
         let failure = StartupFailure::Fatal(code);
         assert_eq!(
             StartupFailure::from_wait(AsyncWaitEnd::Failed, code),
@@ -177,6 +165,121 @@ fn genuine_startup_failures_report_and_exit_one() {
         assert!(failure.reports_error(), "{code}");
         assert_eq!(failure.exit_status(), 1, "{code}");
     }
+}
+
+const FATAL_CODES: [&str; 11] = [
+    "webview2-unavailable",
+    "webview2-controller-failed",
+    "webview2-core-failed",
+    "guard-install-failed",
+    "guards-incomplete",
+    "webview2-visibility-failed",
+    "navigate-failed",
+    "window-failed",
+    "com-init-failed",
+    "user-data-unavailable",
+    "single-instance-failed",
+];
+
+/// Review R1: a user close during controller creation makes WebView2 complete with E_ABORT
+/// inside DestroyWindow, before the pump can see WM_QUIT. The failure is therefore settled by
+/// the liveness of our own main window, never by the error code/HRESULT: a dead window means
+/// the user closed it (quiet exit 0); a live window keeps the genuine error (dialog, exit 1).
+#[test]
+fn startup_failure_is_settled_by_main_window_liveness_not_by_code() {
+    for code in FATAL_CODES {
+        let alive = StartupFailure::Fatal(code).settle(true);
+        assert_eq!(alive, StartupFailure::Fatal(code), "{code}: live window");
+        assert!(alive.reports_error(), "{code}");
+        assert_eq!(alive.exit_status(), 1, "{code}");
+
+        let dead = StartupFailure::Fatal(code).settle(false);
+        assert_eq!(
+            dead,
+            StartupFailure::ClosedDuringStartup,
+            "{code}: window already destroyed by a user close"
+        );
+        assert!(
+            !dead.reports_error(),
+            "{code}: no dialog after a user close"
+        );
+        assert_eq!(dead.exit_status(), 0, "{code}");
+        assert_eq!(dead.code(), "closed-during-startup");
+    }
+    // Idempotent: a close stays a close, whatever the liveness probe says.
+    for alive in [true, false] {
+        assert_eq!(
+            StartupFailure::ClosedDuringStartup.settle(alive),
+            StartupFailure::ClosedDuringStartup
+        );
+        let once = StartupFailure::Fatal("webview2-controller-failed").settle(alive);
+        assert_eq!(once.settle(alive), once);
+    }
+    // Variant, not string: a code that merely looks like a close stays fatal while the window
+    // lives, and an abort-looking code is not special-cased.
+    for code in ["closed-during-startup", "E_ABORT", "0x80004004"] {
+        assert_eq!(
+            StartupFailure::Fatal(code).settle(true),
+            StartupFailure::Fatal(code)
+        );
+    }
+}
+
+/// Source-ordering check ONLY (portable, Linux): it does not execute or prove the native
+/// WebView2/DestroyWindow behavior. The startup Err branch must settle the failure with the
+/// real `IsWindow(main)` result taken BEFORE the host's own cleanup DestroyWindow (after it,
+/// every failure would look like a close and be hidden), and a dead window must not reach
+/// controller creation.
+#[test]
+fn host_source_settles_startup_failure_by_liveness_before_own_cleanup() {
+    let src = include_str!("../src/shell/windows/host.rs");
+    let body = |name: &str| {
+        let start = [format!("fn {name}("), format!("fn {name}<")]
+            .iter()
+            .find_map(|needle| src.find(needle.as_str()))
+            .unwrap_or_else(|| panic!("fn {name} missing"));
+        let end = src[start..].find("\n}\n").map_or(src.len(), |e| start + e);
+        // Code only: comment lines are dropped, then whitespace (rustfmt-insensitive).
+        src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<String>()
+    };
+    let run_window = body("run_window");
+    let err = run_window
+        .find("Err(failure)=>")
+        .expect("startup Err branch");
+    let branch = &run_window[err..];
+    let alive = branch
+        .find("letalive=unsafe{IsWindow(Some(main)).as_bool()};")
+        .expect("liveness probe of our own main window");
+    let settle = branch
+        .find("failure.settle(alive)")
+        .expect("failure settled by liveness");
+    let destroy = branch
+        .find("DestroyWindow(main)")
+        .expect("own cleanup DestroyWindow");
+    assert!(
+        alive < settle && alive < destroy,
+        "probe before own cleanup"
+    );
+    assert!(
+        branch[..destroy].contains("ifalive{"),
+        "cleanup only if alive"
+    );
+    assert!(
+        !run_window.contains("E_ABORT") && !body("wait_end").contains("E_ABORT"),
+        "no HRESULT special case"
+    );
+
+    let start = body("start_webview");
+    let environment = start.find("create_environment(").expect("environment");
+    let probe = start
+        .find("IsWindow(Some(main))")
+        .expect("liveness checked before controller creation");
+    let controller = start.find("create_controller(").expect("controller");
+    assert!(environment < probe && probe < controller);
 }
 
 /// Source-ordering check ONLY (portable, Linux): it does not execute or prove the native

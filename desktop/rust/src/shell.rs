@@ -67,6 +67,18 @@ impl StartupFailure {
             AsyncWaitEnd::Failed => Self::Fatal(fatal_code),
         }
     }
+    /// Settles a WebView2 startup failure by the liveness of our own main window, probed
+    /// before the host's own cleanup destroys it. Before the message loop only a user close
+    /// (DefWindowProc's WM_CLOSE → DestroyWindow) destroys the window; WebView2 then completes
+    /// controller creation with E_ABORT inside that DestroyWindow, before the startup pump can
+    /// retrieve WM_QUIT (review R1). The error code/HRESULT is deliberately not consulted: an
+    /// abort can have other causes, and while the window lives every failure stays fatal.
+    pub fn settle(self, window_alive: bool) -> Self {
+        match self {
+            Self::Fatal(_) if !window_alive => Self::ClosedDuringStartup,
+            other => other,
+        }
+    }
     pub fn code(&self) -> &'static str {
         match self {
             Self::ClosedDuringStartup => "closed-during-startup",

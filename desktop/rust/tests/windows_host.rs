@@ -266,6 +266,26 @@ fn render_widget(main: HWND) -> Option<HWND> {
     };
     search.found
 }
+extern "system" fn any_child(hwnd: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: `data` is the &mut Option<HWND> passed to EnumChildWindows for the call.
+    unsafe { *(data.0 as *mut Option<HWND>) = Some(hwnd) };
+    BOOL(0)
+}
+/// Any child of the host's main window. The host itself creates none; WebView2 adds one to
+/// the parent before CreateCoreWebView2Controller returns, so a child marks the controller
+/// creation phase (until `started` is logged).
+fn host_child(main: HWND) -> Option<HWND> {
+    let mut found = None;
+    // SAFETY: callback only touches `found`, which outlives the call.
+    let _ = unsafe {
+        EnumChildWindows(
+            Some(main),
+            Some(any_child),
+            LPARAM(&mut found as *mut _ as isize),
+        )
+    };
+    found
+}
 fn title(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     // SAFETY: bounded buffer.
@@ -446,6 +466,67 @@ fn close_during_startup_quits_quietly() -> TestResult<()> {
     drop(fixture);
     remove_scratch(&dir);
     println!("CLOSE_DURING_STARTUP_OK pid={pid}");
+    Ok(())
+}
+
+/// Review R1: the user closes the window while WebView2 *controller* creation is in flight.
+/// WebView2 then completes the creation with E_ABORT inside DestroyWindow, before the startup
+/// pump sees WM_QUIT; the host must still settle it as a quiet close (exit 0, no dialog).
+/// Targets the phase: WM_CLOSE is posted at the first sighting of a child window of the host's
+/// main window (added by WebView2 during controller creation) while `started` is not logged.
+/// Fails as INCONCLUSIVE, never passes, when the phase was not hit; rerun on a fresh directory.
+#[test]
+#[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
+fn close_during_controller_creation_quits_quietly() -> TestResult<()> {
+    let dir = owned_scratch("nimbo-close-controller")?;
+    let fixture = Fixture::start()?;
+    let mut app = App(launch(&fixture, &dir)?);
+    let pid = app.0.id();
+    let start = Instant::now();
+    let timed_out = |what: &str| -> TestResult<()> {
+        if start.elapsed() > Duration::from_secs(30) {
+            return Err(format!("timed out waiting for {what}").into());
+        }
+        std::thread::sleep(Duration::from_millis(1)); // poll granularity only
+        Ok(())
+    };
+    let main = loop {
+        if let Some(main) = main_window(pid) {
+            break main;
+        }
+        timed_out("main window")?;
+    };
+    loop {
+        if host_child(main).is_some() {
+            break;
+        }
+        if app.0.try_wait()?.is_some() {
+            return Err("host exited before controller creation began".into());
+        }
+        timed_out("controller creation (child window)")?;
+    }
+    let started_before_close = events(&dir).contains("started\n");
+    // SAFETY: test-owned child window.
+    unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
+    let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    let log = events(&dir);
+    println!("EVENTS_LOG_BEGIN\n{log}EVENTS_LOG_END");
+    println!("CONTROLLER_PHASE_TARGET child_seen=true started_before_close={started_before_close}");
+    assert_eq!(exit.code(), Some(0), "a user close is a normal quit");
+    for error in STARTUP_ERRORS {
+        assert!(!log.contains(error), "unexpected {error}");
+    }
+    assert!(!log.contains("fatal-"), "no fatal path after a user close");
+    assert!(
+        !started_before_close
+            && !log.contains("started\n")
+            && log.contains("closed-during-startup"),
+        "INCONCLUSIVE: controller creation finished before WM_CLOSE was handled; rerun with a fresh directory"
+    );
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
+    println!("CLOSE_DURING_CONTROLLER_CREATION_OK pid={pid}");
     Ok(())
 }
 
