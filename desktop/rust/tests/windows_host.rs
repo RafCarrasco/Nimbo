@@ -73,6 +73,57 @@ if (role === 'top') {
 </script>"#;
 const AUTOPLAY_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; media-src blob:; connect-src 'self'; frame-src http://localhost:*";
 
+/// CP2 S1 bridge: the app-origin top page must see `nimboDesktop` and get answers; a
+/// same-origin iframe and a foreign (`localhost`) iframe must see no bridge and get no reply to
+/// messages they post themselves. Results go to /report (values URL-encoded).
+const BRIDGE_PAGE: &str = r#"<!doctype html><meta charset=utf-8><title>bridge</title><body>
+<script>
+const report = (k, x) => fetch('/report?' + k + '=' + encodeURIComponent(x)).catch(() => {});
+const role = location.pathname !== '/frame' ? 'top' : location.hostname === 'localhost' ? 'foreign' : 'same';
+report(role + '-bridge', typeof window.nimboDesktop);
+if (role === 'top') {
+  report('top-keys', Object.keys(window.nimboDesktop || {}).sort().join(','));
+  window.nimboDesktop.startAudio().then((r) => report('top-start', JSON.stringify(r)), (e) => report('top-start', 'error ' + e.message));
+  for (const src of ['/frame', 'http://localhost:' + location.port + '/frame']) {
+    const f = document.createElement('iframe');
+    f.src = src;
+    document.body.appendChild(f);
+  }
+} else if (window.chrome && window.chrome.webview) {
+  let replies = 0;
+  window.chrome.webview.addEventListener('message', () => { replies++; });
+  window.chrome.webview.postMessage({ v: 1, kind: 'hello' });
+  window.chrome.webview.postMessage({ v: 1, kind: 'invoke', id: 1, gen: 1, method: 'nimbo:audio:start', args: [] });
+  setTimeout(() => report(role + '-replies', String(replies)), 1500);
+} else {
+  report(role + '-replies', 'no-webview');
+}
+</script>"#;
+const BRIDGE_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-src 'self' http://localhost:*";
+
+/// Minimal percent-decoding for /report values written by `encodeURIComponent`.
+fn decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = raw
+            .get(i + 1..i + 3)
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 struct Fixture {
     url: String,
     log: Arc<Mutex<Vec<String>>>,
@@ -358,11 +409,12 @@ fn opens_local_fixture_and_enforces_policy() -> TestResult<()> {
         .find(|r| r.starts_with("/ "))
         .ok_or("fixture page not requested")?;
     assert!(page.contains(&format!("Nimbo/{version}")), "{page}");
+    // CP2 S1: the app-origin top document now has the bridge v1 object.
     wait_until("bridge report", || {
         fixture
             .requests()
             .iter()
-            .any(|r| r.starts_with("/report?bridge=undefined"))
+            .any(|r| r.starts_with("/report?bridge=object"))
             .then_some(())
     })?;
 
@@ -626,5 +678,61 @@ fn app_origin_autoplays_without_gesture_foreign_iframe_does_not() -> TestResult<
     drop(fixture);
     remove_scratch(&dir);
     println!("AUTOPLAY_APP_ORIGIN_OK pid={pid}");
+    Ok(())
+}
+
+/// CP2 S1 NATIVE-GATE (user-run on Windows): bridge v1 is present only in the app-origin main
+/// frame; iframes (same-origin and `localhost`) see none and never receive a reply.
+#[test]
+#[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
+fn bridge_present_in_main_frame_absent_in_iframes() -> TestResult<()> {
+    let dir = owned_scratch("nimbo-bridge")?;
+    let fixture = Fixture::serve(BRIDGE_PAGE, BRIDGE_CSP)?;
+    let mut app = App(launch(&fixture, &dir)?);
+    let pid = app.0.id();
+    let main = wait_until("main window", || main_window(pid))?;
+    let report = |key: &str| {
+        let prefix = format!("/report?{key}=");
+        fixture.requests().iter().find_map(|r| {
+            r.strip_prefix(&prefix)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(decode)
+        })
+    };
+    let top = wait_until("top bridge", || report("top-bridge"))?;
+    let keys = wait_until("top keys", || report("top-keys"))?;
+    let start = wait_until("top startAudio", || report("top-start"))?;
+    let same = wait_until("same-origin iframe bridge", || report("same-bridge"))?;
+    let foreign = wait_until("foreign iframe bridge", || report("foreign-bridge"))?;
+    let same_replies = wait_until("same-origin iframe replies", || report("same-replies"))?;
+    let foreign_replies = wait_until("foreign iframe replies", || report("foreign-replies"))?;
+    let log = events(&dir);
+    println!("EVENTS_LOG_BEGIN\n{log}EVENTS_LOG_END");
+    println!(
+        "BRIDGE_RESULTS top={top} start={start} same={same} foreign={foreign} same_replies={same_replies} foreign_replies={foreign_replies}"
+    );
+    assert_eq!(top, "object");
+    assert_eq!(
+        keys,
+        "cancelSignIn,installUpdate,onAudio,onGameEnded,onGameState,onUpdateProgress,setCaptureAudio,signIn,startAudio,startGameWatch,stopAudio,stopGameWatch,version,watchUpdate"
+    );
+    assert_eq!(start, r#"{"ok":true,"value":null}"#);
+    assert_eq!(same, "undefined", "no bridge in a same-origin iframe");
+    assert_eq!(foreign, "undefined", "no bridge in a foreign iframe");
+    for replies in [&same_replies, &foreign_replies] {
+        assert!(
+            replies == "0" || replies == "no-webview",
+            "iframe got a reply: {replies}"
+        );
+    }
+    assert!(!log.contains("bridge-frame-id-unavailable"));
+    // SAFETY: test-owned child window.
+    unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
+    let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    assert!(exit.success());
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
+    println!("BRIDGE_MAIN_FRAME_ONLY_OK pid={pid}");
     Ok(())
 }

@@ -17,6 +17,10 @@ pub struct Guards {
     pub screen_capture: bool,
     /// Context menu / DevTools / host objects / web messages settings applied.
     pub settings: bool,
+    /// The bridge v1 script's AddScriptToExecuteOnDocumentCreated completion succeeded.
+    pub bridge_script: bool,
+    /// ContentLoading (generation/main frame id) and WebMessageReceived handlers registered.
+    pub web_message: bool,
 }
 
 #[derive(Debug)]
@@ -31,7 +35,14 @@ impl Startup {
     /// through `policy::Features`, not through a process-level refusal.
     pub fn release_navigation(&self) -> Result<(), StartupError> {
         let g = self.guards;
-        if g.navigation && g.new_window && g.permissions && g.screen_capture && g.settings {
+        if g.navigation
+            && g.new_window
+            && g.permissions
+            && g.screen_capture
+            && g.settings
+            && g.bridge_script
+            && g.web_message
+        {
             Ok(())
         } else {
             Err(StartupError::MissingNativeGuards)

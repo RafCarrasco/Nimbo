@@ -15,6 +15,9 @@ with tempfile.TemporaryDirectory(prefix="nimbo-source-api-", dir=os.environ.get(
     scratch = Path(directory)
     for name in ["Cargo.toml", "Cargo.lock"]:
         shutil.copy2(root / name, scratch / name)
+    # The manifest declares [[example]] targets; their files must exist for it to parse (they
+    # need the test-host feature and are not checked here).
+    shutil.copytree(root / "examples", scratch / "examples")
     (scratch / "src").mkdir()
     source = scratch / "src/main.rs"
     prelude = """#[cfg(windows)]

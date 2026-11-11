@@ -12,6 +12,14 @@ test-host = []
 
 [dependencies]
 url = "=2.5.8"
+# Bridge v1 JSON via serde_json::Value only (no serde_derive).
+serde_json = "=1.0.154"
+
+# Debug-only transport double for the real dispatcher (stdio instead of WebView2). Never part
+# of a release build: it needs `test-host`, which build.rs and a compile_error! reject there.
+[[example]]
+name = "bridge-stdio"
+required-features = ["test-host"]
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.39.1"

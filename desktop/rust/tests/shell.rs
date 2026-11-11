@@ -167,7 +167,100 @@ fn genuine_startup_failures_report_and_exit_one() {
     }
 }
 
-const FATAL_CODES: [&str; 11] = [
+/// CP2 S1: navigation also requires the awaited bridge script and the web-message handlers.
+#[test]
+fn navigation_requires_bridge_script_and_web_message_guards() {
+    let cp1 = Guards {
+        navigation: true,
+        new_window: true,
+        permissions: true,
+        screen_capture: true,
+        settings: true,
+        ..Guards::default()
+    };
+    for (bridge_script, web_message) in [(false, false), (true, false), (false, true)] {
+        let g = Guards {
+            bridge_script,
+            web_message,
+            ..cp1
+        };
+        assert_eq!(
+            Startup::new(g).release_navigation(),
+            Err(StartupError::MissingNativeGuards),
+            "{g:?}"
+        );
+    }
+    let all = Guards {
+        bridge_script: true,
+        web_message: true,
+        ..cp1
+    };
+    assert_eq!(Startup::new(all).release_navigation(), Ok(()));
+    let failed = StartupFailure::from_wait(AsyncWaitEnd::QuitRequested, "bridge-script-failed");
+    assert_eq!(failed, StartupFailure::ClosedDuringStartup);
+}
+
+/// SOURCE-POLICY PROBE: text match on host.rs, NOT native evidence. WebView2 runtime ordering,
+/// frame attribution and script injection stay unverified until the Windows operator run.
+#[test]
+fn host_source_installs_bridge_before_navigation_in_documented_order() {
+    let src = include_str!("../src/shell/windows/host.rs");
+    let code = |name: &str| {
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} missing"));
+        let end = src[start..].find("\n}\n").map_or(src.len(), |e| start + e);
+        src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<String>()
+    };
+    let install = code("install");
+    let pos = |hay: &str, needle: &str| {
+        hay.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}"))
+    };
+    let host_objects = pos(&install, "SetAreHostObjectsAllowed(false)?");
+    let web_message = pos(&install, "SetIsWebMessageEnabled(true)?");
+    let settings_done = pos(&install, "guards.settings=true;");
+    let loading = pos(&install, "add_ContentLoading(");
+    let received = pos(&install, "add_WebMessageReceived(");
+    let web_guard = pos(&install, "guards.web_message=true;");
+    assert!(host_objects < web_message && web_message < settings_done);
+    assert!(settings_done < loading && loading < received && received < web_guard);
+    // Code only (the CP1 comment "never AddHostObjectToScript" must not match).
+    let all_code: String = src
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .flat_map(str::split_whitespace)
+        .collect();
+    assert!(!all_code.contains("SetIsWebMessageEnabled(false)"));
+    assert!(!all_code.contains("AddHostObjectToScript"));
+    assert!(install.contains("ICoreWebView2_20>()") && install.contains("FrameId("));
+    assert!(install.contains("\"bridge-frame-id-unavailable\""));
+
+    let script = code("add_bridge_script");
+    assert!(script.contains("AddScriptToExecuteOnDocumentCreated("));
+    assert!(script.contains("wait_end(webview2_com::wait_with_pump(rx))"));
+    assert!(!script.contains("wait_for_async_operation"));
+
+    let start = code("start_webview");
+    let installed = pos(&start, "install(");
+    let awaited = pos(&start, "add_bridge_script(");
+    let classified = pos(
+        &start,
+        "StartupFailure::from_wait(end,\"bridge-script-failed\")",
+    );
+    let guard = pos(&start, "guards.bridge_script=true;");
+    let release = pos(&start, ".release_navigation()");
+    let navigate = pos(&start, "Navigate(");
+    assert!(installed < awaited && awaited < classified && classified < guard);
+    assert!(guard < release && release < navigate);
+}
+
+const FATAL_CODES: [&str; 12] = [
+    "bridge-script-failed",
     "webview2-unavailable",
     "webview2-controller-failed",
     "webview2-core-failed",

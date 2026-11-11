@@ -13,8 +13,115 @@ pub const HOSTED_URL: &str = "https://golive-ad118.web.app/";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// desktop/main.cjs:24-27. `backgroundThrottling:false` (706) is covered by the same switches.
 pub const BROWSER_ARGUMENTS: &str = "--disable-renderer-backgrounding --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling";
-/// Checkpoint 1 installs NO `nimboDesktop` bridge, not even a stub: the page sees a plain browser.
-pub const BRIDGE_INSTALLED: bool = false;
+/// CP2 S1 installs the `nimboDesktop` v1 surface (bridge.rs); media/update features stay
+/// unavailable through `Features` and login is an interim internal answer.
+pub const BRIDGE_INSTALLED: bool = true;
+
+/// Bridge v1 method allowlist: the Electron preload channels plus `nimbo:capture:stop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeMethod {
+    SignIn,
+    SignInCancel,
+    CaptureAudio,
+    AudioStart,
+    AudioStop,
+    UpdateWatch,
+    UpdateInstall,
+    GameStart,
+    GameStop,
+    CaptureStop,
+}
+/// Exact argument shape per method; anything else is malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgShape {
+    Empty,
+    Bool,
+    /// One string of at most `MAX_STRING_ARG_BYTES` UTF-8 bytes.
+    ShortString,
+}
+pub const MAX_STRING_ARG_BYTES: usize = 128;
+const METHODS: [(&str, BridgeMethod, ArgShape); 10] = [
+    ("nimbo:signIn", BridgeMethod::SignIn, ArgShape::Empty),
+    (
+        "nimbo:signIn:cancel",
+        BridgeMethod::SignInCancel,
+        ArgShape::Empty,
+    ),
+    (
+        "nimbo:capture:audio",
+        BridgeMethod::CaptureAudio,
+        ArgShape::Bool,
+    ),
+    (
+        "nimbo:audio:start",
+        BridgeMethod::AudioStart,
+        ArgShape::Empty,
+    ),
+    (
+        "nimbo:audio:stop",
+        BridgeMethod::AudioStop,
+        ArgShape::ShortString,
+    ),
+    (
+        "nimbo:update:watch",
+        BridgeMethod::UpdateWatch,
+        ArgShape::Empty,
+    ),
+    (
+        "nimbo:update:install",
+        BridgeMethod::UpdateInstall,
+        ArgShape::Empty,
+    ),
+    ("nimbo:game:start", BridgeMethod::GameStart, ArgShape::Empty),
+    (
+        "nimbo:game:stop",
+        BridgeMethod::GameStop,
+        ArgShape::ShortString,
+    ),
+    (
+        "nimbo:capture:stop",
+        BridgeMethod::CaptureStop,
+        ArgShape::Empty,
+    ),
+];
+pub const BRIDGE_METHOD_NAMES: [&str; 10] = {
+    let mut names = [""; 10];
+    let mut i = 0;
+    while i < METHODS.len() {
+        names[i] = METHODS[i].0;
+        i += 1;
+    }
+    names
+};
+impl BridgeMethod {
+    /// Exact, case-sensitive match against the allowlist.
+    pub fn parse(name: &str) -> Option<Self> {
+        METHODS.iter().find(|m| m.0 == name).map(|m| m.1)
+    }
+    fn entry(self) -> &'static (&'static str, BridgeMethod, ArgShape) {
+        METHODS
+            .iter()
+            .find(|m| m.1 == self)
+            .expect("every variant is listed")
+    }
+    pub fn name(self) -> &'static str {
+        self.entry().0
+    }
+    pub fn args(self) -> ArgShape {
+        self.entry().2
+    }
+}
+/// Methods per media/update feature. Exhaustive on purpose (no wildcard): a new `Feature`
+/// variant fails to compile until its bridge methods are classified here.
+pub const fn feature_methods(feature: Feature) -> &'static [BridgeMethod] {
+    use BridgeMethod as M;
+    match feature {
+        Feature::Capture => &[M::CaptureAudio, M::CaptureStop],
+        Feature::Audio => &[M::AudioStart, M::AudioStop],
+        Feature::GameWatch => &[M::GameStart, M::GameStop],
+        Feature::Update => &[M::UpdateWatch, M::UpdateInstall],
+    }
+}
 
 /// Electron puts `Nimbo/x.y.z` in the UA; the page derives `APP_VERSION`/title from it
 /// (src/lib/version.ts:6, src/main.tsx:11).
@@ -158,6 +265,10 @@ impl Config {
     pub fn start_url(&self) -> &str {
         self.start.as_str()
     }
+    /// Serialized app origin (`scheme://host[:port]`), substituted into the injected bridge.
+    pub fn app_origin(&self) -> String {
+        self.start.origin().ascii_serialization()
+    }
     pub fn navigation(&self, raw: &str) -> Navigation {
         let Some(u) = clean_url(raw) else {
             return Navigation::Deny;
@@ -199,7 +310,7 @@ impl Config {
             )
     }
     pub fn command(&self, r: &NativeRequest<'_>, generation: u64, command: &str) -> bool {
-        self.authorize(r, generation) && command == "nimbo:capture:stop"
+        self.authorize(r, generation) && BridgeMethod::parse(command).is_some()
     }
     /// WebView2 PermissionRequested decision (main.cjs:662-678). Both the current top-level
     /// document and the requesting origin must be the app origin; never a WebView2 prompt.

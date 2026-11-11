@@ -1,10 +1,13 @@
 //! Checkpoint-1 Windows host shell: one HWND + WebView2 that opens the hosted Nimbo with the
 //! Electron window/navigation/popup/permission/UA/reload/single-instance semantics.
 //!
-//! NOT in this checkpoint: `nimboDesktop` bridge (none installed, not even a stub), login,
-//! deep-link handling or protocol registration, capture/audio/game watch, updater/installer.
+//! CP2 S1 adds the `nimboDesktop` bridge v1 (portable dispatcher in `crate::bridge`): injected
+//! script awaited before navigation, ContentLoading generation/main-frame attribution and
+//! WebMessageReceived. NOT here: login (interim answer only), deep-link handling or protocol
+//! registration, capture/audio/game watch, updater/installer.
 //! A debug-only `test-host` build replaces the hosted URL with a loopback fixture, keeps every
 //! file under an owned scratch directory and records external opens instead of launching them.
+use crate::bridge::{self, Dispatcher, Outbound};
 use crate::policy::{
     BROWSER_ARGUMENTS, CaptureDecision, Config, KeyAction, KeyInput, MAIN_WINDOW, Navigation,
     Permission, PermissionDecision, accelerator, user_agent, webview2_permission,
@@ -21,13 +24,14 @@ use std::{
     process::ExitCode,
     rc::Rc,
     sync::mpsc,
+    time::Instant,
 };
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::*;
 use windows::Win32::{
     Foundation::{
-        COLORREF, CloseHandle, E_POINTER, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM,
-        LRESULT, POINT, RECT, WPARAM,
+        COLORREF, CloseHandle, E_POINTER, E_UNEXPECTED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE,
+        HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
     },
     Graphics::Gdi::{
         CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
@@ -564,6 +568,40 @@ fn wait_end<T>(waited: webview2_com::Result<Result<T>>) -> std::result::Result<T
     }
 }
 
+/// AddScriptToExecuteOnDocumentCreated is asynchronous: the script is ready to run only after
+/// its completion handler ran (DOCUMENTED), so navigation waits for it like controller creation.
+fn add_bridge_script(core: &ICoreWebView2, script: &str) -> std::result::Result<(), AsyncWaitEnd> {
+    let (tx, rx) = mpsc::channel();
+    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        move |result, _id| {
+            let _ = tx.send(result);
+            Ok(())
+        },
+    ));
+    // SAFETY: live core on its UI thread; the completion handler is ref-counted.
+    unsafe { core.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script), &handler) }
+        .map_err(|_| AsyncWaitEnd::Failed)?;
+    wait_end(webview2_com::wait_with_pump(rx))
+}
+
+/// Posts replies to the sender's current top-level document (WebView2 discards a reply if a
+/// navigation happened first) and logs fixed codes; suppressed counts only in the recorder.
+fn deliver(core: &ICoreWebView2, out: Vec<Outbound>) -> Result<()> {
+    for item in out {
+        match item {
+            // SAFETY: live core on its UI thread.
+            Outbound::Reply(json) => unsafe { core.PostWebMessageAsJson(&HSTRING::from(json))? },
+            Outbound::Code(code) => event(code, None),
+            Outbound::Suppressed(n) => event("bridge-drops-suppressed", Some(&n.to_string())),
+        }
+    }
+    Ok(())
+}
+
+fn reentered<T>(_: T) -> windows::core::Error {
+    windows::core::Error::from_hresult(E_UNEXPECTED)
+}
+
 fn read_pwstr(read: impl FnOnce(&mut PWSTR) -> Result<()>) -> Result<String> {
     let mut value = PWSTR::null();
     read(&mut value)?;
@@ -595,6 +633,7 @@ fn install(
     controller: &ICoreWebView2Controller,
     core: &ICoreWebView2,
     config: &Rc<Config>,
+    dispatcher: &Rc<RefCell<Dispatcher>>,
     main: HWND,
 ) -> Result<Guards> {
     let mut guards = Guards::default();
@@ -606,7 +645,7 @@ fn install(
         settings.SetAreDevToolsEnabled(false)?; // no DevTools accelerator without a menu
         settings.SetIsStatusBarEnabled(false)?;
         settings.SetAreHostObjectsAllowed(false)?; // never AddHostObjectToScript
-        settings.SetIsWebMessageEnabled(false)?; // no bridge in checkpoint 1
+        settings.SetIsWebMessageEnabled(true)?; // bridge v1 JSON messages (CP2 S1)
         let settings2 = settings.cast::<ICoreWebView2Settings2>()?;
         let default_ua = read_pwstr(|p| settings2.UserAgent(p))?;
         settings2.SetUserAgent(&HSTRING::from(user_agent(&default_ua)))?;
@@ -715,6 +754,61 @@ fn install(
             &mut token,
         )?;
         guards.screen_capture = true;
+
+        // Bridge v1 attribution. DOCUMENTED: ContentLoading fires before any content, including
+        // AddScriptToExecuteOnDocumentCreated scripts, and FrameId is valid from the first
+        // ContentLoading (0 = invalid). A missing id disables only this document (fail closed).
+        let c = controller.clone();
+        let d = dispatcher.clone();
+        core.add_ContentLoading(
+            &ContentLoadingEventHandler::create(Box::new(move |sender, _| {
+                let outcome = args_or_pointer(sender).and_then(|sender| {
+                    let mut id = 0;
+                    let frame = sender
+                        .cast::<ICoreWebView2_20>()
+                        .and_then(|s| s.FrameId(&mut id));
+                    let out = {
+                        let mut d = d.try_borrow_mut().map_err(reentered)?;
+                        let mut out = d.begin_document();
+                        out.extend(match frame {
+                            Ok(()) => d.set_main_frame(id),
+                            Err(_) => d.disable_document("bridge-frame-id-unavailable"),
+                        });
+                        out
+                    };
+                    deliver(&sender, out)
+                });
+                fail_closed(&c, main, outcome)
+            })),
+            &mut token,
+        )?;
+
+        // DOCUMENTED: ICoreWebView2's WebMessageReceived is raised for the top-level document;
+        // iframe messages would need ICoreWebView2Frame's event, never subscribed. Attribution is
+        // Source + host-owned frame id/generation, checked by the dispatcher before parsing. No
+        // RefCell borrow is held across a COM call.
+        let c = controller.clone();
+        let d = dispatcher.clone();
+        let started = Instant::now();
+        core.add_WebMessageReceived(
+            &WebMessageReceivedEventHandler::create(Box::new(move |sender, args| {
+                let outcome = args_or_pointer(args).and_then(|args| {
+                    let sender = args_or_pointer(sender)?;
+                    let source = read_pwstr(|p| args.Source(p))?;
+                    let json = read_pwstr(|p| args.WebMessageAsJson(p))?;
+                    let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let out = {
+                        let mut d = d.try_borrow_mut().map_err(reentered)?;
+                        let attr = d.main_frame_request(&source);
+                        d.receive(&attr, &json, now)
+                    };
+                    deliver(&sender, out)
+                });
+                fail_closed(&c, main, outcome)
+            })),
+            &mut token,
+        )?;
+        guards.web_message = true;
 
         core.add_DocumentTitleChanged(
             &DocumentTitleChangedEventHandler::create(Box::new(move |sender, _| {
@@ -956,8 +1050,18 @@ fn start_webview(launch: &Launch, main: HWND) -> std::result::Result<(), Startup
     with_state(|s| s.controller = Some(controller.clone()));
     // SAFETY: live controller on its UI thread.
     let core = unsafe { controller.CoreWebView2() }.map_err(|_| Fatal("webview2-core-failed"))?;
-    let guards = install(&controller, &core, &launch.config, main)
+    let dispatcher = Rc::new(RefCell::new(Dispatcher::new(launch.config.clone())));
+    let mut guards = install(&controller, &core, &launch.config, &dispatcher, main)
         .map_err(|_| Fatal("guard-install-failed"))?;
+    // The bridge script must be registered (completion received) before the first navigation; a
+    // close during this wait settles like the CP1 controller wait (review R1).
+    add_bridge_script(&core, &bridge::script(&launch.config.app_origin()))
+        .map_err(|end| StartupFailure::from_wait(end, "bridge-script-failed"))?;
+    guards.bridge_script = true;
+    // SAFETY: our own window on its owning thread.
+    if !unsafe { IsWindow(Some(main)) }.as_bool() {
+        return Err(StartupFailure::ClosedDuringStartup);
+    }
     Startup::new(guards)
         .release_navigation()
         .map_err(|_| Fatal("guards-incomplete"))?;

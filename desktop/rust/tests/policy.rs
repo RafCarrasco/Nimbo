@@ -121,19 +121,72 @@ fn deny_unknown_permissions_and_commands_and_unproven_capture() {
     ] {
         assert!(!c.permission(&r, 1, permission));
     }
-    // Only resource cancellation is modeled at this checkpoint, not a real IPC dispatcher.
-    assert!(c.command(&r, 1, "nimbo:capture:stop"));
+    // CP2 S1: exactly the bridge v1 allowlist (Electron preload channels + capture:stop).
+    for command in BRIDGE_METHOD_NAMES {
+        assert!(c.command(&r, 1, command), "{command}");
+    }
     for command in [
         "nimbo:capture:start",
         "spawn",
         "eval",
         "read_file",
         "plugin:shell|open",
-        "nimbo:signIn",
+        "nimbo:signin",
+        "nimbo:signIn ",
         "nimbo:capture:stop ",
+        "nimbo:update:ready",
+        "nimbo:audio:data",
+        "",
     ] {
-        assert!(!c.command(&r, 1, command));
+        assert!(!c.command(&r, 1, command), "{command:?}");
     }
+}
+
+#[test]
+fn bridge_allowlist_and_arg_shapes_are_exact() {
+    assert_eq!(
+        BRIDGE_METHOD_NAMES,
+        [
+            "nimbo:signIn",
+            "nimbo:signIn:cancel",
+            "nimbo:capture:audio",
+            "nimbo:audio:start",
+            "nimbo:audio:stop",
+            "nimbo:update:watch",
+            "nimbo:update:install",
+            "nimbo:game:start",
+            "nimbo:game:stop",
+            "nimbo:capture:stop",
+        ]
+    );
+    for name in BRIDGE_METHOD_NAMES {
+        let method = BridgeMethod::parse(name).expect(name);
+        assert_eq!(method.name(), name);
+        let shape = match name {
+            "nimbo:capture:audio" => ArgShape::Bool,
+            "nimbo:audio:stop" | "nimbo:game:stop" => ArgShape::ShortString,
+            _ => ArgShape::Empty,
+        };
+        assert_eq!(method.args(), shape, "{name}");
+    }
+    assert_eq!(MAX_STRING_ARG_BYTES, 128);
+    assert_eq!(BridgeMethod::parse("NIMBO:SIGNIN"), None);
+    // Exhaustive per Feature (no wildcard in policy.rs): a new Feature variant fails to compile
+    // until it is classified; every feature method is in the allowlist and none is shared.
+    let mut seen = Vec::new();
+    for f in [
+        Feature::Capture,
+        Feature::Audio,
+        Feature::GameWatch,
+        Feature::Update,
+    ] {
+        for m in feature_methods(f) {
+            assert!(BRIDGE_METHOD_NAMES.contains(&m.name()));
+            assert!(!seen.contains(m), "{m:?} classified twice");
+            seen.push(*m);
+        }
+    }
+    assert_eq!(seen.len(), 8, "only signIn/cancel are feature-less (login)");
 }
 
 // ---- Checkpoint 1 shell policy (Electron desktop/main.cjs parity contract) ----
@@ -443,8 +496,8 @@ fn features_default_unavailable() {
     ] {
         assert!(!features.available(f), "{f:?}");
     }
-    // No nimboDesktop bridge (not even a stub returning errors) is installed in checkpoint 1.
-    const { assert!(!BRIDGE_INSTALLED) };
+    // CP2 S1 installs the bridge v1 surface; every media/update feature stays unavailable.
+    const { assert!(BRIDGE_INSTALLED) };
 }
 
 #[test]
