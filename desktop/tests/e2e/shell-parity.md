@@ -62,7 +62,7 @@ resolved in either direction, and the Rust code is not changed to "match" withou
 | 10 | External link | open a non-app https link (e.g. a footer/help link) | | navigation cancelled, opened in the default browser | | |
 | 11 | Popup | `target=_blank` / `window.open` to https | | never an app window; https opens in the default browser | | |
 | 12 | F5 | on the login screen | | reload once (handled; no double reload) | | |
-| 13 | Ctrl+R and Ctrl+Shift+R | same | | reload once | | |
+| 13 | Ctrl+R | same | | reload once (handled) | | |
 | 14 | Title | read the taskbar/window title | | "Nimbo 0.4.1" after load (UA `Nimbo/0.4.1`) | | |
 | 15 | Minimum size | drag the corner to the smallest size | | 850×590 DIP, scaled per monitor DPI | | |
 | 16 | Second instance | launch again while running; also while minimized | | first window restored and focused, second exits | | |
@@ -77,6 +77,11 @@ resolved in either direction, and the Rust code is not changed to "match" withou
 | 25 | Moving between monitors with different DPI | drag across | | resized to the suggested rect (`WM_DPICHANGED`) | | |
 | 26 | WebView2 Runtime missing | only on a disposable VM without the runtime | n/a (Electron bundles Chromium) | native error dialog, exit 1, decide | | |
 | 27 | Background throttling (window covered/minimized) | covered by later live checkpoints | | same 4 Chromium switches as Electron; WebView never hidden on minimize | | |
+| 28 | Alt+← / Alt+→ (history back/forward) | navigate inside the site (e.g. open a footer/help page that stays in the app, if any), then press | | WebView2 browser accelerator default (`AreBrowserAcceleratorKeysEnabled` not changed): history navigation; navigation policy still applies to the target; decide | | |
+| 29 | Mouse back/forward buttons (XButton1/XButton2) | same, with a 5-button mouse | | WebView2 default history navigation, not handled by the host; decide | | |
+| 30 | Ctrl+S | on the login screen | | WebView2 default (not handled by the host; may open a save-page dialog); decide | | |
+| 31 | Ctrl+Shift+R | on the login screen | | reload once (same handler as Ctrl+R; Shift ignored, like Electron's `key.toLowerCase()==='r'`); normal reload, not a cache bypass | | |
+| 32 | Autoplay with sound (live tile audio without a prior click) | needs a signed-in live view: NOT testable at CP1 without login; CARRY FORWARD to the live checkpoint. Electron's documented default is `autoplayPolicy: no-user-gesture-required` (not overridden in `desktop/main.cjs`, not part of its permission handler); record what is actually heard | | PENDING USER DECISION `CP1-F3-autoplay` (parity vs explicit gesture), not accepted either way. Current code, unchanged in this cycle: the WebView2 AUTOPLAY permission kind maps to `Permission::Other` and is explicitly DENIED; no `--autoplay-policy` switch. `src/components/LiveTile.tsx` mutes the tile on `NotAllowedError` | | expected difference from the documented Electron default until decided; not a hardening |
 
 ## Automated interactive host test (test-host build, loopback fixture only)
 
@@ -90,6 +95,31 @@ scratch directory):
 Pass requires the line `REAL_WINDOWS_HOST_POLICY_OK`. Record the full output, exit status and the
 `events.log` beneath the printed `ISOLATED_HOST_DIR`. Delete that directory only after the test-host
 and its WebView2 processes have exited. Enforce an external timeout if the run hangs.
+
+The same command also runs the two startup-lifecycle regressions from review correction cycle 1
+(each uses its own fresh `nimbo-close-<pid>` / `nimbo-fatal-<pid>` directory, prints its
+`events.log`, kills the host process tree on a timeout and removes its directory when released):
+
+- `close_during_startup_quits_quietly` (F2): WM_CLOSE as soon as the main window exists, on a cold
+  profile. Pass line `CLOSE_DURING_STARTUP_OK`: exit 0, `closed-during-startup` recorded, no
+  `webview2-unavailable` / `webview2-controller-failed` / `fatal-dialog`. If WebView2 started first,
+  the test fails as INCONCLUSIVE; rerun it, never record that as a pass.
+- `startup_failure_discards_quit_before_reporting` (F1): the child alone gets
+  `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` pointing at a missing folder. Pass line
+  `STARTUP_FAILURE_REPORT_OK`: exit 1 (not 101), and `webview2-unavailable`, `fatal-quit-discarded`,
+  `fatal-dialog webview2-unavailable` recorded in that order. The test host records the dialog
+  path instead of showing it, so this does not prove the real MessageBox stays visible (row 26 and
+  F1 operator check below).
+
+## Startup lifecycle operator checks (RELEASE build, review correction cycle 1)
+
+NOT VERIFIED until performed. Record exit codes with
+`$p = Start-Process -FilePath <nimbo-desktop.exe> -PassThru -Wait; $p.ExitCode`.
+
+| # | Case | How to test | Expected (Rust intent) | Observed | Exit code |
+|---|---|---|---|---|---|
+| F1 | WebView2 Runtime missing or unusable | disposable VM without the runtime (row 26) | error dialog "O Nimbo não conseguiu abrir…" stays open until OK is pressed (does not flash and vanish); then exit 1 | | |
+| F2 | Close during startup | Windows user without `%LOCALAPPDATA%\Nimbo\WebView2` (cold profile; do not delete an existing one), press Alt+F4 or X as soon as the window appears | window closes, no error dialog, no crash/abort dialog, process exits 0, no leftover `nimbo-desktop.exe` in Task Manager | | |
 
 ## Screenshot checklist (operator evidence, not stored in the repository)
 

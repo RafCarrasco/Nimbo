@@ -39,6 +39,49 @@ impl Startup {
     }
 }
 
+/// How a WebView2 asynchronous startup wait (environment or controller creation, pumped by
+/// `webview2_com::wait_with_pump`) ended without a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncWaitEnd {
+    /// The startup pump retrieved WM_QUIT (`webview2_com::Error::TaskCanceled`): the visible
+    /// main window was closed and destroyed before WebView2 finished starting.
+    QuitRequested,
+    /// The WebView2 call or its completion reported an error.
+    Failed,
+}
+
+/// Why the host stopped before reaching its message loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupFailure {
+    /// A normal user close during startup: quiet exit 0, no dialog (Electron simply quits,
+    /// main.cjs:730).
+    ClosedDuringStartup,
+    /// A genuine failure with its fixed log code: error dialog and exit 1.
+    Fatal(&'static str),
+}
+impl StartupFailure {
+    /// Classifies an asynchronous WebView2 wait; `fatal_code` names the failing step.
+    pub fn from_wait(end: AsyncWaitEnd, fatal_code: &'static str) -> Self {
+        match end {
+            AsyncWaitEnd::QuitRequested => Self::ClosedDuringStartup,
+            AsyncWaitEnd::Failed => Self::Fatal(fatal_code),
+        }
+    }
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ClosedDuringStartup => "closed-during-startup",
+            Self::Fatal(code) => code,
+        }
+    }
+    /// Whether the native error dialog must be shown (never after a user close).
+    pub fn reports_error(&self) -> bool {
+        matches!(self, Self::Fatal(_))
+    }
+    pub fn exit_status(&self) -> u8 {
+        if self.reports_error() { 1 } else { 0 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub left: i32,

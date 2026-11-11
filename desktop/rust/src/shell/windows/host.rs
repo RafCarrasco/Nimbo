@@ -10,8 +10,8 @@ use crate::policy::{
     Permission, PermissionDecision, accelerator, user_agent,
 };
 use crate::shell::{
-    Guards, InstanceIdentity, InstanceRequest, Rect, Startup, colorref, initial_window_rect,
-    instance_request, min_track_size, window_title,
+    AsyncWaitEnd, Guards, InstanceIdentity, InstanceRequest, Rect, Startup, StartupFailure,
+    colorref, initial_window_rect, instance_request, min_track_size, window_title,
 };
 use std::{
     cell::RefCell,
@@ -503,60 +503,63 @@ fn create_windows(identity: &InstanceIdentity) -> Result<(HWND, HWND)> {
 
 // ---------- WebView2 ----------
 
-fn create_environment(user_data: &Path) -> Result<ICoreWebView2Environment> {
+// Environment/controller creation uses its own completion handler plus
+// `webview2_com::wait_with_pump` instead of `wait_for_async_operation`: that helper `expect`s
+// its channel send, so a completion delivered after the startup wait already ended (the user
+// closed the window, or a later modal loop dispatches it) would panic inside the COM callback
+// and abort. Here a late completion finds no receiver and is dropped quietly.
+
+fn create_environment(
+    user_data: &Path,
+) -> std::result::Result<ICoreWebView2Environment, AsyncWaitEnd> {
     let options = CoreWebView2EnvironmentOptions::default();
     // SAFETY: options object is exclusively owned here before being handed to WebView2.
     unsafe { options.set_additional_browser_arguments(BROWSER_ARGUMENTS.to_owned()) };
     let options: ICoreWebView2EnvironmentOptions = options.into();
     let folder = HSTRING::from(user_data.as_os_str());
     let (tx, rx) = mpsc::channel();
-    CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
-        Box::new(move |handler| unsafe {
-            // SAFETY: arguments live for the call; the completion handler is ref-counted.
-            CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &folder, &options, &handler)
-                .map_err(webview2_com::Error::WindowsError)
-        }),
-        Box::new(move |result, environment| {
-            result?;
-            tx.send(environment.ok_or_else(|| windows::core::Error::from_hresult(E_POINTER)))
-                .map_err(|_| windows::core::Error::from_hresult(E_POINTER))?;
+    let handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+        move |result, environment| {
+            let _ = tx.send(result.and_then(|()| {
+                environment.ok_or_else(|| windows::core::Error::from_hresult(E_POINTER))
+            }));
             Ok(())
-        }),
-    )
-    .map_err(webview_error)?;
-    rx.recv()
-        .map_err(|_| windows::core::Error::from_hresult(E_POINTER))?
+        },
+    ));
+    // SAFETY: arguments live for the call; the completion handler is ref-counted.
+    unsafe {
+        CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &folder, &options, &handler)
+    }
+    .map_err(|_| AsyncWaitEnd::Failed)?;
+    wait_end(webview2_com::wait_with_pump(rx))
 }
 
 fn create_controller(
     environment: &ICoreWebView2Environment,
     main: HWND,
-) -> Result<ICoreWebView2Controller> {
-    let environment = environment.clone();
+) -> std::result::Result<ICoreWebView2Controller, AsyncWaitEnd> {
     let (tx, rx) = mpsc::channel();
-    CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
-        Box::new(move |handler| unsafe {
-            // SAFETY: `main` is our live top-level window on this thread.
-            environment
-                .CreateCoreWebView2Controller(main, &handler)
-                .map_err(webview2_com::Error::WindowsError)
-        }),
-        Box::new(move |result, controller| {
-            result?;
-            tx.send(controller.ok_or_else(|| windows::core::Error::from_hresult(E_POINTER)))
-                .map_err(|_| windows::core::Error::from_hresult(E_POINTER))?;
+    let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
+        move |result, controller| {
+            let _ = tx.send(result.and_then(|()| {
+                controller.ok_or_else(|| windows::core::Error::from_hresult(E_POINTER))
+            }));
             Ok(())
-        }),
-    )
-    .map_err(webview_error)?;
-    rx.recv()
-        .map_err(|_| windows::core::Error::from_hresult(E_POINTER))?
+        },
+    ));
+    // SAFETY: `main` is our live top-level window on this thread; the handler is ref-counted.
+    unsafe { environment.CreateCoreWebView2Controller(main, &handler) }
+        .map_err(|_| AsyncWaitEnd::Failed)?;
+    wait_end(webview2_com::wait_with_pump(rx))
 }
 
-fn webview_error(error: webview2_com::Error) -> windows::core::Error {
-    match error {
-        webview2_com::Error::WindowsError(e) => e,
-        _ => windows::core::Error::from_hresult(E_POINTER),
+/// Keeps the pinned crate's error taxonomy: only `TaskCanceled` (the startup pump retrieved
+/// WM_QUIT) means "closed during startup"; every other error is a genuine failure.
+fn wait_end<T>(waited: webview2_com::Result<Result<T>>) -> std::result::Result<T, AsyncWaitEnd> {
+    match waited {
+        Ok(completed) => completed.map_err(|_| AsyncWaitEnd::Failed),
+        Err(webview2_com::Error::TaskCanceled) => Err(AsyncWaitEnd::QuitRequested),
+        Err(_) => Err(AsyncWaitEnd::Failed),
     }
 }
 
@@ -781,10 +784,46 @@ fn fail_closed(
 
 // ---------- entry point ----------
 
-fn fatal(test_host: bool, code: &str) {
+/// Removes this thread's pending quit request, if any. A failed startup destroys the main
+/// window (WM_DESTROY → PostQuitMessage) before the error is reported, and a pending WM_QUIT
+/// ends any modal loop, including MessageBox's, before the user can read it (review F1).
+/// PeekMessage always retrieves WM_QUIT regardless of the filter; the filter keeps every other
+/// posted message queued. Returns whether a quit request was removed.
+fn discard_pending_quit() -> bool {
+    let mut removed = false;
+    let mut message = MSG::default();
+    for _ in 0..8 {
+        // SAFETY: plain queue query on the calling thread.
+        if !unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE) }.as_bool() {
+            break;
+        }
+        removed |= message.message == WM_QUIT;
+    }
+    removed
+}
+
+/// Debug-only check that no WM_QUIT is pending (PM_NOREMOVE leaves the queue unchanged).
+fn quit_pending() -> bool {
+    let mut message = MSG::default();
+    // SAFETY: plain queue query on the calling thread.
+    unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) }.as_bool()
+}
+
+/// Reports a genuine startup failure after all teardown (WebView closed, windows destroyed,
+/// COM uninitialized). The test host records `fatal-dialog <code>` on exactly this path
+/// instead of showing modal UI; release shows the dialog.
+fn report_startup_failure(test_host: bool, code: &str) {
     event(code, None);
+    if discard_pending_quit() {
+        event("fatal-quit-discarded", None);
+    }
+    debug_assert!(
+        !quit_pending(),
+        "WM_QUIT would dismiss the startup error dialog"
+    );
+    event("fatal-dialog", Some(code));
     if !test_host {
-        // SAFETY: modal dialog with constant strings; no owner window may exist.
+        // SAFETY: modal dialog with constant strings; the main window is already destroyed.
         unsafe {
             MessageBoxW(
                 None,
@@ -830,7 +869,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(_) => {
-            fatal(launch.test_host, "single-instance-failed");
+            report_startup_failure(launch.test_host, "single-instance-failed");
             return ExitCode::FAILURE;
         }
     };
@@ -838,21 +877,29 @@ pub fn run(args: &[OsString]) -> ExitCode {
     drop(lock);
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(code) => {
-            fatal(launch.test_host, code);
-            ExitCode::FAILURE
+        Err(failure) if failure.reports_error() => {
+            report_startup_failure(launch.test_host, failure.code());
+            ExitCode::from(failure.exit_status())
+        }
+        Err(failure) => {
+            // The user closed the window while WebView2 was starting: quiet quit, like
+            // Electron (main.cjs:730). No dialog; the host adds no message pumping, and a late
+            // WebView2 completion (e.g. dispatched during COM teardown) is dropped, not a panic.
+            event(failure.code(), None);
+            ExitCode::from(failure.exit_status())
         }
     }
 }
 
-fn run_window(launch: &Launch) -> std::result::Result<(), &'static str> {
+fn run_window(launch: &Launch) -> std::result::Result<(), StartupFailure> {
+    use StartupFailure::Fatal;
     // SAFETY: STA required by WebView2; balanced by `Apartment`.
     if unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_err() {
-        return Err("com-init-failed");
+        return Err(Fatal("com-init-failed"));
     }
     let _apartment = Apartment;
-    std::fs::create_dir_all(&launch.user_data).map_err(|_| "user-data-unavailable")?;
-    let (main, message) = create_windows(&launch.identity).map_err(|_| "window-failed")?;
+    std::fs::create_dir_all(&launch.user_data).map_err(|_| Fatal("user-data-unavailable"))?;
+    let (main, message) = create_windows(&launch.identity).map_err(|_| Fatal("window-failed"))?;
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
             main,
@@ -866,10 +913,17 @@ fn run_window(launch: &Launch) -> std::result::Result<(), &'static str> {
             message_loop();
             Ok(())
         }
-        Err(code) => {
-            // SAFETY: our own window; WM_DESTROY closes any controller.
-            let _ = unsafe { DestroyWindow(main) };
-            Err(code)
+        Err(failure) => {
+            // A user close already destroyed the window inside the startup pump; never call
+            // DestroyWindow on a stale handle. Otherwise WM_DESTROY closes any controller (its
+            // PostQuitMessage is discarded before a dialog by `report_startup_failure`).
+            // SAFETY: our own window on its owning thread.
+            unsafe {
+                if IsWindow(Some(main)).as_bool() {
+                    let _ = DestroyWindow(main);
+                }
+            }
+            Err(failure)
         }
     };
     // SAFETY: our own message-only window.
@@ -878,26 +932,28 @@ fn run_window(launch: &Launch) -> std::result::Result<(), &'static str> {
     result
 }
 
-fn start_webview(launch: &Launch, main: HWND) -> std::result::Result<(), &'static str> {
-    let environment = create_environment(&launch.user_data).map_err(|_| "webview2-unavailable")?;
-    let controller =
-        create_controller(&environment, main).map_err(|_| "webview2-controller-failed")?;
+fn start_webview(launch: &Launch, main: HWND) -> std::result::Result<(), StartupFailure> {
+    use StartupFailure::Fatal;
+    let environment = create_environment(&launch.user_data)
+        .map_err(|end| StartupFailure::from_wait(end, "webview2-unavailable"))?;
+    let controller = create_controller(&environment, main)
+        .map_err(|end| StartupFailure::from_wait(end, "webview2-controller-failed"))?;
     with_state(|s| s.controller = Some(controller.clone()));
     // SAFETY: live controller on its UI thread.
-    let core = unsafe { controller.CoreWebView2() }.map_err(|_| "webview2-core-failed")?;
-    let guards =
-        install(&controller, &core, &launch.config, main).map_err(|_| "guard-install-failed")?;
+    let core = unsafe { controller.CoreWebView2() }.map_err(|_| Fatal("webview2-core-failed"))?;
+    let guards = install(&controller, &core, &launch.config, main)
+        .map_err(|_| Fatal("guard-install-failed"))?;
     Startup::new(guards)
         .release_navigation()
-        .map_err(|_| "guards-incomplete")?;
+        .map_err(|_| Fatal("guards-incomplete"))?;
     resize_controller(main);
     // SAFETY: as above; guards were all registered before this first navigation.
     unsafe {
         controller
             .SetIsVisible(true)
-            .map_err(|_| "webview2-visibility-failed")?;
+            .map_err(|_| Fatal("webview2-visibility-failed"))?;
         core.Navigate(&HSTRING::from(launch.config.start_url()))
-            .map_err(|_| "navigate-failed")?;
+            .map_err(|_| Fatal("navigate-failed"))?;
     }
     event("started", None);
     Ok(())

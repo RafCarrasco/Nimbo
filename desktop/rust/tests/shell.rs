@@ -137,6 +137,87 @@ fn single_instance_identity_and_focus_message() {
     }
 }
 
+/// Review F2: a WebView2 startup wait that ends because the startup pump retrieved WM_QUIT
+/// (the user closed the visible window) is a normal quit, never a "WebView2 missing" error.
+#[test]
+fn startup_closed_by_user_is_quiet_success_not_a_webview2_error() {
+    let closed = StartupFailure::from_wait(AsyncWaitEnd::QuitRequested, "webview2-unavailable");
+    assert_eq!(closed, StartupFailure::ClosedDuringStartup);
+    assert_eq!(closed.code(), "closed-during-startup");
+    assert!(!closed.reports_error(), "no dialog after a user close");
+    assert_eq!(closed.exit_status(), 0);
+    assert_eq!(
+        StartupFailure::from_wait(AsyncWaitEnd::QuitRequested, "webview2-controller-failed"),
+        StartupFailure::ClosedDuringStartup
+    );
+}
+
+/// Every genuine startup failure keeps its fixed code, reports the error dialog and exits 1.
+#[test]
+fn genuine_startup_failures_report_and_exit_one() {
+    for code in [
+        "webview2-unavailable",
+        "webview2-controller-failed",
+        "webview2-core-failed",
+        "guard-install-failed",
+        "guards-incomplete",
+        "webview2-visibility-failed",
+        "navigate-failed",
+        "window-failed",
+        "com-init-failed",
+        "user-data-unavailable",
+        "single-instance-failed",
+    ] {
+        let failure = StartupFailure::Fatal(code);
+        assert_eq!(
+            StartupFailure::from_wait(AsyncWaitEnd::Failed, code),
+            failure
+        );
+        assert_eq!(failure.code(), code);
+        assert!(failure.reports_error(), "{code}");
+        assert_eq!(failure.exit_status(), 1, "{code}");
+    }
+}
+
+/// Source-ordering check ONLY (portable, Linux): it does not execute or prove the native
+/// MessageBox/WM_QUIT/WebView2 behavior, which stays NOT VERIFIED until the Windows operator run.
+#[test]
+fn host_source_orders_quit_discard_before_dialog_and_keeps_task_canceled() {
+    let src = include_str!("../src/shell/windows/host.rs");
+    let body = |name: &str| {
+        let start = src
+            .find(&format!("fn {name}"))
+            .unwrap_or_else(|| panic!("fn {name} missing"));
+        let end = src[start..].find("\n}\n").map_or(src.len(), |e| start + e);
+        // Whitespace-insensitive, so rustfmt line breaks do not matter.
+        src[start..end].split_whitespace().collect::<String>()
+    };
+    let fatal = body("report_startup_failure");
+    let discard = fatal
+        .find("discard_pending_quit()")
+        .expect("quit discarded");
+    let assert = fatal
+        .find("debug_assert!(!quit_pending()")
+        .expect("debug assert");
+    let record = fatal
+        .find("\"fatal-dialog\"")
+        .expect("recorded dialog event");
+    let dialog = fatal.find("MessageBoxW(").expect("dialog");
+    assert!(discard < assert && assert < record && record < dialog);
+    for name in ["create_environment", "create_controller"] {
+        let f = body(name);
+        assert!(
+            !f.contains("wait_for_async_operation"),
+            "{name}: helper panics on late completion"
+        );
+        assert!(f.contains("wait_with_pump(rx)"), "{name}");
+    }
+    assert!(
+        body("wait_end")
+            .contains("Err(webview2_com::Error::TaskCanceled)=>Err(AsyncWaitEnd::QuitRequested)")
+    );
+}
+
 #[cfg(feature = "test-host")]
 #[test]
 fn test_host_identity_and_args_are_isolated() {

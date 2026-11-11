@@ -121,13 +121,48 @@ impl Drop for Fixture {
 struct App(Child);
 impl Drop for App {
     fn drop(&mut self) {
-        // Bounded teardown: the WM_CLOSE path is exercised in the test body; this is a backstop.
+        // Bounded teardown, also on a timeout/early `?`: the WM_CLOSE path is exercised in the
+        // test body; this backstop kills the host AND its WebView2 child process tree.
         if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = Command::new("taskkill")
+                .args(["/T", "/F", "/PID"])
+                .arg(self.0.id().to_string())
+                .status();
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
     }
 }
+
+/// Removes a per-test scratch directory once the WebView2 processes released it (bounded).
+fn remove_scratch(dir: &Path) {
+    for _ in 0..50 {
+        if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+            println!("SCRATCH_REMOVED {}", dir.display());
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!(
+        "SCRATCH_LEFT {} (delete after WebView2 exits)",
+        dir.display()
+    );
+}
+
+fn owned_scratch(name: &str) -> TestResult<PathBuf> {
+    let root = std::env::var_os("NIMBO_HOST_TEST_DIR")
+        .ok_or("set NIMBO_HOST_TEST_DIR to an owned empty scratch directory")?;
+    let dir = PathBuf::from(root).join(format!("{name}-{}", std::process::id()));
+    std::fs::create_dir(&dir)?; // fresh => cold WebView2 profile
+    println!("ISOLATED_HOST_DIR {}", dir.display());
+    Ok(dir)
+}
+
+const STARTUP_ERRORS: [&str; 3] = [
+    "webview2-unavailable",
+    "webview2-controller-failed",
+    "fatal-dialog",
+];
 
 fn wait_until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> TestResult<T> {
     let start = Instant::now();
@@ -340,5 +375,89 @@ fn opens_local_fixture_and_enforces_policy() -> TestResult<()> {
     let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
     assert!(exit.success());
     println!("REAL_WINDOWS_HOST_POLICY_OK pid={pid}");
+    Ok(())
+}
+
+/// Review F2: the user closes the visible main window while WebView2 environment/controller
+/// creation is still pending (fresh, cold profile). Expected: quiet exit 0, no WebView2 error.
+#[test]
+#[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
+fn close_during_startup_quits_quietly() -> TestResult<()> {
+    let dir = owned_scratch("nimbo-close")?;
+    let fixture = Fixture::start()?;
+    let mut app = App(launch(&fixture, &dir)?);
+    let pid = app.0.id();
+    // Poll tightly: the window is shown before WebView2 creation starts.
+    let start = Instant::now();
+    let main = loop {
+        if let Some(main) = main_window(pid) {
+            break main;
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            return Err("timed out waiting for main window".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // SAFETY: test-owned child window.
+    unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
+    let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    let log = events(&dir);
+    println!("EVENTS_LOG_BEGIN\n{log}EVENTS_LOG_END");
+    assert_eq!(exit.code(), Some(0), "a user close is a normal quit");
+    for error in STARTUP_ERRORS {
+        assert!(!log.contains(error), "unexpected {error}");
+    }
+    assert!(
+        log.contains("closed-during-startup"),
+        "INCONCLUSIVE: WebView2 started before WM_CLOSE was handled; rerun with a fresh directory"
+    );
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
+    println!("CLOSE_DURING_STARTUP_OK pid={pid}");
+    Ok(())
+}
+
+/// Review F1: a genuine WebView2 environment failure after the window exists. The documented
+/// WEBVIEW2_BROWSER_EXECUTABLE_FOLDER override points at a missing runtime folder (child env
+/// only). The test host records `fatal-dialog` on the exact pre-dialog path instead of showing
+/// modal UI; the real MessageBox stays the operator check (parity row 26).
+#[test]
+#[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
+fn startup_failure_discards_quit_before_reporting() -> TestResult<()> {
+    let dir = owned_scratch("nimbo-fatal")?;
+    let fixture = Fixture::start()?;
+    let child = Command::new(EXE)
+        .env(
+            "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+            dir.join("missing-runtime"),
+        )
+        .arg("--test-host-url")
+        .arg(&fixture.url)
+        .arg("--test-host-dir")
+        .arg(&dir)
+        .spawn()?;
+    let mut app = App(child);
+    let pid = app.0.id();
+    let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    let log = events(&dir);
+    println!("EVENTS_LOG_BEGIN\n{log}EVENTS_LOG_END");
+    // 101 would mean the debug_assert (WM_QUIT still pending before the dialog) fired.
+    assert_eq!(exit.code(), Some(1), "genuine failure exits 1");
+    let order = [
+        "webview2-unavailable\n",
+        "fatal-quit-discarded\n",
+        "fatal-dialog webview2-unavailable\n",
+    ]
+    .map(|line| log.find(line));
+    assert!(
+        order.iter().all(Option::is_some) && order.is_sorted(),
+        "expected failure, discarded WM_QUIT, then dialog: {order:?}"
+    );
+    assert!(!log.contains("started"), "no navigation after a failure");
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
+    println!("STARTUP_FAILURE_REPORT_OK pid={pid}");
     Ok(())
 }
