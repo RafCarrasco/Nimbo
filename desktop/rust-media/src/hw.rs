@@ -5,7 +5,7 @@
 //! Intel ou AMD) → H.264 em formato Annex B, pronto para o WebRTC. A CPU só move ponteiros.
 
 use std::mem::ManuallyDrop;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
@@ -16,8 +16,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
     D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
     D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
-    ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
-    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
+    ID3D11RenderTargetView, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice,
+    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+    ID3D11VideoProcessorOutputView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
@@ -26,7 +27,7 @@ use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
     CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
     CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
-    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample, IMFTransform,
+    IMFDXGIDeviceManager, IMFMediaEventGenerator, IMFSample, IMFShutdown, IMFTransform,
     MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS, METransformHaveOutput, METransformNeedInput,
     MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
     MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE,
@@ -38,6 +39,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_High,
 };
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 use windows::core::Interface;
@@ -47,6 +49,11 @@ use crate::AnyError;
 /// Quantas texturas NV12 ficam em rodízio. O codificador pode segurar algumas enquanto trabalha.
 const POOL: usize = 8;
 /// `MF_EVENT_FLAG_NO_WAIT`: pega o evento se houver, sem esperar.
+/// Quanto esperar pelo quadro codificado depois de entregar a entrada. A placa leva ~3 ms em 1080p;
+/// colher na hora tira um quadro inteiro de atraso e não deixa o último quadro preso.
+const OUTPUT_WAIT: Duration = Duration::from_millis(12);
+/// Sem o codificador pedir entrada por este tempo, ele travou: quem usa recria.
+const STALLED: Duration = Duration::from_secs(3);
 const NO_WAIT: MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS = MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(1);
 const MF_VIDEO_INTERLACE_PROGRESSIVE: u32 = 2;
 
@@ -63,10 +70,16 @@ pub struct HwEncoder {
     /// Cópia do quadro capturado numa textura nossa, que o processador de vídeo aceita como entrada.
     source: ID3D11Texture2D,
     source_view: ID3D11VideoProcessorInputView,
+    /// Para pintar a textura de entrada de uma cor só (tela de pausa).
+    source_target: ID3D11RenderTargetView,
     pool: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
     next: usize,
     /// Quantos quadros o codificador pediu e ainda não recebeu.
     wants: u32,
+    /// Quadros entregues cuja saída ainda não voltou: cada um segura uma textura do rodízio.
+    inflight: usize,
+    /// Última vez que o codificador aceitou um quadro (vigia de travamento).
+    accepted: Instant,
     fps: u32,
     start: Instant,
     pub name: String,
@@ -121,6 +134,9 @@ impl HwEncoder {
         // chamada; cada interface retornada é contada por referência pelo próprio tipo.
         unsafe {
             MFStartup(MF_VERSION, 0)?;
+            // Relógio do Windows em 1 ms enquanto houver live: as esperas curtas daqui e do envio
+            // (controle de banda) atrasariam ~15 ms com o relógio padrão. Desfeito no Drop.
+            let _ = timeBeginPeriod(1);
             // O codificador usa o dispositivo em threads dele: o Direct3D precisa se proteger.
             let _ = context
                 .cast::<ID3D11Multithread>()?
@@ -207,6 +223,9 @@ impl HwEncoder {
                 Some(&mut source_view),
             )?;
             let source_view = source_view.ok_or("sem vista de entrada do processador de vídeo")?;
+            let mut source_target = None;
+            device.CreateRenderTargetView(&source, None, Some(&mut source_target))?;
+            let source_target = source_target.ok_or("sem alvo de desenho na textura de entrada")?;
             let mut pool = Vec::with_capacity(POOL);
             for _ in 0..POOL {
                 let nv12 = texture(
@@ -322,9 +341,12 @@ impl HwEncoder {
                 enumerator,
                 source,
                 source_view,
+                source_target,
                 pool,
                 next: 0,
                 wants: 0,
+                inflight: 0,
+                accepted: Instant::now(),
                 fps,
                 start: Instant::now(),
                 name,
@@ -344,22 +366,47 @@ impl HwEncoder {
         }
     }
 
-    /// Entrega um quadro capturado. Devolve em `out` os quadros H.264 que ficaram prontos (em geral
-    /// o anterior). Retorna `false` se o codificador estava ocupado e o quadro foi descartado.
+    /// Entrega um quadro capturado e devolve em `out` o H.264 dele. Retorna `false` se o
+    /// codificador estava ocupado e o quadro foi descartado.
     pub fn encode(
         &mut self,
         frame: &ID3D11Texture2D,
         keyframe: bool,
         out: &mut Vec<Vec<u8>>,
     ) -> Result<bool, AnyError> {
+        self.copy(frame);
+        self.submit(keyframe, out)
+    }
+
+    /// Guarda o quadro capturado na textura de entrada (cópia dentro da GPU).
+    pub fn copy(&self, frame: &ID3D11Texture2D) {
+        // SAFETY: as duas texturas são do mesmo dispositivo, com o mesmo tamanho e formato.
+        unsafe { self.context.CopyResource(&self.source, frame) };
+    }
+
+    /// Pinta a textura de entrada de uma cor só: é a imagem enviada enquanto a live está pausada.
+    pub fn fill(&self, rgba: [f32; 4]) {
+        // SAFETY: a vista pertence à textura de entrada deste codificador.
+        unsafe {
+            self.context
+                .ClearRenderTargetView(&self.source_target, &rgba)
+        };
+    }
+
+    /// Codifica o que está na textura de entrada (o último quadro copiado, ou a cor da pausa).
+    /// Serve também para repetir o quadro quando a tela está parada e alguém precisa de imagem.
+    pub fn submit(&mut self, keyframe: bool, out: &mut Vec<Vec<u8>>) -> Result<bool, AnyError> {
         self.drain(out)?;
-        if self.wants == 0 {
+        if self.wants == 0 || self.inflight + 1 >= POOL {
+            // Ocupado. Se ficar assim por muito tempo, travou: o erro faz quem usa recriar.
+            if self.accepted.elapsed() > STALLED {
+                return Err("o codificador da placa parou de responder".into());
+            }
             return Ok(false);
         }
         // SAFETY: texturas e vistas pertencem ao mesmo dispositivo; os ponteiros passados apontam para
         // valores locais vivos durante cada chamada.
         unsafe {
-            self.context.CopyResource(&self.source, frame);
             let (nv12, view) = &self.pool[self.next];
             self.next = (self.next + 1) % POOL;
             let stream = D3D11_VIDEO_PROCESSOR_STREAM {
@@ -380,14 +427,25 @@ impl HwEncoder {
             let sample: IMFSample = MFCreateSample()?;
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime((self.start.elapsed().as_nanos() / 100) as i64)?;
-            sample.SetSampleDuration(10_000_000 / i64::from(self.fps))?;
+            sample.SetSampleDuration(10_000_000 / i64::from(self.fps.max(1)))?;
             if keyframe && let Some(codec) = &self.codec {
                 let _ = codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant_u32(1));
             }
             self.transform.ProcessInput(0, &sample, 0)?;
         }
         self.wants -= 1;
-        self.drain(out)?;
+        self.inflight += 1;
+        self.accepted = Instant::now();
+        // Espera a saída deste quadro em vez de colhê-la só quando o próximo chegar.
+        let before = out.len();
+        let deadline = Instant::now() + OUTPUT_WAIT;
+        loop {
+            self.drain(out)?;
+            if out.len() > before || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(500));
+        }
         Ok(true)
     }
 
@@ -407,6 +465,7 @@ impl HwEncoder {
             } else if kind == METransformHaveOutput.0 as u32
                 && let Some(data) = self.output()?
             {
+                self.inflight = self.inflight.saturating_sub(1);
                 out.push(data);
             }
         }
@@ -459,6 +518,20 @@ impl HwEncoder {
         &ID3D11VideoProcessorEnumerator,
     ) {
         (&self.device, &self.video_device, &self.enumerator)
+    }
+}
+
+impl Drop for HwEncoder {
+    fn drop(&mut self) {
+        // Sem o Shutdown, soltar o codificador às vezes bloqueia por 5 s (medido): a live inteira
+        // congelaria numa troca de fonte ou num redimensionamento de janela.
+        // SAFETY: chamadas COM simples em objetos que ainda estão vivos.
+        unsafe {
+            if let Ok(shutdown) = self.transform.cast::<IMFShutdown>() {
+                let _ = shutdown.Shutdown();
+            }
+            let _ = timeEndPeriod(1);
+        }
     }
 }
 
