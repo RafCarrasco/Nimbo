@@ -11,6 +11,9 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Thre
 str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"] }
 openh264 = "0.9"
 serde_json = "1"
+# Áudio do jogo (WASAPI por processo) e o codificador Opus (libopus, compilado com cmake).
+nimbo-audio = { path = "../rust-audio" }
+opus = "0.4"
 
 [profile.release]
 opt-level = 3

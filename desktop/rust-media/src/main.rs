@@ -3,7 +3,9 @@
 //!
 //!   nimbo-media capture [segundos]            mede quadros por segundo e CPU só da captura
 //!   nimbo-media encode  [segundos] [arquivo]  captura + codifica em H.264 para um .mp4
-//!   nimbo-media serve   [porta]               envia a tela por WebRTC para navegadores
+//!   nimbo-media serve   [porta] [exclude|include <pid>]
+//!                                             envia a tela por WebRTC para navegadores; com
+//!                                             `exclude`/`include`, envia também o som
 //!   nimbo-media hw [s] [largura] [altura] [fps] codifica pela placa direto na GPU e mede
 
 mod hwbench;
@@ -24,6 +26,7 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
+use nimbo_media::engine::AudioSource;
 pub(crate) use nimbo_media::{AnyError, hw, process_cpu};
 
 struct Job {
@@ -122,7 +125,15 @@ fn main() -> Result<(), AnyError> {
         return hwbench::run(&args);
     }
     if mode == "serve" {
-        return serve::run(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3070));
+        let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3070);
+        let pid = args.get(3).and_then(|s| s.parse().ok());
+        let audio = match (args.get(2).map(String::as_str), pid) {
+            (None, _) => None,
+            (Some("exclude"), Some(pid)) => Some(AudioSource::Exclude(pid)),
+            (Some("include"), Some(pid)) => Some(AudioSource::Include(pid)),
+            _ => return Err("áudio: use `exclude <pid>` ou `include <pid>`".into()),
+        };
+        return serve::run(port, audio);
     }
     let output = match mode {
         "capture" => None,

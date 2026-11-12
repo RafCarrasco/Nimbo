@@ -1,6 +1,8 @@
-//! Motor de mídia do Nimbo em Rust: captura, codificação pela placa e envio WebRTC.
+//! Motor de mídia do Nimbo em Rust: captura, codificação pela placa, áudio do jogo em Opus e
+//! envio WebRTC.
 //! Ver `docs/rust-app.md` para o plano e os números medidos.
 
+mod audio;
 pub mod engine;
 pub mod hw;
 

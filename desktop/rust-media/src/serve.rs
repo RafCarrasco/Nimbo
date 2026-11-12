@@ -1,34 +1,40 @@
-//! `nimbo-media serve [porta]`: página de teste do motor. Abra http://127.0.0.1:3070 em quantas
-//! abas quiser; cada uma vira um espectador da tela principal.
+//! `nimbo-media serve [porta] [exclude|include <pid>]`: página de teste do motor. Abra
+//! http://127.0.0.1:3070 em quantas abas quiser; cada uma vira um espectador da tela principal.
+//!
+//! Com `exclude <pid>` a live leva todo o som do computador menos o daquele processo; com
+//! `include <pid>`, só o som dele. Sem isso, não há som. A página nunca toca o som que recebe.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nimbo_media::engine::{Engine, Quality, Source};
+use nimbo_media::engine::{AudioSource, Engine, Quality, Source};
 
 use crate::AnyError;
 
-pub fn run(port: u16) -> Result<(), AnyError> {
+pub fn run(port: u16, audio: Option<AudioSource>) -> Result<(), AnyError> {
     let engine = Arc::new(Engine::new());
+    engine.set_audio(audio)?;
     engine.start(Source::PrimaryMonitor, Quality::default())?;
 
     let stats = engine.clone();
     std::thread::spawn(move || {
-        let (mut last_cpu, mut last_frames) = (crate::process_cpu(), 0);
+        let (mut last_cpu, mut last_frames, mut last_audio) = (crate::process_cpu(), 0, 0);
         loop {
             std::thread::sleep(Duration::from_secs(5));
             let (now_cpu, s) = (crate::process_cpu(), stats.stats());
             println!(
-                "{{\"espectadores\":{},\"codificador\":\"{}\",\"alvo_mbps\":{:.1},\"quadros_codificados_por_s\":{:.1},\"cpu_um_nucleo_pct\":{:.1}}}",
+                "{{\"espectadores\":{},\"codificador\":\"{}\",\"alvo_mbps\":{:.1},\"quadros_codificados_por_s\":{:.1},\"audio\":{},\"pacotes_de_audio_por_s\":{:.1},\"cpu_um_nucleo_pct\":{:.1}}}",
                 s.viewers,
                 s.encoder,
                 f64::from(s.target_bitrate) / 1e6,
                 (s.frames_encoded - last_frames) as f64 / 5.0,
+                s.audio,
+                (s.audio_packets - last_audio) as f64 / 5.0,
                 now_cpu.saturating_sub(last_cpu).as_secs_f64() / 5.0 * 100.0,
             );
-            (last_cpu, last_frames) = (now_cpu, s.frames_encoded);
+            (last_cpu, last_frames, last_audio) = (now_cpu, s.frames_encoded, s.audio_packets);
         }
     });
 
@@ -77,7 +83,7 @@ fn http(mut stream: TcpStream, engine: &Engine) -> Result<(), AnyError> {
             length = value.trim().parse()?;
         }
     }
-    if request.starts_with("GET / ") {
+    if request.starts_with("GET / ") || request.starts_with("GET /?") {
         return Ok(respond(
             &mut stream,
             "200 OK",
