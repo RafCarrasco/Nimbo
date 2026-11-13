@@ -3,11 +3,15 @@
 //!
 //! CP2 S1 adds the `nimboDesktop` bridge v1 (portable dispatcher in `crate::bridge`): injected
 //! script awaited before navigation, ContentLoading generation/main-frame attribution and
-//! WebMessageReceived. NOT here: login (interim answer only), deep-link handling or protocol
-//! registration, capture/audio/game watch, updater/installer.
+//! WebMessageReceived. CP2 S2-core adds the browser-login receiver wiring: a `LoginFlow` whose
+//! receiver threads wake this UI thread with `WM_APP_LOGIN` (PostMessageW, never blocking), a
+//! 1 s `WM_TIMER` fallback, and bounded shutdown after the message loop. Execution of all of
+//! this is a Windows NATIVE-GATE. NOT here: deep-link/activation handling or protocol
+//! registration (S3), capture/audio/game watch, updater/installer.
 //! A debug-only `test-host` build replaces the hosted URL with a loopback fixture, keeps every
 //! file under an owned scratch directory and records external opens instead of launching them.
 use crate::bridge::{self, Dispatcher, Outbound};
+use crate::login::{Hooks, LoginFlow, Notify};
 use crate::policy::{
     BROWSER_ARGUMENTS, CaptureDecision, Config, KeyAction, KeyInput, MAIN_WINDOW, Navigation,
     Permission, PermissionDecision, accelerator, user_agent, webview2_permission,
@@ -23,8 +27,8 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     rc::Rc,
-    sync::mpsc,
-    time::Instant,
+    sync::{Arc, Mutex, OnceLock, PoisonError, mpsc},
+    time::{Duration, Instant},
 };
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::*;
@@ -37,6 +41,7 @@ use windows::Win32::{
         CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
         UpdateWindow,
     },
+    Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::{
         Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
         DataExchange::COPYDATASTRUCT,
@@ -57,6 +62,11 @@ use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, Result, w};
 
 const MAIN_CLASS: PCWSTR = w!("Nimbo.MainWindow");
 const WM_APP_EXTERNAL: u32 = WM_APP + 1;
+/// Receiver threads -> UI thread: drain login settlements (`Dispatcher::drain_settlements`).
+const WM_APP_LOGIN: u32 = WM_APP + 2;
+/// 1 s login housekeeping (expiry fallback, unclaimed drop, activation TTL).
+const LOGIN_TIMER: usize = 1;
+const LOGIN_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 /// MAKEINTRESOURCE(1): the icon embedded by build.rs from desktop/icon.ico.
 const ICON_ID: PCWSTR = PCWSTR(std::ptr::without_provenance(1));
 
@@ -71,6 +81,48 @@ struct State {
     main: HWND,
     controller: Option<ICoreWebView2Controller>,
     external: Vec<String>,
+    config: Rc<Config>,
+    dispatcher: Option<Rc<RefCell<Dispatcher>>>,
+    core: Option<ICoreWebView2>,
+    login: Option<LoginFlow>,
+    /// HWND (as isize) the login notifier may post to; `None` once WM_DESTROY began, so a late
+    /// receiver thread can never post to a destroyed (and possibly reused) handle.
+    notify_target: Arc<Mutex<Option<isize>>>,
+}
+
+/// One monotonic clock for the dispatcher and the login flow (`Instant`-based ms).
+fn now_ms() -> u64 {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(STARTED.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Plan T3: the system-preferred CSPRNG; a failure is reported, never replaced.
+fn bcrypt_rng(buf: &mut [u8; 24]) -> bool {
+    // SAFETY: `buf` is a valid writable buffer for the duration of the call.
+    unsafe { BCryptGenRandom(None, buf, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.is_ok()
+}
+
+/// Cross-thread wake-up. PostMessageW never blocks; the target lock is held only around it and
+/// is cleared by WM_DESTROY (HWND lifetime/reuse). A failed post is reported by the flow
+/// (`login-notify-failed`); the 1 s timer then still drains.
+fn login_notifier(target: Arc<Mutex<Option<isize>>>) -> Notify {
+    Arc::new(move || {
+        let target = target.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(hwnd) = *target else { return false };
+        // SAFETY: the handle is our live main window (cleared before it is destroyed).
+        unsafe {
+            PostMessageW(
+                Some(HWND(hwnd as *mut _)),
+                WM_APP_LOGIN,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        }
+        .is_ok()
+    })
+}
+fn clear_notify_target(target: &Arc<Mutex<Option<isize>>>) {
+    *target.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// Release builds print only fixed codes (never URLs, titles or arguments). The test-host
@@ -187,14 +239,16 @@ fn queue_external(url: String) {
 }
 
 fn open_external(url: &str) {
-    // Defense in depth: only https ever leaves the app (main.cjs:714, 720).
-    let https = url::Url::parse(url).is_ok_and(|u| u.scheme() == "https");
-    if !https {
+    // Defense in depth: only https ever leaves the app (main.cjs:714, 720); the debug test-host
+    // additionally allows its loopback fixture origin (login URLs), see `external_allowed`.
+    let allowed = with_state(|s| s.config.external_allowed(url)).unwrap_or(false);
+    if !allowed {
         event("external-rejected", None);
         return;
     }
+    // The recorder never sees the single-use state (full URL only in login-url.txt).
     #[cfg(feature = "test-host")]
-    event("external", Some(url));
+    event("external", Some(&crate::login::redact_login_url(url)));
     #[cfg(not(feature = "test-host"))]
     {
         use windows::Win32::UI::Shell::ShellExecuteW;
@@ -215,6 +269,79 @@ fn open_external(url: &str) {
             event("external-opened", None);
         }
     }
+}
+
+/// Test-host only: the full login URL goes to `<dir>/login-url.txt` (owned scratch), never to
+/// events.log, and is deleted once no login is active.
+fn record_login_url(url: &str) {
+    if cfg!(feature = "test-host")
+        && let Some(path) = RECORDER.with(|r| {
+            r.borrow()
+                .as_ref()
+                .map(|p| p.with_file_name("login-url.txt"))
+        })
+        && std::fs::write(path, url).is_err()
+    {
+        event("login-url-write-failed", None);
+    }
+}
+fn sync_login_url() {
+    if !cfg!(feature = "test-host") {
+        return;
+    }
+    let active =
+        with_state(|s| s.login.as_ref().is_some_and(LoginFlow::is_active)).unwrap_or(false);
+    if !active
+        && let Some(path) = RECORDER.with(|r| {
+            r.borrow()
+                .as_ref()
+                .map(|p| p.with_file_name("login-url.txt"))
+        })
+        && path.exists()
+        && std::fs::remove_file(path).is_err()
+    {
+        event("login-url-remove-failed", None);
+    }
+}
+/// UI-thread login handoff (WM_APP_LOGIN / WM_TIMER): the dispatcher borrow is released before
+/// any COM call; a COM failure closes the WebView like every other handler; focus only when a
+/// result was actually posted (parity main.cjs:108).
+fn login_handoff(run: impl FnOnce(&mut Dispatcher, u64) -> Vec<Outbound>) {
+    let handles = with_state(|s| {
+        Some((
+            s.dispatcher.clone()?,
+            s.core.clone()?,
+            s.controller.clone()?,
+            s.main,
+        ))
+    })
+    .flatten();
+    let Some((dispatcher, core, controller, main)) = handles else {
+        return;
+    };
+    let out = match dispatcher.try_borrow_mut() {
+        Ok(mut d) => run(&mut d, now_ms()),
+        Err(_) => {
+            event("login-handoff-reentered", None); // the 1 s timer retries
+            return;
+        }
+    };
+    // Parity main.cjs:105-108: focus when the browser callback produced the posted result
+    // (credential or missing-credential), not on expiry or cancel.
+    let posted = out
+        .iter()
+        .any(|o| matches!(o, Outbound::Code("login-result-posted")))
+        && out.iter().any(|o| {
+            matches!(
+                o,
+                Outbound::Code("login-credential-claimed" | "login-callback-missing-credential")
+            )
+        });
+    let outcome = deliver(&core, out);
+    if fail_closed(&controller, main, outcome).is_ok() && posted {
+        focus_main();
+    }
+    sync_login_url();
 }
 
 // ---------- single instance ----------
@@ -357,7 +484,32 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 }
                 LRESULT(0)
             }
+            WM_APP_LOGIN => {
+                login_handoff(|d, now| d.drain_settlements(now));
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == LOGIN_TIMER => {
+                login_handoff(|d, now| d.tick(now));
+                LRESULT(0)
+            }
             WM_DESTROY => {
+                // Login first: no further wake-ups to this handle, settle and signal every
+                // receiver thread and close their sockets; never waits here (bounded wait runs
+                // after the message loop, in `run_window`).
+                let parts = with_state(|s| {
+                    s.dispatcher = None;
+                    s.core = None;
+                    (s.notify_target.clone(), s.login.clone())
+                });
+                if let Some((target, login)) = parts {
+                    clear_notify_target(&target);
+                    if let Some(login) = login {
+                        for settle in login.shutdown() {
+                            event(settle.code, None);
+                        }
+                    }
+                }
+                let _ = KillTimer(Some(hwnd), LOGIN_TIMER);
                 if let Some(c) = with_state(|s| s.controller.take()).flatten()
                     && c.Close().is_err()
                 {
@@ -591,8 +743,21 @@ fn deliver(core: &ICoreWebView2, out: Vec<Outbound>) -> Result<()> {
         match item {
             // SAFETY: live core on its UI thread.
             Outbound::Reply(json) => unsafe { core.PostWebMessageAsJson(&HSTRING::from(json))? },
+            // The credential result: its UTF-16 copy is transient; the owned UTF-8 buffer is
+            // wiped (best effort) when `secret` drops at the end of this arm.
+            Outbound::Secret(secret) => {
+                // SAFETY: live core on its UI thread.
+                unsafe { core.PostWebMessageAsJson(&HSTRING::from(secret.as_str()))? }
+            }
+            Outbound::OpenLogin(url) => {
+                record_login_url(url.as_str());
+                queue_external(url.as_str().to_owned());
+            }
             Outbound::Code(code) => event(code, None),
             Outbound::Suppressed(n) => event("bridge-drops-suppressed", Some(&n.to_string())),
+            Outbound::CallbackSuppressed(n) => {
+                event("callback-codes-suppressed", Some(&n.to_string()))
+            }
         }
     }
     Ok(())
@@ -789,14 +954,13 @@ fn install(
         // RefCell borrow is held across a COM call.
         let c = controller.clone();
         let d = dispatcher.clone();
-        let started = Instant::now();
         core.add_WebMessageReceived(
             &WebMessageReceivedEventHandler::create(Box::new(move |sender, args| {
                 let outcome = args_or_pointer(args).and_then(|args| {
                     let sender = args_or_pointer(sender)?;
                     let source = read_pwstr(|p| args.Source(p))?;
                     let json = read_pwstr(|p| args.WebMessageAsJson(p))?;
-                    let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let now = now_ms();
                     let out = {
                         let mut d = d.try_borrow_mut().map_err(reentered)?;
                         let attr = d.main_frame_request(&source);
@@ -1005,12 +1169,29 @@ fn run_window(launch: &Launch) -> std::result::Result<(), StartupFailure> {
             main,
             controller: None,
             external: Vec::new(),
+            config: launch.config.clone(),
+            dispatcher: None,
+            core: None,
+            login: None,
+            notify_target: Arc::new(Mutex::new(Some(main.0 as isize))),
         })
     });
     let started = start_webview(launch, main);
     let result = match started {
         Ok(()) => {
             message_loop();
+            // Bounded supervision of the receiver threads, off the UI message pump (it has
+            // ended) and before process exit; recorded, never blocking past the bound.
+            if let Some(login) = with_state(|s| s.login.clone()).flatten() {
+                let left = login.wait_idle(LOGIN_SHUTDOWN_WAIT);
+                event(
+                    "shutdown",
+                    Some(&format!(
+                        "workers={} acceptors={}",
+                        left.workers, left.acceptors
+                    )),
+                );
+            }
             Ok(())
         }
         Err(failure) => {
@@ -1050,7 +1231,21 @@ fn start_webview(launch: &Launch, main: HWND) -> std::result::Result<(), Startup
     with_state(|s| s.controller = Some(controller.clone()));
     // SAFETY: live controller on its UI thread.
     let core = unsafe { controller.CoreWebView2() }.map_err(|_| Fatal("webview2-core-failed"))?;
-    let dispatcher = Rc::new(RefCell::new(Dispatcher::new(launch.config.clone())));
+    let target = with_state(|s| s.notify_target.clone()).ok_or(Fatal("state-missing"))?;
+    let login = LoginFlow::new(Hooks::new(
+        Arc::new(bcrypt_rng),
+        login_notifier(target),
+        Arc::new(now_ms),
+    ));
+    let dispatcher = Rc::new(RefCell::new(Dispatcher::new(
+        launch.config.clone(),
+        login.clone(),
+    )));
+    with_state(|s| {
+        s.dispatcher = Some(dispatcher.clone());
+        s.core = Some(core.clone());
+        s.login = Some(login);
+    });
     let mut guards = install(&controller, &core, &launch.config, &dispatcher, main)
         .map_err(|_| Fatal("guard-install-failed"))?;
     // The bridge script must be registered (completion received) before the first navigation; a
@@ -1075,6 +1270,11 @@ fn start_webview(launch: &Launch, main: HWND) -> std::result::Result<(), Startup
             .map_err(|_| Fatal("navigate-failed"))?;
     }
     event("started", None);
+    // SAFETY: our own live window on its owning thread; the timer is killed in WM_DESTROY.
+    if unsafe { SetTimer(Some(main), LOGIN_TIMER, 1000, None) } == 0 {
+        // Fail closed: without the timer an expired login would never settle.
+        return Err(Fatal("login-timer-failed"));
+    }
     Ok(())
 }
 

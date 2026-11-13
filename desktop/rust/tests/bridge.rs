@@ -1,10 +1,14 @@
 //! Portable bridge v1 dispatcher (CP2 S1). These drive the same pure dispatcher the Windows host
 //! uses; they are NOT evidence that WebView2 delivered, attributed or injected anything.
 use nimbo_desktop::bridge::*;
+use nimbo_desktop::login::{CallbackDecision, Caller, Credential, Hooks, LoginFlow};
+use nimbo_desktop::loopback::SecretBuf;
 use nimbo_desktop::policy::{
     BRIDGE_METHOD_NAMES, Config, Feature, HOSTED_URL, NativeRequest, feature_methods,
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cell::Cell, rc::Rc};
 
 const FRAME: u32 = 7;
@@ -21,8 +25,36 @@ fn now() -> u64 {
     })
 }
 
+/// A real `LoginFlow` (real loopback bind) with a deterministic test rng. Its spawner never
+/// runs the acceptor (job dropped: listener and acceptor slot released at once), so these
+/// dispatcher tests never depend on receiver-thread timing or the global acceptor budget; the
+/// receiver itself is covered by tests/loopback.rs and the L4 Node tier.
+fn test_flow() -> LoginFlow {
+    flow_with_rng(Arc::new(AtomicBool::new(true)))
+}
+fn flow_with_rng(ok: Arc<AtomicBool>) -> LoginFlow {
+    let mut hooks = Hooks::new(
+        Arc::new(move |buf: &mut [u8; 24]| {
+            buf.fill(0xab);
+            ok.load(Ordering::SeqCst)
+        }),
+        Arc::new(|| true),
+        Arc::new(|| 0),
+    );
+    hooks.spawn = Arc::new(|job| {
+        drop(job);
+        Ok(())
+    });
+    LoginFlow::new(hooks)
+}
+fn release(flow: LoginFlow) -> Dispatcher {
+    Dispatcher::new(Rc::new(Config::release()), flow)
+}
 fn fresh() -> Dispatcher {
-    let mut d = Dispatcher::new(Rc::new(Config::release()));
+    fresh_with(test_flow())
+}
+fn fresh_with(flow: LoginFlow) -> Dispatcher {
+    let mut d = release(flow);
     d.begin_document();
     d.set_main_frame(FRAME);
     d
@@ -119,11 +151,11 @@ fn authorization_table_reuses_native_request_cases_and_never_replies() {
     let attr = cases[0](base(&d));
     dropped(&d.receive(&attr, "{not json", now()), "bridge-unauthorized");
     // No document yet (generation 0): nothing is authorized.
-    let mut none = Dispatcher::new(Rc::new(Config::release()));
+    let mut none = release(test_flow());
     let attr = none.main_frame_request(HOSTED_URL);
     dropped(&none.receive(&attr, &hello, now()), "bridge-unauthorized");
     // Frame id 0 / unavailable disables the document: fail closed, no ready.
-    let mut zero = Dispatcher::new(Rc::new(Config::release()));
+    let mut zero = release(test_flow());
     zero.begin_document();
     zero.set_main_frame(0);
     assert_eq!(zero.document(), DocumentState::Disabled);
@@ -249,13 +281,20 @@ fn ids_are_strictly_increasing_and_replays_are_dropped_until_exhaustion() {
 fn member_answers_are_electron_nothing_selected_values() {
     let mut d = fresh();
     let g = ready(&mut d);
+    // signIn is DEFERRED (no immediate result) and the cancel settles it first: both have
+    // dedicated tests below; here they only complete the exhaustive table.
+    let out = send(&mut d, &invoke(1, g, "nimbo:signIn", json!([])));
+    assert!(replies(&out).is_empty(), "no immediate signIn result");
+    assert_eq!(codes(&out), vec!["login-begin"]);
+    let out = send(&mut d, &invoke(2, g, "nimbo:signIn:cancel", json!([])));
+    assert_eq!(
+        replies(&out),
+        vec![
+            json!({"v":1,"kind":"result","id":1,"gen":g,"ok":false,"error":"Login cancelado."}),
+            json!({"v":1,"kind":"result","id":2,"gen":g,"ok":true}),
+        ]
+    );
     let cases = [
-        (
-            "nimbo:signIn",
-            json!([]),
-            json!({"ok":false,"error":SIGN_IN_INTERIM}),
-        ),
-        ("nimbo:signIn:cancel", json!([]), json!({"ok":true})),
         ("nimbo:capture:audio", json!([true]), json!({"ok":true})),
         (
             "nimbo:audio:start",
@@ -281,9 +320,9 @@ fn member_answers_are_electron_nothing_selected_values() {
         ("nimbo:game:stop", json!(["w"]), json!({"ok":true})),
         ("nimbo:capture:stop", json!([]), json!({"ok":true})),
     ];
-    assert_eq!(cases.len(), BRIDGE_METHOD_NAMES.len());
+    assert_eq!(cases.len() + 2, BRIDGE_METHOD_NAMES.len());
     for (i, (method, args, expected)) in cases.into_iter().enumerate() {
-        let id = i as u64 + 1;
+        let id = i as u64 + 3;
         let out = send(&mut d, &invoke(id, g, method, args));
         let mut want = json!({"v":1,"kind":"result","id":id,"gen":g});
         for (k, v) in expected.as_object().unwrap() {
@@ -292,10 +331,6 @@ fn member_answers_are_electron_nothing_selected_values() {
         assert_eq!(replies(&out), vec![want], "{method}");
         assert!(codes(&out).is_empty());
     }
-    assert_eq!(
-        SIGN_IN_INTERIM,
-        "Login pelo app ainda não disponível nesta prévia."
-    );
     assert!(d.audio_wanted());
     send(
         &mut d,
@@ -494,13 +529,13 @@ fn clock_rollback_never_reopens_the_log_budget_and_accounting_is_exact() {
 fn generation_is_bounded_to_exact_javascript_integers_without_wrap() {
     let limit = 1u64 << 53;
     assert_eq!(MAX_WIRE_GENERATION, limit - 1);
-    let mut d = Dispatcher::starting_at(Rc::new(Config::release()), limit - 2);
+    let mut d = Dispatcher::starting_at(Rc::new(Config::release()), test_flow(), limit - 2);
     d.begin_document();
     d.set_main_frame(FRAME);
     assert_eq!(d.generation(), limit - 1);
     assert_eq!(ready(&mut d), limit - 1);
 
-    let mut d = Dispatcher::starting_at(Rc::new(Config::release()), limit - 1);
+    let mut d = Dispatcher::starting_at(Rc::new(Config::release()), test_flow(), limit - 1);
     assert_eq!(
         d.begin_document(),
         vec![Outbound::Code("bridge-generation-exhausted")]
@@ -511,7 +546,7 @@ fn generation_is_bounded_to_exact_javascript_integers_without_wrap() {
     assert!(replies(&send(&mut d, &json!({"v":1,"kind":"hello"}))).is_empty());
 
     // At u64::MAX the generation saturates and every document stays disabled (no wrap to 0/1).
-    let mut d = Dispatcher::starting_at(Rc::new(Config::release()), u64::MAX);
+    let mut d = Dispatcher::starting_at(Rc::new(Config::release()), test_flow(), u64::MAX);
     d.begin_document();
     d.set_main_frame(FRAME);
     assert_eq!(d.generation(), u64::MAX);
@@ -618,4 +653,229 @@ fn injected_script_has_verbatim_guards_and_one_json_origin() {
     for forbidden in ["eval(", "Function(", "innerHTML", "AddHostObject", "fetch("] {
         assert!(!raw.contains(forbidden), "{forbidden}");
     }
+}
+
+// ---------- CP2 S2-core: deferred `nimbo:signIn` (dispatcher side) ----------
+// Portable dispatcher evidence only. A posted result is NOT a Firebase sign-in: LOGIN NOT
+// DELIVERED until the real producer/consumer proof (S2-integration).
+
+fn secrets(out: &[Outbound]) -> Vec<Value> {
+    out.iter()
+        .filter_map(|o| match o {
+            Outbound::Secret(s) => Some(serde_json::from_str(s.as_str()).expect("JSON")),
+            _ => None,
+        })
+        .collect()
+}
+fn login_urls(out: &[Outbound]) -> Vec<String> {
+    out.iter()
+        .filter_map(|o| match o {
+            Outbound::OpenLogin(url) => Some(url.as_str().to_owned()),
+            _ => None,
+        })
+        .collect()
+}
+fn deliver(flow: &LoginFlow, id_token: &str, access: &str) {
+    let login = flow.current_login_id().expect("pending");
+    let credential = Credential::new(
+        SecretBuf::new(id_token.as_bytes().to_vec()),
+        SecretBuf::new(access.as_bytes().to_vec()),
+    );
+    assert_eq!(
+        flow.callback(login, credential, 0),
+        CallbackDecision::Deliver
+    );
+}
+
+#[test]
+fn sign_in_is_deferred_and_the_delivered_credential_is_posted_exactly_once_by_drain() {
+    let flow = test_flow();
+    let mut d = fresh_with(flow.clone());
+    let g = ready(&mut d);
+    let out = send(&mut d, &invoke(1, g, "nimbo:signIn", json!([])));
+    assert!(replies(&out).is_empty() && secrets(&out).is_empty());
+    let urls = login_urls(&out);
+    assert_eq!(urls.len(), 1);
+    assert!(urls[0].starts_with("https://golive-ad118.web.app/desktop-login?port="));
+    assert!(urls[0].ends_with(&format!("&state={}", "ab".repeat(24))));
+    assert!(
+        !format!("{out:?}").contains("abab"),
+        "Debug redacts the login URL"
+    );
+    deliver(&flow, "synthetic-id", "synthetic-access");
+    let out = d.drain_settlements(now());
+    assert_eq!(
+        secrets(&out),
+        vec![json!({"v":1,"kind":"result","id":1,"gen":g,"ok":true,
+            "value":{"idToken":"synthetic-id","accessToken":"synthetic-access"}})]
+    );
+    assert!(
+        replies(&out).is_empty(),
+        "the credential travels only as Secret"
+    );
+    assert!(codes(&out).contains(&"login-result-posted"));
+    assert!(
+        !format!("{out:?}").contains("synthetic"),
+        "Debug redacts the credential"
+    );
+    assert!(d.drain_settlements(now()).is_empty(), "exactly once");
+    assert!(d.tick(now()).is_empty());
+    assert_eq!(d.document(), DocumentState::Ready { last_id: 1 });
+}
+
+#[test]
+fn delivered_after_navigation_or_disable_is_dropped_stale_without_any_result() {
+    for disable in [false, true] {
+        let flow = test_flow();
+        let mut d = fresh_with(flow.clone());
+        let g = ready(&mut d);
+        send(&mut d, &invoke(1, g, "nimbo:signIn", json!([])));
+        if disable {
+            d.disable_document("bridge-test-disabled");
+        } else {
+            d.begin_document();
+            d.set_main_frame(FRAME);
+        }
+        deliver(&flow, "stale-id", "");
+        let out = d.drain_settlements(now());
+        assert!(
+            replies(&out).is_empty() && secrets(&out).is_empty(),
+            "{out:?}"
+        );
+        assert!(codes(&out).contains(&"login-result-dropped-stale"));
+        assert!(!flow.is_active());
+    }
+}
+
+#[test]
+fn missing_id_token_cancel_replacement_and_expiry_answer_with_electron_texts() {
+    let flow = test_flow();
+    let mut d = fresh_with(flow.clone());
+    let g = ready(&mut d);
+    let err = |id: u64, text: &str| json!({"v":1,"kind":"result","id":id,"gen":g,"ok":false,"error":text});
+    send(&mut d, &invoke(1, g, "nimbo:signIn", json!([])));
+    deliver(&flow, "", "");
+    assert_eq!(
+        replies(&d.drain_settlements(now())),
+        vec![err(1, "O Google não devolveu a credencial. Tente de novo.")]
+    );
+    // Replacement: the previous caller is settled in the same batch as the new begin.
+    send(&mut d, &invoke(2, g, "nimbo:signIn", json!([])));
+    let out = send(&mut d, &invoke(3, g, "nimbo:signIn", json!([])));
+    assert_eq!(replies(&out), vec![err(2, "Login cancelado.")]);
+    assert_eq!(login_urls(&out).len(), 1);
+    // Replacement of a delivered-but-unclaimed credential.
+    deliver(&flow, "unclaimed", "");
+    let out = send(&mut d, &invoke(4, g, "nimbo:signIn", json!([])));
+    assert_eq!(replies(&out), vec![err(3, "Login cancelado.")]);
+    assert!(codes(&out).contains(&"login-replaced-unclaimed"));
+    // Host lifetime 300 s on the dispatcher clock (tick), not the page's 330 s.
+    let t = now();
+    let begun = {
+        let out = send(&mut d, &invoke(5, g, "nimbo:signIn", json!([])));
+        assert_eq!(replies(&out), vec![err(4, "Login cancelado.")]);
+        now()
+    };
+    let _ = t;
+    assert!(replies(&d.tick(begun + 299_000)).is_empty());
+    assert_eq!(
+        replies(&d.tick(begun + 300_000 + LOG_WINDOW_MS)),
+        vec![err(5, "O login expirou. Tente de novo.")]
+    );
+    // Cancel without a pending login: just {ok:true}.
+    let out = send(&mut d, &invoke(6, g, "nimbo:signIn:cancel", json!([])));
+    assert_eq!(
+        replies(&out),
+        vec![json!({"v":1,"kind":"result","id":6,"gen":g,"ok":true})]
+    );
+}
+
+#[test]
+fn begin_failure_answers_the_new_caller_immediately() {
+    let ok = Arc::new(AtomicBool::new(false));
+    let mut d = fresh_with(flow_with_rng(ok));
+    let g = ready(&mut d);
+    let out = send(&mut d, &invoke(1, g, "nimbo:signIn", json!([])));
+    assert_eq!(
+        replies(&out),
+        vec![json!({"v":1,"kind":"result","id":1,"gen":g,"ok":false,
+            "error":"Não foi possível iniciar o login: rng"})]
+    );
+    assert!(codes(&out).contains(&"login-server-failed"));
+    assert!(login_urls(&out).is_empty());
+}
+
+#[test]
+fn shutdown_settles_a_pending_sign_in_with_the_cancel_text() {
+    let flow = test_flow();
+    let mut d = fresh_with(flow.clone());
+    let g = ready(&mut d);
+    send(&mut d, &invoke(1, g, "nimbo:signIn", json!([])));
+    let out = d.shutdown(now());
+    assert_eq!(
+        replies(&out),
+        vec![json!({"v":1,"kind":"result","id":1,"gen":g,"ok":false,"error":"Login cancelado."})]
+    );
+    assert!(codes(&out).contains(&"login-shutdown"));
+    let out = send(&mut d, &invoke(2, g, "nimbo:signIn", json!([])));
+    assert_eq!(
+        replies(&out),
+        vec![json!({"v":1,"kind":"result","id":2,"gen":g,"ok":false,"error":"Login cancelado."})]
+    );
+    let st = flow.wait_idle(std::time::Duration::from_secs(2));
+    assert_eq!((st.workers, st.acceptors), (0, 0));
+}
+
+#[test]
+fn receiver_codes_pass_through_the_log_budget_with_an_overflow_count() {
+    let flow = test_flow();
+    let mut d = fresh_with(flow.clone());
+    let t = now();
+    for _ in 0..70 {
+        flow.push_code("callback-state-rejected");
+    }
+    let out = d.drain_settlements(t);
+    let logged = codes(&out).len();
+    assert_eq!(logged, LOG_BUDGET as usize, "{out:?}");
+    assert!(out.contains(&Outbound::CallbackSuppressed(6)), "{out:?}");
+    // The 48 logged-budget drops are reported once in the next window.
+    assert_eq!(
+        d.tick(t + LOG_WINDOW_MS),
+        vec![Outbound::Suppressed(64 - u64::from(LOG_BUDGET))]
+    );
+}
+
+#[test]
+fn login_result_encoding_bound_and_quote_escaping_arithmetic() {
+    assert_eq!(MAX_LOGIN_RESULT_BYTES, 139_264);
+    let quotes = "\"".repeat(65_400);
+    let c = Credential::new(
+        SecretBuf::new(quotes.clone().into_bytes()),
+        SecretBuf::new(Vec::new()),
+    );
+    let s = encode_login_result(7, 3, &c).expect("fits");
+    let envelope = r#"{"v":1,"kind":"result","id":7,"gen":3,"ok":true,"value":{"idToken":"","accessToken":""}}"#;
+    assert_eq!(s.as_str().len(), envelope.len() + 2 * 65_400);
+    let v: Value = serde_json::from_str(s.as_str()).unwrap();
+    assert_eq!(v["value"]["idToken"], json!(quotes));
+    // Worst case: 65,536 decoded bytes, all escaped, with the largest id and generation.
+    let half = "\\".repeat(32_768);
+    let c = Credential::new(
+        SecretBuf::new(half.clone().into_bytes()),
+        SecretBuf::new(half.into_bytes()),
+    );
+    let s = encode_login_result(u32::MAX, MAX_WIRE_GENERATION, &c).expect("fits");
+    assert!(s.as_str().len() < MAX_LOGIN_RESULT_BYTES);
+    assert!(!format!("{s:?}").contains('\\'));
+    // Multibyte UTF-8 is emitted verbatim (no expansion beyond the byte count).
+    let c = Credential::new(
+        SecretBuf::new("€".repeat(10).into_bytes()),
+        SecretBuf::new(Vec::new()),
+    );
+    let s = encode_login_result(1, 1, &c).unwrap();
+    assert!(s.as_str().contains(&"€".repeat(10)));
+    let _ = Caller {
+        generation: 1,
+        id: 1,
+    };
 }

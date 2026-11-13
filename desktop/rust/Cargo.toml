@@ -4,7 +4,7 @@ version = "0.4.1"
 edition = "2024"
 rust-version = "1.99"
 publish = false
-description = "Nimbo Windows host shell (CP1 WebView2 window and policies; CP2 S1 bridge v1 with interim login answer; no capture/login/updater)"
+description = "Nimbo Windows host shell (CP1 WebView2 window and policies; CP2 S1 bridge v1; CP2 S2-core loopback login receiver, not yet proven end to end; no capture/updater)"
 
 [features]
 # Debug-only isolated loopback test host. build.rs and a compile_error! reject release builds.
@@ -14,6 +14,8 @@ test-host = []
 url = "=2.5.8"
 # Bridge v1 JSON via serde_json::Value only (no serde_derive).
 serde_json = "=1.0.154"
+# Constant-time state compare (plan T7). Cached exact version; no default features.
+subtle = { version = "=2.6.1", default-features = false }
 
 # Debug-only transport double for the real dispatcher (stdio instead of WebView2). Never part
 # of a release build: it needs `test-host`, which build.rs and a compile_error! reject there.
@@ -30,7 +32,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_System_WinRT_Direct3D11", "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_Threading",
     "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_System_WinRT", "Win32_Security",
+    "Win32_System_WinRT", "Win32_Security", "Win32_Security_Cryptography",
 ] }
 
 [build-dependencies]

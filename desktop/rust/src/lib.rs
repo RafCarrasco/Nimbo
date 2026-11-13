@@ -2,5 +2,7 @@
 pub mod bridge;
 pub mod capture;
 pub mod frame_route;
+pub mod login;
+pub mod loopback;
 pub mod policy;
 pub mod shell;

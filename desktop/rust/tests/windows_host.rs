@@ -827,3 +827,108 @@ fn bridge_present_in_main_frame_absent_in_iframes() -> TestResult<()> {
     println!("BRIDGE_MAIN_FRAME_ONLY_OK pid={pid}");
     Ok(())
 }
+
+/// CP2 S2-core NATIVE-GATE login page: click 1 starts a signIn; click 2 starts another and
+/// cancels it 500 ms later. Every Result goes to /report. Synthetic credentials only.
+const LOGIN_PAGE: &str = r#"<!doctype html><meta charset=utf-8><title>login</title><body style="margin:0;height:100vh">
+<script>
+const report = (k, x) => fetch('/report?' + k + '=' + encodeURIComponent(x)).catch(() => {});
+let clicks = 0;
+document.addEventListener('click', () => {
+  clicks++;
+  const n = clicks;
+  window.nimboDesktop.signIn().then((r) => report('signin' + n, JSON.stringify(r)));
+  if (n === 2) setTimeout(() => window.nimboDesktop.cancelSignIn().then((r) => report('cancel', JSON.stringify(r))), 500);
+});
+</script>"#;
+
+/// CP2 S2-core NATIVE-GATE (user-run on Windows): the test acts as the system browser. It reads
+/// `<dir>/login-url.txt`, POSTs a synthetic credential to the real receiver, and checks the
+/// done page, the page-visible Result, the redacted recorder line, the deleted URL file, the
+/// closed port, the cancel path and the bounded shutdown record. NOT a Google/Firebase login.
+#[test]
+#[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
+fn synthetic_browser_login_round_trip() -> TestResult<()> {
+    let dir = owned_scratch("nimbo-login")?;
+    let fixture = Fixture::serve(LOGIN_PAGE, CSP)?;
+    let origin = fixture.url.trim_end_matches('/').to_owned();
+    let mut app = App(launch(&fixture, &dir)?);
+    let pid = app.0.id();
+    let main = wait_until("main window", || main_window(pid))?;
+    let widget = wait_until("renderer", || render_widget(main))?;
+    let report = |key: &str| {
+        let prefix = format!("/report?{key}=");
+        fixture.requests().iter().find_map(|r| {
+            r.strip_prefix(&prefix)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(decode)
+        })
+    };
+    wait_until("started", || events(&dir).contains("started").then_some(()))?;
+    click(widget);
+    let url_file = dir.join("login-url.txt");
+    let url = wait_until("login-url.txt", || std::fs::read_to_string(&url_file).ok())?;
+    let prefix = format!("{origin}/desktop-login?port=");
+    let rest = url.strip_prefix(&prefix).ok_or("login URL shape")?;
+    let (port, state) = rest.split_once("&state=").ok_or("login URL state")?;
+    let port: u16 = port.parse()?;
+    assert!(port >= 1024 && state.len() == 48);
+    let body = format!("state={state}&idToken=synthetic-id&accessToken=synthetic-access");
+    let mut socket = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    write!(
+        socket,
+        "POST /callback HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut response = String::new();
+    socket.read_to_string(&mut response)?;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with(nimbo_desktop::loopback::LOGIN_DONE_PAGE));
+    let first = wait_until("signIn result", || report("signin1"))?;
+    assert_eq!(
+        first,
+        r#"{"ok":true,"value":{"idToken":"synthetic-id","accessToken":"synthetic-access"}}"#
+    );
+    wait_until("login-url.txt deleted", || {
+        (!url_file.exists()).then_some(())
+    })?;
+    let refused = wait_until("receiver port closed", || {
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .is_err()
+            .then_some(())
+    });
+    assert!(refused.is_ok(), "second POST must be refused");
+    click(widget);
+    let second = wait_until("cancelled signIn", || report("signin2"))?;
+    assert_eq!(second, r#"{"ok":false,"error":"Login cancelado."}"#);
+    assert_eq!(wait_until("cancel", || report("cancel"))?, r#"{"ok":true}"#);
+    // SAFETY: test-owned child window.
+    unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
+    let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    assert!(exit.success());
+    let log = events(&dir);
+    println!(
+        "EVENTS_LOG_BEGIN\n{}EVENTS_LOG_END",
+        log.replace(state, "<STATE-LEAKED>")
+    );
+    for code in [
+        "login-begin",
+        "login-credential-delivered",
+        "login-result-posted",
+        "focus-request",
+        "login-cancelled",
+        "shutdown workers=0 acceptors=0",
+    ] {
+        assert!(log.contains(code), "missing {code}");
+    }
+    assert!(log.contains(&format!("external {prefix}{port}&state=<redacted>")));
+    for secret in [state, "synthetic-id", "synthetic-access"] {
+        assert!(!log.contains(secret), "events.log leaked a secret");
+    }
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
+    println!("SYNTHETIC_LOGIN_ROUND_TRIP_OK pid={pid} (NOT a Firebase sign-in)");
+    Ok(())
+}

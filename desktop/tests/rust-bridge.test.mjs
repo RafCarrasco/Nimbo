@@ -10,7 +10,9 @@ import { loadDesktopConsumer } from './helpers/oracle.mjs';
 
 const plain = (value) => JSON.parse(JSON.stringify(value));
 const KEYS = ['version', 'signIn', 'cancelSignIn', 'setCaptureAudio', 'startAudio', 'stopAudio', 'watchUpdate', 'installUpdate', 'onUpdateProgress', 'startGameWatch', 'stopGameWatch', 'onGameState', 'onGameEnded', 'onAudio'];
-const INTERIM = 'Login pelo app ainda não disponível nesta prévia.';
+// CP2 S2-core: signIn is deferred (real loopback receiver; see rust-login.test.mjs). A cancel
+// settles the pending signIn first with Electron's text.
+const CANCELLED = 'Login cancelado.';
 const LABEL = 'transport double: stdio instead of WebView2 — ';
 const settled = (promise) => {
   const s = { done: false };
@@ -39,8 +41,9 @@ test(LABEL + 'exact v1 surface, Electron "nothing selected" answers, coercion an
   assert.deepEqual(plain(await bridge.startAudio()), { ok: true, value: null });
   assert.deepEqual(plain(await bridge.startGameWatch()), { ok: true, value: null });
   assert.deepEqual(plain(await bridge.installUpdate()), { ok: true, value: false });
-  assert.deepEqual(plain(await bridge.signIn()), { ok: false, error: INTERIM });
+  const signIn = bridge.signIn();
   assert.deepEqual(plain(await bridge.cancelSignIn()), { ok: true });
+  assert.deepEqual(plain(await signIn), { ok: false, error: CANCELLED });
   assert.deepEqual(plain(await bridge.stopAudio(123)), { ok: true }, 'String(id) coercion reaches the host');
   assert.deepEqual(plain(await bridge.stopGameWatch({ toString: () => 'w1' })), { ok: true });
   assert.deepEqual(plain(page.sent.at(-1)), { v: 1, kind: 'invoke', id: 7, gen: 1, method: 'nimbo:game:stop', args: ['w1'] });
@@ -116,10 +119,12 @@ test(LABEL + 'watchUpdate keeps a permanent listener and installUpdate answers f
   assert.equal((await bridge.installUpdate()).value, false);
 });
 
-test(LABEL + 'unchanged src/desktop.ts consumer: desktopSignIn rejects with the S1 interim text', async (t) => {
+test(LABEL + 'unchanged src/desktop.ts consumer: a cancelled desktopSignIn rejects with "Login cancelado."', async (t) => {
   const { bridge } = await ready(t);
   const consumer = loadDesktopConsumer(bridge);
-  await assert.rejects(consumer.api.desktopSignIn(), (error) => error.message === INTERIM);
+  const signIn = consumer.api.desktopSignIn();
+  assert.deepEqual(plain(await bridge.cancelSignIn()), { ok: true });
+  await assert.rejects(signIn, (error) => error.message === CANCELLED);
   assert.equal(await consumer.api.desktopAudioTrack(), null);
 });
 
@@ -234,7 +239,7 @@ test(LABEL + 'ready withheld 5 s (host disabled the document): queued promises r
 });
 
 test(LABEL + 'deadlines: 30 s "Ponte sem resposta." (host dropped it), signIn 330 s, late result ignored', async (t) => {
-  const { h, bridge } = await ready(t);
+  const { h, page, bridge } = await ready(t);
   const from = h.codes.length;
   const lost = settled(bridge.stopAudio('x'.repeat(200)));
   await h.waitCode('bridge-malformed', from);
@@ -247,18 +252,21 @@ test(LABEL + 'deadlines: 30 s "Ponte sem resposta." (host dropped it), signIn 33
   assert.equal(lost.error?.message, 'Ponte sem resposta.');
   assert.equal(h.clock.pending(), 0);
 
-  h.hold = true;
+  // Re-pointed (S2): a never-answered login. The host begins a real login and answers nothing
+  // because this harness never POSTs to the receiver.
   const signIn = settled(bridge.signIn());
   await h.flush();
-  assert.equal(h.held.length, 1, 'host answered; the double holds the reply');
+  assert.equal(h.loginUrls.length, 1, 'login begun; no immediate result');
+  assert.ok(!h.toPage.some((m) => m.kind === 'result' && m.id === page.sent.at(-1).id));
   h.clock.advance(30000);
   await microtasks();
   assert.equal(signIn.done, false, 'signIn is not bound by the 30 s deadline');
   h.clock.advance(300000);
   await microtasks();
   assert.equal(signIn.error?.message, 'Ponte sem resposta.');
-  h.release(); // the late result for a forgotten id is ignored
-  await microtasks();
+  // The late host result for the forgotten id (settled by the cancel) is ignored by the page.
+  assert.deepEqual(plain(await bridge.cancelSignIn()), { ok: true });
+  assert.ok(h.toPage.some((m) => m.kind === 'result' && m.error === CANCELLED), 'late result arrived');
   assert.equal(signIn.error?.message, 'Ponte sem resposta.');
   assert.deepEqual(plain(await bridge.startAudio()), { ok: true, value: null }, 'bridge still usable');
   assert.equal(h.clock.pending(), 0);

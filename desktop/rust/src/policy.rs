@@ -14,7 +14,7 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// desktop/main.cjs:24-27. `backgroundThrottling:false` (706) is covered by the same switches.
 pub const BROWSER_ARGUMENTS: &str = "--disable-renderer-backgrounding --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling";
 /// CP2 S1 installs the `nimboDesktop` v1 surface (bridge.rs); media/update features stay
-/// unavailable through `Features` and login is an interim internal answer.
+/// unavailable through `Features`; signIn uses the S2-core loopback receiver (login.rs).
 pub const BRIDGE_INSTALLED: bool = true;
 
 /// Bridge v1 method allowlist: the Electron preload channels plus `nimbo:capture:stop`.
@@ -282,6 +282,19 @@ impl Config {
         } else {
             Navigation::Deny
         }
+    }
+    /// External opener rule (plan §5.7): https always (main.cjs:714, 720); under the debug-only
+    /// `test-host` build ALSO the loopback app origin, where login URLs point. Release builds
+    /// cannot reach the loopback branch.
+    pub fn external_allowed(&self, raw: &str) -> bool {
+        let Some(u) = clean_url(raw) else {
+            return false;
+        };
+        #[cfg(feature = "test-host")]
+        if u.origin() == self.start.origin() && self.start.scheme() == "http" {
+            return true;
+        }
+        u.scheme() == "https"
     }
     pub fn popup(&self, raw: &str) -> Navigation {
         if clean_url(raw).is_some_and(|u| u.scheme() == "https") {
