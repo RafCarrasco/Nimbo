@@ -813,6 +813,210 @@ fn burst_of_begin_cancel_with_idle_clients_stays_within_global_budgets() {
     }
 }
 
+// ---------- never-reading peer with a tiny receive buffer (plan §8.2) ----------
+
+/// Test-only client socket whose SO_RCVBUF is set to 1 BEFORE connect (the OS rounds it up; the
+/// effective value is read back with getsockopt and returned). std has no such option and the
+/// crate takes no new dependency, so this is raw FFI to the OS socket API that std already links.
+#[cfg(target_os = "linux")]
+fn tiny_rcvbuf_connect(port: u16) -> (TcpStream, i32) {
+    use std::os::fd::FromRawFd;
+    #[repr(C)]
+    struct SockaddrIn {
+        family: u16,
+        port: u16,
+        addr: u32,
+        zero: [u8; 8],
+    }
+    unsafe extern "C" {
+        fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+        fn setsockopt(fd: i32, level: i32, name: i32, value: *const i32, len: u32) -> i32;
+        fn getsockopt(fd: i32, level: i32, name: i32, value: *mut i32, len: *mut u32) -> i32;
+        fn connect(fd: i32, addr: *const SockaddrIn, len: u32) -> i32;
+        fn close(fd: i32) -> i32;
+    }
+    const AF_INET: i32 = 2;
+    const SOCK_STREAM: i32 = 1;
+    const SOL_SOCKET: i32 = 1;
+    const SO_RCVBUF: i32 = 8;
+    let addr = SockaddrIn {
+        family: AF_INET as u16,
+        port: port.to_be(),
+        addr: u32::from_be_bytes([127, 0, 0, 1]).to_be(),
+        zero: [0; 8],
+    };
+    let int_len = std::mem::size_of::<i32>() as u32;
+    // SAFETY: plain socket syscalls on a descriptor this function owns; every pointer refers to
+    // a live local of the declared size, and the descriptor is closed on every failure path.
+    unsafe {
+        let fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert!(fd >= 0, "socket() failed");
+        let one: i32 = 1;
+        let mut effective: i32 = 0;
+        let mut len = int_len;
+        let ok = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &one, int_len) == 0
+            && getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &mut effective, &mut len) == 0
+            && connect(fd, &addr, std::mem::size_of::<SockaddrIn>() as u32) == 0;
+        if !ok {
+            close(fd);
+            panic!("tiny SO_RCVBUF client setup failed");
+        }
+        (TcpStream::from_raw_fd(fd), effective)
+    }
+}
+
+/// Windows twin of the Linux helper (Winsock is already started by the receiver's std listener).
+/// Compiled by the windows-msvc check/clippy gates only; its runtime is the native user gate.
+#[cfg(windows)]
+fn tiny_rcvbuf_connect(port: u16) -> (TcpStream, i32) {
+    use std::os::windows::io::FromRawSocket;
+    #[repr(C)]
+    struct SockaddrIn {
+        family: u16,
+        port: u16,
+        addr: u32,
+        zero: [u8; 8],
+    }
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn socket(af: i32, kind: i32, protocol: i32) -> usize;
+        fn setsockopt(s: usize, level: i32, name: i32, value: *const i32, len: i32) -> i32;
+        fn getsockopt(s: usize, level: i32, name: i32, value: *mut i32, len: *mut i32) -> i32;
+        fn connect(s: usize, addr: *const SockaddrIn, len: i32) -> i32;
+        fn closesocket(s: usize) -> i32;
+    }
+    const AF_INET: i32 = 2;
+    const SOCK_STREAM: i32 = 1;
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_RCVBUF: i32 = 0x1002;
+    let addr = SockaddrIn {
+        family: AF_INET as u16,
+        port: port.to_be(),
+        addr: u32::from_be_bytes([127, 0, 0, 1]).to_be(),
+        zero: [0; 8],
+    };
+    let int_len = std::mem::size_of::<i32>() as i32;
+    // SAFETY: see the Linux helper; the SOCKET is owned here and closed on every failure path.
+    unsafe {
+        let s = socket(AF_INET, SOCK_STREAM, 0);
+        assert!(s != usize::MAX, "socket() failed");
+        let one: i32 = 1;
+        let mut effective: i32 = 0;
+        let mut len = int_len;
+        let ok = setsockopt(s, SOL_SOCKET, SO_RCVBUF, &one, int_len) == 0
+            && getsockopt(s, SOL_SOCKET, SO_RCVBUF, &mut effective, &mut len) == 0
+            && connect(s, &addr, std::mem::size_of::<SockaddrIn>() as i32) == 0;
+        if !ok {
+            closesocket(s);
+            panic!("tiny SO_RCVBUF client setup failed");
+        }
+        (TcpStream::from_raw_socket(s as u64), effective)
+    }
+}
+
+/// No silent skip: a target without a tiny-receive-buffer mechanism fails this required test.
+#[cfg(not(any(target_os = "linux", windows)))]
+fn tiny_rcvbuf_connect(_port: u16) -> (TcpStream, i32) {
+    panic!("no tiny SO_RCVBUF client mechanism on this target: required §8.2 test cannot run")
+}
+
+/// Plan §8.2 "write timeout (peer never reads: socket with tiny receive buffer -> bounded)".
+/// The peer sends a VALID callback and its application never reads while the receiver works.
+/// Asserted: bounded credential delivery, exactly-once settlement, worker/acceptor teardown and
+/// port closure within the real connection deadline, and no echo of state/tokens.
+/// Coverage boundary (recorded, not asserted): the fixed responses are a few hundred bytes and
+/// fit the kernel socket buffers, so native TCP pressure is NOT expected to reach the write
+/// timeout branch; whether `callback-response-timeout` was emitted is printed as an observation.
+/// The timeout/deadline algorithm itself is covered by the injected-writer unit tests in
+/// src/loopback.rs, which are algorithm evidence only, not native socket-pressure proof.
+#[test]
+fn never_reading_peer_with_tiny_receive_buffer_is_bounded_and_delivers_exactly_once() {
+    let limits = Limits {
+        connection_deadline_ms: 2_000,
+        write_timeout_ms: 300,
+        ..Limits::RELEASE
+    };
+    let l = live(limits);
+    let (mut peer, rcvbuf) = tiny_rcvbuf_connect(l.port);
+    assert!(
+        rcvbuf > 0 && rcvbuf <= 4608,
+        "tiny receive buffer not observed: {rcvbuf}"
+    );
+    let body = format!(
+        "state={}&idToken=nonreader-id&accessToken=nonreader-access",
+        l.state
+    );
+    let raw = format!(
+        "POST /callback HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{body}",
+        l.port,
+        body.len()
+    );
+    let sent = Instant::now();
+    peer.write_all(raw.as_bytes()).expect("send request");
+    // From here on the peer's application reads NOTHING until the receiver has torn down.
+    let bound = Duration::from_millis(limits.connection_deadline_ms);
+    let mut settled = Vec::new();
+    while settled.is_empty() {
+        assert!(sent.elapsed() < bound, "no settlement within the deadline");
+        settled = l.flow.take_settlements(5);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let delivered_ms = sent.elapsed().as_millis();
+    assert_eq!(settled.len(), 1, "exactly one settlement");
+    let Outcome::Credential(c) = &settled[0].outcome else {
+        panic!("expected a credential")
+    };
+    assert_eq!(
+        (c.id_token(), c.access_token()),
+        ("nonreader-id", "nonreader-access")
+    );
+    let st = l.flow.wait_idle(bound.saturating_sub(sent.elapsed()));
+    assert_eq!(
+        (st.workers, st.acceptors, st.registered),
+        (0, 0, 0),
+        "{st:?}"
+    );
+    let idle_ms = sent.elapsed().as_millis();
+    assert!(sent.elapsed() < bound, "worker not bounded: {idle_ms} ms");
+    let refuse_by = Instant::now() + Duration::from_secs(2);
+    while TcpStream::connect(("127.0.0.1", l.port)).is_ok() {
+        assert!(Instant::now() < refuse_by, "port still open");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(l.flow.take_settlements(5).is_empty(), "settled twice");
+    assert_eq!(l.notified.load(Ordering::SeqCst), 1);
+    let (codes, _) = l.flow.take_codes();
+    let delivered = codes
+        .iter()
+        .filter(|c| **c == "login-credential-delivered")
+        .count();
+    assert_eq!(delivered, 1, "{codes:?}");
+    let timeout_code = codes.contains(&"callback-response-timeout");
+    // Only now, after teardown, does the test read what reached the peer: a prefix of the exact
+    // fixed Done response (the whole response when it fit the buffers), never an echo.
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut got = Vec::new();
+    let _ = peer.read_to_end(&mut got);
+    let fixed = response_bytes(Response::Done);
+    assert!(
+        !got.is_empty() && fixed.starts_with(&got),
+        "not the fixed response"
+    );
+    let text = String::from_utf8_lossy(&got);
+    assert!(
+        !text.contains("nonreader") && !text.contains(&l.state),
+        "no echo"
+    );
+    eprintln!(
+        "NONREADER_OBSERVED rcvbuf_effective={rcvbuf} delivered_ms={delivered_ms} \
+         idle_ms={idle_ms} response_bytes={} received_bytes={} full_response={} \
+         callback_response_timeout_code={timeout_code}",
+        fixed.len(),
+        got.len(),
+        got == fixed
+    );
+}
+
 /// Linux-only sample of this test process's OS threads (other tests run in parallel, so the
 /// bound here is loose; the strict per-process bound is asserted by the stdio L4 test).
 fn os_threads() -> Option<usize> {
