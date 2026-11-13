@@ -469,6 +469,49 @@ fn read_until(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> io::
     stream.read(buf)
 }
 
+/// The two socket operations the response write needs: `TcpStream` in production, an injected
+/// writer in the unit tests below (algorithm evidence only, not native TCP-pressure proof).
+trait TimedWrite {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize>;
+}
+impl TimedWrite for TcpStream {
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        Write::write(self, bytes)
+    }
+}
+
+/// Writes the fixed response (`write_all` semantics) within the REMAINING original connection
+/// deadline: before every write attempt (including after a partial or interrupted write) the
+/// timeout is recomputed as `min(deadline - now, cap)`, and an exhausted budget fails at once
+/// with `TimedOut` without writing. A fresh `cap` never extends the connection deadline.
+fn write_response<W: TimedWrite>(
+    w: &mut W,
+    bytes: &[u8],
+    deadline: Instant,
+    cap: Duration,
+    now: &dyn Fn() -> Instant,
+) -> io::Result<()> {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        w.set_write_timeout(Some(left.min(cap)))?;
+        match w.write(rest) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => rest = &rest[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl Worker {
     fn run(self, mut stream: TcpStream) {
         // Windows sockets accepted from a non-blocking listener inherit non-blocking mode.
@@ -488,11 +531,8 @@ impl Worker {
         let (response, decision) = self.handle(&mut stream, deadline);
         let bytes = response_bytes(response);
         if !bytes.is_empty() {
-            let wrote = stream
-                .set_write_timeout(Some(Duration::from_millis(
-                    self.limits.write_timeout_ms.max(1),
-                )))
-                .and_then(|()| stream.write_all(&bytes));
+            let cap = Duration::from_millis(self.limits.write_timeout_ms.max(1));
+            let wrote = write_response(&mut stream, &bytes, deadline, cap, &Instant::now);
             if wrote.is_err() {
                 self.flow.push_code("callback-response-timeout");
             }
@@ -570,5 +610,148 @@ impl Worker {
             CallbackDecision::ExpiredAtCallback => "login-expired-at-callback",
         });
         (Response::Done, Some(decision))
+    }
+}
+
+/// T3: the response write honours the REMAINING original connection deadline, capped by
+/// `write_timeout_ms`, recomputed before every write attempt. Deterministic injected writer and
+/// clock around the production `write_response`; algorithm evidence, not native TCP pressure.
+#[cfg(test)]
+mod write_deadline_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    enum Step {
+        Accept(usize, Duration),
+        Interrupt(Duration),
+        Fail(ErrorKind, Duration),
+    }
+    struct Fake<'c> {
+        clock: &'c Cell<Instant>,
+        script: VecDeque<Step>,
+        timeouts: Vec<Duration>,
+        written: Vec<u8>,
+        writes: usize,
+    }
+    impl TimedWrite for Fake<'_> {
+        fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+            let t = timeout.expect("a write timeout is always set");
+            if t.is_zero() {
+                // std rejects a zero timeout the same way.
+                return Err(ErrorKind::InvalidInput.into());
+            }
+            self.timeouts.push(t);
+            Ok(())
+        }
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            let step = self
+                .script
+                .pop_front()
+                .unwrap_or(Step::Accept(usize::MAX, ms(0)));
+            let (result, cost) = match step {
+                Step::Accept(n, cost) => {
+                    let n = n.min(bytes.len());
+                    self.written.extend_from_slice(&bytes[..n]);
+                    (Ok(n), cost)
+                }
+                Step::Interrupt(cost) => (Err(ErrorKind::Interrupted.into()), cost),
+                Step::Fail(kind, cost) => (Err(kind.into()), cost),
+            };
+            self.clock.set(self.clock.get() + cost);
+            result
+        }
+    }
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+    fn fake(clock: &Cell<Instant>, script: Vec<Step>) -> Fake<'_> {
+        Fake {
+            clock,
+            script: script.into(),
+            timeouts: Vec::new(),
+            written: Vec::new(),
+            writes: 0,
+        }
+    }
+    const BYTES: &[u8] = b"HTTP/1.1 200 OK\r\nfixed response bytes";
+
+    #[test]
+    fn write_timeout_is_capped_by_the_remaining_connection_deadline() {
+        let t0 = Instant::now();
+        let clock = Cell::new(t0);
+        let mut w = fake(&clock, vec![]);
+        let r = write_response(&mut w, BYTES, t0 + ms(200), ms(5_000), &|| clock.get());
+        assert!(r.is_ok());
+        assert_eq!(
+            w.timeouts,
+            vec![ms(200)],
+            "fixed timeout extends the deadline"
+        );
+        assert_eq!(w.written, BYTES);
+    }
+
+    #[test]
+    fn write_timeout_is_capped_by_write_timeout_ms_when_more_budget_remains() {
+        let t0 = Instant::now();
+        let clock = Cell::new(t0);
+        let mut w = fake(&clock, vec![]);
+        let r = write_response(&mut w, BYTES, t0 + ms(10_000), ms(5_000), &|| clock.get());
+        assert!(r.is_ok());
+        assert_eq!(w.timeouts, vec![ms(5_000)]);
+    }
+
+    #[test]
+    fn remaining_budget_is_recomputed_across_partial_and_interrupted_writes() {
+        let t0 = Instant::now();
+        let clock = Cell::new(t0);
+        let script = vec![
+            Step::Accept(10, ms(300)),
+            Step::Interrupt(ms(100)),
+            Step::Accept(usize::MAX, ms(0)),
+        ];
+        let mut w = fake(&clock, script);
+        let r = write_response(&mut w, BYTES, t0 + ms(1_000), ms(5_000), &|| clock.get());
+        assert!(r.is_ok());
+        assert_eq!(w.timeouts, vec![ms(1_000), ms(700), ms(600)]);
+        assert_eq!((w.writes, w.written.as_slice()), (3, BYTES));
+    }
+
+    #[test]
+    fn no_remaining_budget_fails_immediately_without_writing() {
+        let t0 = Instant::now();
+        let clock = Cell::new(t0 + ms(1));
+        let mut w = fake(&clock, vec![]);
+        let r = write_response(&mut w, BYTES, t0, ms(5_000), &|| clock.get());
+        assert_eq!(r.map_err(|e| e.kind()), Err(ErrorKind::TimedOut));
+        assert_eq!(
+            (w.writes, w.timeouts.len()),
+            (0, 0),
+            "wrote past the deadline"
+        );
+    }
+
+    #[test]
+    fn budget_exhausted_by_a_partial_write_stops_before_the_next_write() {
+        let t0 = Instant::now();
+        let clock = Cell::new(t0);
+        let mut w = fake(&clock, vec![Step::Accept(10, ms(1_000))]);
+        let r = write_response(&mut w, BYTES, t0 + ms(1_000), ms(5_000), &|| clock.get());
+        assert_eq!(r.map_err(|e| e.kind()), Err(ErrorKind::TimedOut));
+        assert_eq!((w.writes, w.written.len()), (1, 10));
+        assert_eq!(w.timeouts, vec![ms(1_000)]);
+    }
+
+    #[test]
+    fn writer_timeout_and_zero_writes_are_errors() {
+        let t0 = Instant::now();
+        let clock = Cell::new(t0);
+        let mut w = fake(&clock, vec![Step::Fail(ErrorKind::WouldBlock, ms(5_000))]);
+        let r = write_response(&mut w, BYTES, t0 + ms(10_000), ms(5_000), &|| clock.get());
+        assert_eq!(r.map_err(|e| e.kind()), Err(ErrorKind::WouldBlock));
+        let mut w = fake(&clock, vec![Step::Accept(0, ms(0))]);
+        let r = write_response(&mut w, BYTES, t0 + ms(10_000), ms(5_000), &|| clock.get());
+        assert_eq!(r.map_err(|e| e.kind()), Err(ErrorKind::WriteZero));
     }
 }
