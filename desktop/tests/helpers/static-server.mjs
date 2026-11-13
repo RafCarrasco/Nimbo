@@ -39,7 +39,7 @@ export async function startStaticServer({ root, host = '127.0.0.1', port = 0 }) 
   const realRoot = fs.realpathSync(root);
   const requests = [];
   const server = http.createServer((req, res) => {
-    const rec = { method: req.method, url: maskUrl(`http://${host}${req.url}`), status: 0 };
+    const rec = { method: req.method, url: maskUrl(`http://${host}:${req.socket.localPort}${req.url}`), status: 0 };
     requests.push(rec);
     const send = (status, body, type = 'text/plain; charset=utf-8') => {
       rec.status = status;

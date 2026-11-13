@@ -173,13 +173,14 @@ describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outsi
     await sleep(300);
     assert.equal(signIn.done, false, 'login stays pending');
     assert.equal(h.toPage.length, before, 'double received nothing');
-    assert.ok(h.codes.includes('callback-state-rejected'));
     assert.equal((await h.stats()).active, true);
     const good = await produce(login.url, {});
     assert.equal(good.req.status, 200);
     assert.equal(good.body, DONE_PAGE);
     await until(() => signIn.done, 'signIn result after the correct POST');
     assert.deepEqual(plain(signIn.value), { ok: true, value: { idToken: ALICE_ID_TOKEN, accessToken: '' } });
+    // Receiver codes reach stderr at the next drain (the success notify), not at the 403 itself.
+    assert.ok(h.codes.includes('callback-state-rejected'), 'wrong-state rejection recorded by the receiver');
     audit('L2 wrong-state (end)', ['chrome', 'node', 'bridge-stdio']);
     ev.scenarios.push({ name: 'wrong-state-then-success', login_url: redact(login.url), wrong_status: bad.req.status, wrong_body: bad.body,
       pending_after_wrong: true, good_status: good.req.status, result: 'ok:true idToken=<alice synthetic JSON>', codes: [...h.codes] });

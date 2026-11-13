@@ -168,6 +168,7 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
     });
 
     await t.test('cancel from the app\'s cancel button -> "Login cancelado."', async () => {
+      h.control('tick 1000'); // fresh 1 s log window on the virtual clock (host timer), far below the 300 s lifetime
       const from = h.loginUrls.length;
       assert.equal(await clickButton(chrome.cdp, app.sessionId, 'Continuar com Google'), true);
       const login = await h.loginUrl(from);
@@ -182,6 +183,7 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
     });
 
     await t.test('app reload while pending -> no result ever posted (login-result-dropped-stale on the POST)', async () => {
+      h.control('tick 1000'); // fresh 1 s log window on the virtual clock (host timer), far below the 300 s lifetime
       const from = h.loginUrls.length;
       assert.equal(await clickButton(chrome.cdp, app.sessionId, 'Continuar com Google'), true);
       const login = await h.loginUrl(from);
@@ -206,6 +208,7 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
     });
 
     await t.test('fresh click works: wrong-state POST -> still LoginScreen; correct POST -> SDK sign-in -> "Aguardando aprovação"', async () => {
+      h.control('tick 1000'); // fresh 1 s log window on the virtual clock (host timer), far below the 300 s lifetime
       const from = h.loginUrls.length;
       assert.equal(await clickButton(chrome.cdp, app.sessionId, 'Continuar com Google'), true);
       const login = await h.loginUrl(from);
@@ -217,7 +220,6 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
       assert.equal(bad.text.trim(), 'Link de login inválido.');
       await sleep(300);
       assert.ok((await appText()).includes('Termine o login no navegador que abriu.'), 'still LoginScreen, waiting');
-      assert.ok(h.codes.includes('callback-state-rejected'));
       const good = await produce(login.url);
       assert.equal(good.req.status, 200);
       assert.equal(good.req.origin, ORIGIN);
@@ -225,6 +227,8 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
       for (const s of [login.state, ALICE_ID_TOKEN]) assert.ok(!good.html.includes(s), 'done page has no token/state');
       await appHas('Aguardando aprovação', 30000);
       await appHas(ALICE);
+      // Receiver codes reach stderr at the next drain (the success notify), not at the 403 itself.
+      assert.ok(h.codes.includes('callback-state-rejected'), 'wrong-state rejection recorded by the receiver');
       const accounts = await emulatorAccounts();
       assert.equal(accounts.status, 200);
       assert.deepEqual(accounts.users, [{ email: ALICE, providers: ['google.com'], has_localId: true }], 'SDK-independent: signInWithIdp created alice with google.com');
