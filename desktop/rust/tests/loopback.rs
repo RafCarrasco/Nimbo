@@ -5,8 +5,9 @@ use nimbo_desktop::login::*;
 use nimbo_desktop::loopback::*;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 const APP: &str = "http://127.0.0.1:4173";
@@ -21,8 +22,19 @@ struct Live {
 
 fn flow_with(limits: Limits) -> (LoginFlow, Arc<AtomicUsize>, Arc<AtomicU64>) {
     let notified = Arc::new(AtomicUsize::new(0));
+    let n = notified.clone();
+    let (flow, clock) = flow_notifying(
+        limits,
+        Arc::new(move || {
+            n.fetch_add(1, Ordering::SeqCst);
+            true
+        }),
+    );
+    (flow, notified, clock)
+}
+fn flow_notifying(limits: Limits, notify: Notify) -> (LoginFlow, Arc<AtomicU64>) {
     let clock = Arc::new(AtomicU64::new(5));
-    let (n, c) = (notified.clone(), clock.clone());
+    let c = clock.clone();
     let seed = Arc::new(AtomicU64::new(0x1234_5678));
     let flow = LoginFlow::new(Hooks::new(
         Arc::new(move |buf: &mut [u8; 24]| {
@@ -35,14 +47,11 @@ fn flow_with(limits: Limits) -> (LoginFlow, Arc<AtomicUsize>, Arc<AtomicU64>) {
             }
             true
         }),
-        Arc::new(move || {
-            n.fetch_add(1, Ordering::SeqCst);
-            true
-        }),
+        notify,
         Arc::new(move || c.load(Ordering::SeqCst)),
     ));
     flow.set_limits(limits);
-    (flow, notified, clock)
+    (flow, clock)
 }
 fn small() -> Limits {
     Limits {
@@ -435,9 +444,120 @@ fn secret_buf_wipes_owned_bytes_best_effort() {
 
 // ---------- real sockets ----------
 
-#[test]
-fn valid_post_delivers_writes_done_page_and_notifies_then_listener_closes() {
-    let l = live(small());
+// ---------- notification observer (test-owned) ----------
+
+/// What the test-owned notify hook does. `Gated` is a SYNTHETIC in-process barrier on the real
+/// Linux loopback path (not native Windows evidence): the hook blocks (bounded by 2 s) until
+/// the test thread has observed the counter once, so the notifier deterministically completes
+/// AFTER the client's EOF and first observation. `Withheld` (no notification) and `Duplicate`
+/// (two notifications) are negative controls.
+#[derive(Clone, Copy, Debug)]
+enum NotifyMode {
+    Immediate,
+    Gated,
+    Withheld,
+    Duplicate,
+}
+
+/// Counts completed notify-hook calls; `count()` is the scenarios' only read of the counter.
+struct Notified {
+    mode: NotifyMode,
+    count: AtomicUsize,
+    first_seen: Mutex<Option<usize>>,
+    released: Mutex<bool>,
+    wake: Condvar,
+    gate_timed_out: AtomicBool,
+}
+impl Notified {
+    fn new(mode: NotifyMode) -> Arc<Self> {
+        Arc::new(Self {
+            mode,
+            count: AtomicUsize::new(0),
+            first_seen: Mutex::new(None),
+            released: Mutex::new(false),
+            wake: Condvar::new(),
+            gate_timed_out: AtomicBool::new(false),
+        })
+    }
+    fn hook(&self) {
+        match self.mode {
+            NotifyMode::Immediate => {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+            NotifyMode::Gated => {
+                let released = self.released.lock().unwrap_or_else(PoisonError::into_inner);
+                let (_released, wait) = self
+                    .wake
+                    .wait_timeout_while(released, Duration::from_secs(2), |r| !*r)
+                    .unwrap_or_else(PoisonError::into_inner);
+                if wait.timed_out() {
+                    self.gate_timed_out.store(true, Ordering::SeqCst);
+                }
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+            NotifyMode::Withheld => {}
+            NotifyMode::Duplicate => {
+                self.count.fetch_add(2, Ordering::SeqCst);
+            }
+        }
+    }
+    /// Reads the counter, records the first value seen, then releases a gated hook.
+    fn count(&self) -> usize {
+        let n = self.count.load(Ordering::SeqCst);
+        self.first_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(n);
+        self.release();
+        n
+    }
+    fn release(&self) {
+        *self.released.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.wake.notify_all();
+    }
+}
+
+/// Bounded wait (the existing 2 s supervision bound) for the ACTUAL notifier. EOF on the client
+/// socket does not imply it ran: `Worker::run` half-closes the socket BEFORE `flow.notify()`.
+fn wait_notified(n: &Notified, want: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while n.count() < want {
+        assert!(Instant::now() < deadline, "notifier did not run within 2 s");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+/// After `wait_idle` reported no worker left (each worker's slot is released only after its
+/// `notify` returned), no later notification can arrive: the count is final.
+fn assert_exactly_one_notification(n: &Notified) {
+    assert_eq!(n.count(), 1, "exactly one notification");
+}
+
+struct Observed {
+    flow: LoginFlow,
+    port: u16,
+    state: String,
+    notified: Arc<Notified>,
+}
+fn observed(mode: NotifyMode) -> Observed {
+    let notified = Notified::new(mode);
+    let n = notified.clone();
+    let (flow, _clock) = flow_notifying(
+        small(),
+        Arc::new(move || {
+            n.hook();
+            true
+        }),
+    );
+    let (port, state) = begin_on(&flow, 1);
+    Observed {
+        flow,
+        port,
+        state,
+        notified,
+    }
+}
+
+fn valid_post_scenario(l: &Observed) {
     let body = format!(
         "state={}&idToken=synthetic-id&accessToken=synthetic-access",
         l.state
@@ -450,9 +570,10 @@ fn valid_post_delivers_writes_done_page_and_notifies_then_listener_closes() {
         !text.contains("synthetic") && !text.contains(&l.state),
         "no echo"
     );
-    assert_eq!(l.notified.load(Ordering::SeqCst), 1);
+    wait_notified(&l.notified, 1);
     assert!(l.flow.activation_reserved());
     let s = l.flow.take_settlements(5);
+    assert_eq!(s.len(), 1, "exactly one settlement");
     let Outcome::Credential(c) = &s[0].outcome else {
         panic!()
     };
@@ -468,8 +589,14 @@ fn valid_post_delivers_writes_done_page_and_notifies_then_listener_closes() {
     }
     let st = l.flow.wait_idle(Duration::from_secs(2));
     assert_eq!((st.workers, st.acceptors), (0, 0));
+    assert_exactly_one_notification(&l.notified);
     let (codes, _) = l.flow.take_codes();
     assert!(codes.contains(&"login-credential-delivered"), "{codes:?}");
+}
+
+#[test]
+fn valid_post_delivers_writes_done_page_and_notifies_then_listener_closes() {
+    valid_post_scenario(&observed(NotifyMode::Immediate));
 }
 
 #[test]
@@ -547,10 +674,8 @@ fn truncated_body_and_idle_connection_close_without_response_after_the_real_dead
     assert!(l.flow.tick(l.clock.load(Ordering::SeqCst)).is_empty());
 }
 
-#[test]
-fn not_pending_post_still_gets_the_done_page_and_delivers_nothing() {
+fn not_pending_scenario(l: &Observed) {
     // Parity main.cjs:103-104: the 200 page is written BEFORE the pending check.
-    let l = live(small());
     let mut late = TcpStream::connect(("127.0.0.1", l.port)).unwrap();
     late.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     late.write_all(b"POST /callback HTTP/1.1\r\n").unwrap();
@@ -581,9 +706,101 @@ fn not_pending_post_still_gets_the_done_page_and_delivers_nothing() {
         panic!()
     };
     assert_eq!(c.id_token(), "first", "exactly one Deliver");
-    assert_eq!(l.notified.load(Ordering::SeqCst), 1);
+    wait_notified(&l.notified, 1);
+    let st = l.flow.wait_idle(Duration::from_secs(2));
+    assert_eq!((st.workers, st.acceptors), (0, 0));
+    assert_exactly_one_notification(&l.notified);
     let (codes, _) = l.flow.take_codes();
     assert!(codes.contains(&"login-ignored-not-pending"), "{codes:?}");
+}
+
+#[test]
+fn not_pending_post_still_gets_the_done_page_and_delivers_nothing() {
+    not_pending_scenario(&observed(NotifyMode::Immediate));
+}
+
+type Scenario = fn(&Observed);
+const SCENARIOS: [(&str, Scenario); 2] = [
+    ("valid_post", valid_post_scenario),
+    ("not_pending", not_pending_scenario),
+];
+
+/// Runs `scenario` under `mode` and returns its panic message, if any. Whatever happened, the
+/// gate is released and the flow shut down and drained (bounded) before returning.
+fn run_controlled(mode: NotifyMode, scenario: Scenario) -> (Option<String>, Arc<Notified>) {
+    let l = observed(mode);
+    let outcome = catch_unwind(AssertUnwindSafe(|| scenario(&l)));
+    l.notified.release();
+    l.flow.shutdown();
+    let st = l.flow.wait_idle(Duration::from_secs(2));
+    assert_eq!((st.workers, st.acceptors), (0, 0), "control teardown");
+    let message = outcome.err().map(|p| {
+        p.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            .unwrap_or_default()
+    });
+    (message, l.notified)
+}
+
+/// Runs EVERY scenario under `mode` and judges each with `verdict` (an error or `None`) before
+/// asserting, so one scenario's failure never hides the other's.
+fn control_all(mode: NotifyMode, verdict: fn(Option<String>, &Notified) -> Option<String>) {
+    let failures: Vec<String> = SCENARIOS
+        .into_iter()
+        .filter_map(|(name, scenario)| {
+            let (panic, n) = run_controlled(mode, scenario);
+            verdict(panic, &n).map(|e| format!("{name}: {e}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Causal positive control: the client reads the whole done page to EOF while the notifier is
+/// still held (first observed count 0), and the scenarios still pass once it completes.
+#[test]
+fn scenarios_pass_when_the_notifier_completes_only_after_eof() {
+    control_all(NotifyMode::Gated, |panic, n| {
+        let first = *n.first_seen.lock().unwrap_or_else(PoisonError::into_inner);
+        let completed = n.count.load(Ordering::SeqCst);
+        if let Some(p) = panic {
+            Some(format!("scenario failed: {p}"))
+        } else if first != Some(0) {
+            Some(format!(
+                "EOF not observed before the notifier ran: {first:?}"
+            ))
+        } else if n.gate_timed_out.load(Ordering::SeqCst) {
+            Some("gate not released by the observation".to_owned())
+        } else if completed != 1 {
+            Some(format!("{completed} notifications"))
+        } else {
+            None
+        }
+    });
+}
+
+/// Negative control: a notification that never happens still fails both scenarios.
+#[test]
+fn scenarios_fail_when_the_notification_is_withheld() {
+    control_all(NotifyMode::Withheld, |panic, n| match panic {
+        None => Some("withheld notification accepted".to_owned()),
+        Some(p) if !p.contains("notifier did not run within 2 s") => {
+            Some(format!("wrong failure: {p}"))
+        }
+        Some(_) if n.count.load(Ordering::SeqCst) != 0 => Some("counter moved".to_owned()),
+        Some(_) => None,
+    });
+}
+
+/// Negative control: a duplicate notification still fails both scenarios.
+#[test]
+fn scenarios_fail_on_a_duplicate_notification() {
+    control_all(NotifyMode::Duplicate, |panic, n| match panic {
+        None => Some("duplicate notification accepted".to_owned()),
+        Some(p) if !p.contains("exactly one notification") => Some(format!("wrong failure: {p}")),
+        Some(_) if n.count.load(Ordering::SeqCst) != 2 => Some("counter not 2".to_owned()),
+        Some(_) => None,
+    });
 }
 
 #[test]
