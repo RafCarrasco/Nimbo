@@ -107,29 +107,100 @@ export function socketViolation(row) {
 
 const NET_TABLES = ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6'];
 
-/** Every process visible in this pid namespace: fd socket inodes joined with its net tables. */
+/** Strict shape check of a kernel net table: its header line, then only well-formed socket rows. */
+export function procNetWellFormed(text) {
+  const lines = String(text).split('\n');
+  const head = lines[0].trim().split(/\s+/);
+  if (head[0] !== 'sl' || head[1] !== 'local_address') return false;
+  const addr = /^([0-9A-Fa-f]{8}|[0-9A-Fa-f]{32}):[0-9A-Fa-f]{4}$/;
+  return lines.slice(1).filter((l) => l.trim()).every((l) => {
+    const x = l.trim().split(/\s+/);
+    return x.length >= 10 && /^\d+:$/.test(x[0]) && addr.test(x[1]) && addr.test(x[2]) && /^[0-9A-Fa-f]{2}$/.test(x[3]) && /^\d+$/.test(x[9]);
+  });
+}
+
+/**
+ * Lists a directory and runs `use(names)` while the listing handle is still open (when the fs has
+ * opendirSync): a /proc/<self>/fd listing contains the reader's own descriptor, which a one-shot
+ * readdir has already closed before its link can be read.
+ */
+function withListing(f, dir, use) {
+  if (typeof f.opendirSync !== 'function') return use(f.readdirSync(dir));
+  const h = f.opendirSync(dir);
+  try {
+    const names = [];
+    for (let e; (e = h.readSync()) !== null;) names.push(e.name);
+    return use(names);
+  } finally { h.closeSync(); }
+}
+
+/** Sanitized error code only (never a message or path). */
+const errCode = (e) => (e && typeof e.code === 'string' && /^E[A-Z0-9]+$/.test(e.code) ? e.code : 'ERROR');
+
+/** `/proc/<pid>/stat` identity: { starttime, state }, or null when malformed. */
+export function parseProcStat(text) {
+  const s = String(text), r = s.lastIndexOf(')');
+  if (r < 0) return null;
+  const rest = s.slice(r + 1).trim().split(/\s+/);
+  if (rest.length < 20 || !/^[A-Za-z]$/.test(rest[0]) || !/^\d+$/.test(rest[19])) return null;
+  return { starttime: rest[19], state: rest[0] };
+}
+
+/**
+ * Every process visible in this pid namespace: fd socket inodes joined with its net tables.
+ * Each process carries explicit sanitized read coverage (`reads`: input -> 'ok' | error code),
+ * its `errors` and a stat identity read before and after; missing data is never empty data.
+ */
 export function auditProc({ procRoot = '/proc', fs: f = fs } = {}) {
-  const read = (p) => { try { return f.readFileSync(p, 'utf8'); } catch { return null; } };
-  const processes = [], violations = [];
-  for (const name of f.readdirSync(procRoot)) {
-    if (!/^\d+$/.test(name)) continue;
+  const processes = [], violations = [], incomplete = [];
+  let names = [], enumCode = null;
+  try { names = f.readdirSync(procRoot).filter((n) => /^\d+$/.test(n)); } catch (e) { enumCode = errCode(e); }
+  if (!enumCode && !names.length) enumCode = 'EMPTY';
+  const enumeration = { ok: !enumCode, code: enumCode, entries: names.length };
+  for (const name of names) {
     const pid = Number(name), base = path.join(procRoot, name);
-    const comm = (read(path.join(base, 'comm')) || '').trim();
-    let fdNames = [];
-    try { fdNames = f.readdirSync(path.join(base, 'fd')); } catch { /* exited or not ours */ }
-    const inodes = new Set();
-    for (const fd of fdNames) {
-      let target = '';
-      try { target = f.readlinkSync(path.join(base, 'fd', fd)); } catch { continue; }
-      const m = /^socket:\[(\d+)\]$/.exec(target);
-      if (m) inodes.add(m[1]);
-    }
+    const reads = {}, errors = [];
+    const attempt = (input, fn) => {
+      try { const v = fn(); reads[input] = 'ok'; return v; } catch (e) { fail(input, errCode(e)); return null; }
+    };
+    const fail = (input, code) => { reads[input] = code; errors.push({ input, code }); };
+    const statText = attempt('stat', () => f.readFileSync(path.join(base, 'stat'), 'utf8'));
+    const id0 = statText === null ? null : parseProcStat(statText);
+    if (statText !== null && !id0) fail('stat', 'MALFORMED');
+    const commText = attempt('comm', () => f.readFileSync(path.join(base, 'comm'), 'utf8'));
+    const comm = (commText ?? '').trim();
+    if (commText !== null && !comm) fail('comm', 'EMPTY');
+    const fdDir = path.join(base, 'fd'), inodes = new Set();
+    // An fd that disappears is closed only if one bounded re-listing of the fd directory
+    // corroborates it; any other readlink failure is unread data.
+    let fdsRead = 0, fdsClosed = 0, linkCode = null;
+    const fdListed = attempt('fd', () => withListing(f, fdDir, (fdNames) => {
+      fdsRead = fdNames.length;
+      let relisted;
+      for (const fd of fdNames) {
+        let target = '';
+        try { target = f.readlinkSync(path.join(fdDir, fd)); } catch (e) {
+          const code = errCode(e);
+          if (code === 'ENOENT') {
+            if (relisted === undefined) { try { relisted = withListing(f, fdDir, (n) => n); } catch { relisted = null; } }
+            if (relisted && !relisted.includes(fd)) { fdsClosed++; continue; }
+          }
+          linkCode = linkCode || code;
+          continue;
+        }
+        const m = /^socket:\[(\d+)\]$/.exec(target);
+        if (m) inodes.add(m[1]);
+      }
+      return true;
+    }));
+    if (linkCode) fail('fd_links', linkCode); else reads.fd_links = fdListed ? 'ok' : 'SKIPPED';
     const inet = [];
     const tables = {};
     for (const t of NET_TABLES) {
-      const text = read(path.join(base, 'net', t));
+      const text = attempt('net/' + t, () => f.readFileSync(path.join(base, 'net', t), 'utf8'));
       tables[t] = text !== null;
       if (text === null) continue;
+      if (!procNetWellFormed(text)) fail('net/' + t, 'MALFORMED'); // well-formed rows below are still audited
       for (const row of parseProcNet(text, t)) {
         if (!inodes.has(row.inode)) continue;
         const v = socketViolation(row);
@@ -138,12 +209,32 @@ export function auditProc({ procRoot = '/proc', fs: f = fs } = {}) {
         if (v) violations.push({ pid, comm, reason: v, ...rec });
       }
     }
+    let id1 = null, recheck = 'ok';
+    try { id1 = parseProcStat(f.readFileSync(path.join(base, 'stat'), 'utf8')); if (!id1) recheck = 'MALFORMED'; } catch (e) { recheck = errCode(e); }
+    const identity = { starttime: id0 ? id0.starttime : null, state: (id1 || id0 || {}).state ?? null,
+      stable: !!(id0 && id1 && id0.starttime === id1.starttime) };
+    if (id0 && id1 && !identity.stable) fail('identity', 'CHANGED'); // pid reused mid-audit: unresolved
+    else if (id0 && !id1) fail('identity', recheck); // identity not re-verified after the reads
+    // Lifecycle: an error alone never proves exit. One bounded corroboration only: a stat recheck
+    // ENOENT plus absence from one re-enumeration proves exit; the same start time in state Z/X
+    // proves a terminal process. Anything else with an error stays a live, incomplete process.
+    let status = 'live', lifecycle = null;
+    if (errors.length && recheck === 'ENOENT') {
+      let listed = null;
+      try { listed = f.readdirSync(procRoot).includes(name); } catch { listed = null; }
+      lifecycle = { stat_recheck: 'ENOENT', listed_on_reenumeration: listed };
+      if (listed === false) status = 'vanished';
+    } else if (errors.length && identity.stable && /^[ZX]$/.test(id1.state)) {
+      lifecycle = { stat_recheck: 'ok', state: id1.state };
+      status = 'terminal';
+    }
     const matched = new Set(inet.map((s) => s.inode));
-    processes.push({ pid, comm, fds_read: fdNames.length, inet_sockets: inet,
+    processes.push({ pid, comm, status, identity, lifecycle, reads, errors, fds_read: fdsRead, fds_closed: fdsClosed, inet_sockets: inet,
       non_inet_socket_inodes: [...inodes].filter((i) => !matched.has(i)).length, tables_read: tables });
+    if (status === 'live' && errors.length) incomplete.push({ pid, comm, status, errors });
   }
-  return { label: 'EVIDENCE (detection only; network-none namespace is the guarantee)', processes, violations,
-    pass: processes.length > 0 && violations.length === 0 };
+  return { label: 'EVIDENCE (detection only; network-none namespace is the guarantee)', enumeration, processes, violations, incomplete,
+    pass: enumeration.ok && processes.length > 0 && violations.length === 0 && incomplete.length === 0 };
 }
 
 // ---------------------------------------------------------------- CDP URL log

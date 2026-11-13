@@ -84,15 +84,26 @@ async function produce(loginUrl, { state }) {
   return { req, body: body.base64Encoded ? Buffer.from(body.body, 'base64').toString('utf8') : body.body, page, callback };
 }
 
-function audit(label, required) {
-  const a = auditProc();
+/**
+ * Retained audit record first (sanitized per-process read/error/identity/lifecycle coverage, so
+ * the saved evidence can be re-evaluated independently), then direct enforcement: a complete
+ * clean audit (a.pass, which also rejects any incomplete live process), no violation, and the
+ * required processes among LIVE audited processes (a vanished or terminal record never satisfies
+ * coverage).
+ */
+function audit(label, required, { run = auditProc, into = ev.audits } = {}) {
+  const a = run();
   const comms = new Set(a.processes.map((p) => p.comm));
-  const missing = required.filter((c) => !comms.has(c));
-  ev.audits.push({ label, pass: a.pass, missing_required: missing, comms: [...comms].sort(), violations: a.violations,
-    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, inet_sockets: p.inet_sockets.length, non_inet_socket_inodes: p.non_inet_socket_inodes })),
+  const live = new Set(a.processes.filter((p) => p.status === 'live').map((p) => p.comm));
+  const missing = required.filter((c) => !live.has(c));
+  into.push({ label, pass: a.pass, enumeration: a.enumeration, missing_required: missing, comms: [...comms].sort(), live_comms: [...live].sort(),
+    violations: a.violations, incomplete: a.incomplete,
+    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, status: p.status, identity: p.identity, lifecycle: p.lifecycle, reads: p.reads,
+      errors: p.errors, fds_read: p.fds_read, fds_closed: p.fds_closed, inet_sockets: p.inet_sockets.length, non_inet_socket_inodes: p.non_inet_socket_inodes })),
     sockets: a.processes.flatMap((p) => p.inet_sockets.map((s) => ({ pid: p.pid, comm: p.comm, ...s }))) });
   assert.deepEqual(missing, [], `${label}: audited processes include ${required.join(', ')}`);
   assert.deepEqual(a.violations, [], `${label}: every socket of every process is loopback`);
+  assert.equal(a.pass, true, `${label}: complete clean audit (no unread or unresolved live-process input)`);
 }
 
 describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outside the isolated network-none container: ' + GUARD.reasons.join('; ') }, () => {
@@ -202,5 +213,358 @@ describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outsi
     const hits = scanForSecrets(text, [...seen, ALICE_ID_TOKEN]);
     assert.deepEqual(hits, [], 'retained evidence carries no state/token/key');
     fs.writeFileSync(path.join(EVIDENCE, 'l2-producer.json'), text);
+  });
+});
+
+// ================================================================ PURE helper regressions
+// NOT browser integration cases and NOT guarded: synthetic /proc trees through auditProc's
+// injectable `procRoot`/`fs` only — no socket is opened and no process is started, so they also
+// run (and are reported separately) on the host where the live suite above is refused.
+const PHDR = '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n';
+const prow = (local, rem, st, inode) => `   0: ${local} ${rem} ${st} 00000000:00000000 00:00000000 00000000 10000        0 ${inode} 1 0000000000000000 100 0 0 10 0\n`;
+const P_TABLES = ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6'];
+const LO_LISTEN = prow('0100007F:1F90', '00000000:0000', '0A', '111');
+const EXT_EST = prow('0100007F:9C40', '08080808:01BB', '01', '222');
+const pstat = (pid, comm, state = 'S', start = 4242) => `${pid} (${comm}) ${state} 1 1 1 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 ${start} 1000 100\n`;
+const perr = (code) => Object.assign(new Error('synthetic ' + code), { code });
+/**
+ * Synthetic /proc. Each value is a string/array, an Error (thrown), or a list of those under
+ * `seq` (consumed per read, last one repeats) to model state changing between reads.
+ */
+function synthProc(spec) {
+  const calls = {};
+  const get = (p) => {
+    const n = (calls[p] = (calls[p] || 0) + 1);
+    let v = spec[p];
+    if (v && v.seq) v = v.seq[Math.min(n, v.seq.length) - 1];
+    if (v === undefined) throw perr('ENOENT');
+    if (v instanceof Error) throw v;
+    return v;
+  };
+  return { calls, fs: { readFileSync: (p) => get(p), readdirSync: (p) => get(p), readlinkSync: (p) => get(p) } };
+}
+/** One healthy process: valid stat/comm, readable fd dir and all six tables (tcp has `tcp`). */
+function procEntry(spec, pid, { comm = 'chrome', tcp = PHDR + LO_LISTEN, fds = { 3: 'socket:[111]' }, start = 4242 } = {}) {
+  const b = `/sp/${pid}`;
+  spec[`${b}/stat`] = pstat(pid, comm, 'S', start);
+  spec[`${b}/comm`] = comm + '\n';
+  spec[`${b}/fd`] = Object.keys(fds);
+  for (const [fd, target] of Object.entries(fds)) spec[`${b}/fd/${fd}`] = target;
+  for (const t of P_TABLES) spec[`${b}/net/${t}`] = t === 'tcp' ? tcp : PHDR;
+  return spec;
+}
+function healthySpec(opts) {
+  const spec = { '/sp': ['100', 'self'] };
+  return procEntry(spec, 100, opts);
+}
+const synthAudit = (spec) => { const s = synthProc(spec); return { a: auditProc({ procRoot: '/sp', fs: s.fs }), calls: s.calls }; };
+
+describe('PURE auditProc regressions (synthetic /proc; no socket, no process; not browser cases)', () => {
+  test('P0 positive control: healthy loopback-only live process -> complete clean audit', () => {
+    const { a } = synthAudit(healthySpec());
+    assert.equal(a.pass, true, JSON.stringify(a));
+    assert.equal(a.processes.length, 1);
+    assert.equal(a.processes[0].inet_sockets.length, 1);
+  });
+  test('P1 positive control: an owned external ESTABLISHED socket is a violation', () => {
+    const { a } = synthAudit(healthySpec({ tcp: PHDR + LO_LISTEN + EXT_EST, fds: { 3: 'socket:[111]', 4: 'socket:[222]' } }));
+    assert.equal(a.pass, false);
+    assert.ok(a.violations.some((v) => v.inode === '222' && /remote/.test(v.reason)));
+  });
+  test('A2 fd directory EACCES on an active process holding an external socket -> NOT a clean audit', () => {
+    const spec = healthySpec({ tcp: PHDR + LO_LISTEN + EXT_EST, fds: { 3: 'socket:[111]', 4: 'socket:[222]' } });
+    spec['/sp/100/fd'] = perr('EACCES');
+    const { a, calls } = synthAudit(spec);
+    assert.equal(calls['/sp/100/fd'], 1, 'the fd directory read was actually attempted');
+    assert.equal(a.processes[0].comm, 'chrome', 'valid identity metadata was read');
+    assert.equal(a.pass, false, 'unreadable fd directory must not report a complete clean audit');
+  });
+  test('A3 one net table (tcp) EACCES on an active process -> NOT a clean audit', () => {
+    const spec = healthySpec({ tcp: PHDR + LO_LISTEN + EXT_EST, fds: { 3: 'socket:[111]', 4: 'socket:[222]' } });
+    spec['/sp/100/net/tcp'] = perr('EACCES');
+    const { a, calls } = synthAudit(spec);
+    assert.equal(calls['/sp/100/net/tcp'], 1, 'the tcp table read was actually attempted');
+    assert.equal(calls['/sp/100/fd'], 1, 'fd directory was readable and read');
+    assert.equal(a.pass, false, 'unreadable tcp table must not report a complete clean audit');
+  });
+  test('A4 all six net tables EACCES on an active process -> NOT a clean audit', () => {
+    const spec = healthySpec({ tcp: PHDR + LO_LISTEN + EXT_EST, fds: { 3: 'socket:[111]', 4: 'socket:[222]' } });
+    for (const t of P_TABLES) spec[`/sp/100/net/${t}`] = perr('EACCES');
+    const { a, calls } = synthAudit(spec);
+    assert.deepEqual(P_TABLES.map((t) => calls[`/sp/100/net/${t}`]), [1, 1, 1, 1, 1, 1], 'every table read was attempted');
+    assert.equal(a.pass, false, 'all tables unreadable must not report a complete clean audit');
+  });
+  test('C1 explicit sanitized read/identity coverage per process (healthy and A2)', () => {
+    const ok = synthAudit(healthySpec()).a.processes[0];
+    assert.equal(ok.status, 'live');
+    assert.deepEqual(ok.identity, { starttime: '4242', state: 'S', stable: true });
+    assert.deepEqual(ok.reads, { stat: 'ok', comm: 'ok', fd: 'ok', fd_links: 'ok', 'net/tcp': 'ok', 'net/tcp6': 'ok', 'net/udp': 'ok',
+      'net/udp6': 'ok', 'net/raw': 'ok', 'net/raw6': 'ok' });
+    assert.deepEqual(ok.errors, []);
+    const spec = healthySpec();
+    spec['/sp/100/fd'] = perr('EACCES');
+    const { a } = synthAudit(spec);
+    const p = a.processes[0];
+    assert.equal(p.reads.fd, 'EACCES');
+    assert.deepEqual(p.errors, [{ input: 'fd', code: 'EACCES' }]);
+    assert.deepEqual(a.incomplete.map((x) => [x.pid, x.status]), [[100, 'live']]);
+    assert.ok(!JSON.stringify(a).includes('/sp') && !JSON.stringify(a).includes('synthetic'), 'no raw paths or messages retained');
+  });
+  const malformed = {
+    'M1 garbage stat': (s) => { s['/sp/100/stat'] = 'garbage\n'; return 'stat'; },
+    'M2 empty comm on a live process': (s) => { s['/sp/100/comm'] = '\n'; return 'comm'; },
+    'M3 tcp table row that does not parse': (s) => { s['/sp/100/net/tcp'] = PHDR + LO_LISTEN + '   1: not-a-row\n'; return 'net/tcp'; },
+    'M4 udp table without its header line (empty file)': (s) => { s['/sp/100/net/udp'] = ''; return 'net/udp'; },
+    'M5 tcp6 row with a non-hex address': (s) => { s['/sp/100/net/tcp6'] = PHDR + prow('ZZ00007F:1F90', '00000000:0000', '0A', '555'); return 'net/tcp6'; },
+  };
+  for (const [name, mutate] of Object.entries(malformed)) {
+    test(name + ' -> required input MALFORMED/EMPTY, NOT a clean audit', () => {
+      const spec = healthySpec();
+      const input = mutate(spec);
+      const { a } = synthAudit(spec);
+      assert.equal(a.pass, false, 'malformed required input must not pass');
+      assert.ok(a.processes[0].errors.some((e) => e.input === input && ['MALFORMED', 'EMPTY'].includes(e.code)), JSON.stringify(a.processes[0].errors));
+    });
+  }
+  test('N1 /proc enumeration EACCES -> recorded, fail closed (no throw, no clean audit)', () => {
+    const { a } = synthAudit({ '/sp': perr('EACCES') });
+    assert.deepEqual(a.enumeration, { ok: false, code: 'EACCES', entries: 0 });
+    assert.equal(a.pass, false);
+  });
+  test('N2 /proc enumeration with no pid entries -> EMPTY, fail closed', () => {
+    const { a } = synthAudit({ '/sp': ['self', 'net'] });
+    assert.deepEqual(a.enumeration, { ok: false, code: 'EMPTY', entries: 0 });
+    assert.equal(a.pass, false);
+  });
+  test('N3 healthy enumeration is recorded', () => {
+    assert.deepEqual(synthAudit(healthySpec()).a.enumeration, { ok: true, code: null, entries: 1 });
+  });
+  // Lifecycle: an error alone never proves exit. Proven exit = stat recheck ENOENT AND the pid
+  // absent from one bounded re-enumeration; terminal = the same start time read twice in state Z/X.
+  test('L1 proven vanished process (stat ENOENT + absent on re-enumeration) is classified, not counted live', () => {
+    const spec = healthySpec();
+    spec['/sp'] = { seq: [['100', '200'], ['100']] };
+    const { a } = synthAudit(spec);
+    const p = a.processes.find((x) => x.pid === 200);
+    assert.equal(p.status, 'vanished');
+    assert.deepEqual(p.lifecycle, { stat_recheck: 'ENOENT', listed_on_reenumeration: false });
+    assert.deepEqual(a.incomplete, []);
+    assert.equal(a.pass, true, JSON.stringify(a.incomplete));
+  });
+  test('L2 ENOENT on fd/tables while the pid is still listed with a stable live stat -> unresolved, fail', () => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    spec['/sp/200/stat'] = pstat(200, 'chrome');
+    spec['/sp/200/comm'] = 'chrome\n';
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes.find((x) => x.pid === 200).status, 'live');
+    assert.deepEqual(a.incomplete.map((x) => x.pid), [200]);
+    assert.equal(a.pass, false);
+  });
+  test('L3 stat recheck ENOENT but the pid is STILL listed -> not proof of exit, fail', () => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes.find((x) => x.pid === 200).status, 'live');
+    assert.equal(a.pass, false);
+  });
+  test('L4 terminal (zombie) process: same start time in state Z on both stat reads -> classified terminal', () => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    spec['/sp/200/stat'] = pstat(200, 'chrome', 'Z', 777);
+    spec['/sp/200/comm'] = 'chrome\n';
+    spec['/sp/200/fd'] = [];
+    const { a } = synthAudit(spec);
+    const p = a.processes.find((x) => x.pid === 200);
+    assert.equal(p.status, 'terminal');
+    assert.deepEqual(p.identity, { starttime: '777', state: 'Z', stable: true });
+    assert.equal(a.pass, true, JSON.stringify(a.incomplete));
+  });
+  test('L5 empty comm on a stable state-S process is not proof of exit -> fail', () => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    spec['/sp/200/stat'] = pstat(200, 'chrome', 'S', 777);
+    spec['/sp/200/comm'] = '\n';
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes.find((x) => x.pid === 200).status, 'live');
+    assert.equal(a.pass, false);
+  });
+  test('F1 fd closed mid-audit: readlink ENOENT AND absent from one fd re-listing -> counted closed, clean', () => {
+    const spec = healthySpec({ fds: { 3: 'socket:[111]', 4: 'socket:[222]' } });
+    spec['/sp/100/fd'] = { seq: [['3', '4'], ['3']] };
+    spec['/sp/100/fd/4'] = perr('ENOENT');
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes[0].fds_closed, 1);
+    assert.equal(a.processes[0].reads.fd_links, 'ok');
+    assert.equal(a.pass, true, JSON.stringify(a.incomplete));
+  });
+  test('F2 readlink ENOENT while the fd is STILL listed -> unresolved fd race, fail', () => {
+    const spec = healthySpec({ fds: { 3: 'socket:[111]', 4: 'socket:[222]' } });
+    spec['/sp/100/fd/4'] = perr('ENOENT');
+    const { a } = synthAudit(spec);
+    assert.ok(a.processes[0].errors.some((e) => e.input === 'fd_links' && e.code === 'ENOENT'));
+    assert.equal(a.pass, false);
+  });
+  test('F3 readlink EACCES -> unreadable fd, fail', () => {
+    const spec = healthySpec({ fds: { 3: 'socket:[111]', 4: 'socket:[222]' } });
+    spec['/sp/100/fd/4'] = perr('EACCES');
+    const { a } = synthAudit(spec);
+    assert.ok(a.processes[0].errors.some((e) => e.input === 'fd_links' && e.code === 'EACCES'));
+    assert.equal(a.pass, false);
+  });
+  test('S1 self-audit: the auditor\'s own fd-directory handle is listed but must not become an unresolved fd race', () => {
+    // Linux semantics: listing /proc/<self>/fd shows the descriptor used to read that directory.
+    // A one-shot readdir closes it before any readlink (ENOENT, and a re-listing shows the same
+    // number again); a held directory handle keeps it valid while the links are read.
+    const spec = healthySpec({ fds: { 0: 'pipe:[1]', 3: 'socket:[111]' } });
+    const open = new Set();
+    const lowest = () => { let n = 25; while (open.has(n)) n++; return n; };
+    const base = synthProc(spec).fs;
+    const listing = () => ['0', '3', ...[...open].map(String)];
+    const fsx = {
+      ...base,
+      readdirSync: (p) => { if (p !== '/sp/100/fd') return base.readdirSync(p); const n = lowest(); open.add(n); const l = listing(); open.delete(n); return l; },
+      opendirSync: (p) => {
+        if (p !== '/sp/100/fd') throw new Error('unexpected opendir ' + p);
+        const n = lowest(); open.add(n);
+        const entries = listing().map((name) => ({ name }));
+        return { readSync: () => entries.shift() ?? null, closeSync: () => { open.delete(n); } };
+      },
+      readlinkSync: (p) => {
+        const m = /^\/sp\/100\/fd\/(\d+)$/.exec(p);
+        if (m && Number(m[1]) >= 25) { if (open.has(Number(m[1]))) return '/sp/100/fd'; throw perr('ENOENT'); }
+        return base.readlinkSync(p);
+      },
+    };
+    const a = auditProc({ procRoot: '/sp', fs: fsx });
+    assert.equal(a.processes[0].reads.fd_links, 'ok', JSON.stringify(a.processes[0].errors));
+    assert.equal(a.pass, true);
+    assert.equal(open.size, 0, 'every directory handle closed');
+  });
+  test('V1 a violation observed before the process provably vanished is preserved -> fail', () => {
+    const spec = healthySpec();
+    spec['/sp'] = { seq: [['100', '200'], ['100']] };
+    procEntry(spec, 200, { tcp: PHDR + EXT_EST, fds: { 4: 'socket:[222]' }, start: 777 });
+    spec['/sp/200/net/udp'] = perr('ENOENT');
+    spec['/sp/200/stat'] = { seq: [pstat(200, 'chrome', 'S', 777), perr('ENOENT')] };
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes.find((x) => x.pid === 200).status, 'vanished');
+    assert.ok(a.violations.some((v) => v.pid === 200 && v.inode === '222'));
+    assert.equal(a.pass, false);
+  });
+  test('V2 an external socket is still detected when another table of the process is unreadable', () => {
+    const spec = healthySpec({ tcp: PHDR + EXT_EST, fds: { 4: 'socket:[222]' } });
+    spec['/sp/100/net/udp6'] = perr('EACCES');
+    const { a } = synthAudit(spec);
+    assert.ok(a.violations.some((v) => v.inode === '222'));
+    assert.deepEqual(a.incomplete.map((x) => x.errors), [[{ input: 'net/udp6', code: 'EACCES' }]]);
+    assert.equal(a.pass, false);
+  });
+  test('U1 legitimate non-inet (unix) socket inode in no inet table -> counted, clean', () => {
+    const { a } = synthAudit(healthySpec({ fds: { 3: 'socket:[111]', 5: 'socket:[909]', 6: 'pipe:[1]', 7: '/dev/null' } }));
+    assert.equal(a.processes[0].non_inet_socket_inodes, 1);
+    assert.equal(a.pass, true, JSON.stringify(a.incomplete));
+  });
+  test('H1 valid header-only tables and no fds -> complete clean audit', () => {
+    const { a } = synthAudit(healthySpec({ tcp: PHDR, fds: {} }));
+    assert.equal(a.processes[0].inet_sockets.length, 0);
+    assert.equal(a.pass, true, JSON.stringify(a.incomplete));
+  });
+  test('I1 live identity change (start time differs between the two stat reads, all reads ok) -> CHANGED, fail', () => {
+    const spec = healthySpec();
+    spec['/sp/100/stat'] = { seq: [pstat(100, 'chrome', 'S', 4242), pstat(100, 'chrome', 'S', 9999)] };
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes[0].identity.stable, false);
+    assert.ok(a.processes[0].errors.some((e) => e.input === 'identity' && e.code === 'CHANGED'));
+    assert.equal(a.pass, false, 'PID reuse during the audit is unresolved');
+  });
+  test('R1 every read ok but the identity recheck fails (exit right after the reads) -> proven vanished, never stable live', () => {
+    const spec = healthySpec();
+    spec['/sp'] = { seq: [['100', '200'], ['100']] };
+    procEntry(spec, 200, { comm: 'node', start: 777 });
+    spec['/sp/200/stat'] = { seq: [pstat(200, 'node', 'S', 777), perr('ENOENT')] };
+    const { a } = synthAudit(spec);
+    const p = a.processes.find((x) => x.pid === 200);
+    assert.equal(p.status, 'vanished');
+    assert.deepEqual(p.errors, [{ input: 'identity', code: 'ENOENT' }]);
+    assert.equal(a.pass, true, JSON.stringify(a.incomplete));
+  });
+  test('R2 every read ok, identity recheck ENOENT but the pid is still listed -> unresolved, fail', () => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    procEntry(spec, 200, { comm: 'node', start: 777 });
+    spec['/sp/200/stat'] = { seq: [pstat(200, 'node', 'S', 777), perr('ENOENT')] };
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes.find((x) => x.pid === 200).status, 'live');
+    assert.equal(a.pass, false);
+  });
+  test('I2 pid reused while its old fd/tables vanished (recheck = new start time, still listed) -> fail', () => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    spec['/sp/200/stat'] = { seq: [pstat(200, 'chrome', 'S', 777), pstat(200, 'node', 'S', 999)] };
+    spec['/sp/200/comm'] = 'chrome\n';
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes.find((x) => x.pid === 200).status, 'live');
+    assert.equal(a.pass, false);
+  });
+  test('I3 state Z on recheck but a different start time -> not terminal, fail', () => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    spec['/sp/200/stat'] = { seq: [pstat(200, 'chrome', 'S', 777), pstat(200, 'chrome', 'Z', 778)] };
+    spec['/sp/200/comm'] = 'chrome\n';
+    spec['/sp/200/fd'] = [];
+    const { a } = synthAudit(spec);
+    assert.equal(a.processes.find((x) => x.pid === 200).status, 'live');
+    assert.equal(a.pass, false);
+  });
+});
+
+// PURE caller regressions: the L2 `audit` used by the live tier, driven with synthetic auditProc
+// results (`run`) into a throwaway record list (`into`); the live evidence object is untouched.
+describe('PURE L2 audit caller enforcement (synthetic /proc; no socket, no process; not browser cases)', () => {
+  const REQ = ['chrome', 'node', 'bridge-stdio'];
+  const tierSpec = () => {
+    const spec = { '/sp': ['100', '101', '102'] };
+    procEntry(spec, 100, { comm: 'chrome' });
+    procEntry(spec, 101, { comm: 'node', start: 5000 });
+    procEntry(spec, 102, { comm: 'bridge-stdio', start: 6000 });
+    return spec;
+  };
+  const runOf = (spec) => () => auditProc({ procRoot: '/sp', fs: synthProc(spec).fs });
+  test('K0 positive control: complete clean audit with live required processes is accepted', () => {
+    const into = [];
+    audit('K0', REQ, { run: runOf(tierSpec()), into });
+    assert.equal(into.length, 1);
+    assert.equal(into[0].pass, true);
+  });
+  test('K1 incomplete audit (A2 fd EACCES on chrome, no violation, comms present) is REJECTED by the caller', () => {
+    const spec = tierSpec();
+    spec['/sp/100/fd'] = perr('EACCES');
+    const into = [];
+    assert.throws(() => audit('K1', REQ, { run: runOf(spec), into }), /complete clean audit/);
+    assert.equal(into.length, 1, 'evidence retained before the assertion');
+  });
+  test('K2 retained record keeps sanitized per-process read/error/lifecycle coverage for re-evaluation', () => {
+    const spec = tierSpec();
+    spec['/sp/100/net/tcp'] = perr('EACCES');
+    const into = [];
+    assert.throws(() => audit('K2', REQ, { run: runOf(spec), into }));
+    const rec = JSON.parse(JSON.stringify(into[0]));
+    assert.deepEqual(rec.enumeration, { ok: true, code: null, entries: 3 });
+    assert.deepEqual(rec.incomplete, [{ pid: 100, comm: 'chrome', status: 'live', errors: [{ input: 'net/tcp', code: 'EACCES' }] }]);
+    const p = rec.processes.find((x) => x.pid === 100);
+    for (const k of ['status', 'identity', 'lifecycle', 'reads', 'errors', 'fds_read', 'fds_closed', 'inet_sockets', 'non_inet_socket_inodes']) assert.ok(k in p, k);
+    assert.equal(p.reads['net/tcp'], 'EACCES');
+    assert.deepEqual(rec.live_comms, ['bridge-stdio', 'chrome', 'node']);
+  });
+  test('K3 a provably vanished required process does not satisfy live coverage', () => {
+    const spec = tierSpec();
+    spec['/sp'] = { seq: [['100', '101', '102'], ['100', '101']] };
+    spec['/sp/102/stat'] = { seq: [pstat(102, 'bridge-stdio', 'S', 6000), perr('ENOENT')] };
+    spec['/sp/102/fd'] = perr('ENOENT');
+    const into = [];
+    assert.throws(() => audit('K3', REQ, { run: runOf(spec), into }), /audited processes include/);
+    assert.deepEqual(into[0].missing_required, ['bridge-stdio']);
+    assert.equal(into[0].pass, true, 'the audit itself is complete; only live coverage is missing');
   });
 });

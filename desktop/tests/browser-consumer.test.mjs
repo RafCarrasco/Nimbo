@@ -108,15 +108,26 @@ const appHas = (text, ms) => waitForPage(chrome.cdp, app.sessionId, `document.bo
 const appText = () => appEval('document.body ? document.body.innerText : ""');
 const loginScreenIdle = `[...document.querySelectorAll('button')].some((b) => b.textContent.includes('Continuar com Google') && !b.disabled)`;
 
-function audit(label, required) {
-  const a = auditProc();
+/**
+ * Retained audit record first (sanitized per-process read/error/identity/lifecycle coverage, so
+ * the saved evidence can be re-evaluated independently), then direct enforcement: a complete
+ * clean audit (a.pass, which also rejects any incomplete live process), no violation, and the
+ * required processes among LIVE audited processes (a vanished or terminal record never satisfies
+ * coverage).
+ */
+function audit(label, required, { run = auditProc, into = ev.audits } = {}) {
+  const a = run();
   const comms = new Set(a.processes.map((p) => p.comm));
-  const missing = required.filter((c) => !comms.has(c));
-  ev.audits.push({ label, pass: a.pass, missing_required: missing, comms: [...comms].sort(), violations: a.violations,
-    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, inet_sockets: p.inet_sockets.length, non_inet_socket_inodes: p.non_inet_socket_inodes })),
+  const live = new Set(a.processes.filter((p) => p.status === 'live').map((p) => p.comm));
+  const missing = required.filter((c) => !live.has(c));
+  into.push({ label, pass: a.pass, enumeration: a.enumeration, missing_required: missing, comms: [...comms].sort(), live_comms: [...live].sort(),
+    violations: a.violations, incomplete: a.incomplete,
+    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, status: p.status, identity: p.identity, lifecycle: p.lifecycle, reads: p.reads,
+      errors: p.errors, fds_read: p.fds_read, fds_closed: p.fds_closed, inet_sockets: p.inet_sockets.length, non_inet_socket_inodes: p.non_inet_socket_inodes })),
     sockets: a.processes.flatMap((p) => p.inet_sockets.map((s) => ({ pid: p.pid, comm: p.comm, ...s }))) });
   assert.deepEqual(missing, [], `${label}: audited processes include ${required.join(', ')}`);
   assert.deepEqual(a.violations, [], `${label}: every socket of every process is loopback`);
+  assert.equal(a.pass, true, `${label}: complete clean audit (no unread or unresolved live-process input)`);
 }
 
 describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outside the isolated network-none container: ' + GUARD.reasons.join('; ') }, () => {
@@ -272,5 +283,75 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
     const text = JSON.stringify(ev, null, 2);
     assert.deepEqual(scanForSecrets(text, [...seen, ALICE_ID_TOKEN]), [], 'retained evidence carries no state/token/key');
     fs.writeFileSync(path.join(EVIDENCE, 'l5-consumer.json'), text);
+  });
+});
+
+// ================================================================ PURE caller regressions
+// NOT browser integration cases and NOT guarded: the L5 `audit` used by the live tier, driven with
+// synthetic auditProc results (`run`) over an injected fake /proc into a throwaway record list
+// (`into`). No socket is opened, no process is started, the live evidence object is untouched.
+const PHDR = '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n';
+const LO_LISTEN = `   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10000        0 111 1 0000000000000000 100 0 0 10 0\n`;
+const perr = (code) => Object.assign(new Error('synthetic ' + code), { code });
+const pstat = (pid, comm, state, start) => `${pid} (${comm}) ${state} 1 1 1 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 ${start} 1000 100\n`;
+function synthFs(spec) {
+  const calls = {};
+  const get = (p) => {
+    const n = (calls[p] = (calls[p] || 0) + 1);
+    let v = spec[p];
+    if (v && v.seq) v = v.seq[Math.min(n, v.seq.length) - 1];
+    if (v === undefined) throw perr('ENOENT');
+    if (v instanceof Error) throw v;
+    return v;
+  };
+  return { readFileSync: get, readdirSync: get, readlinkSync: get };
+}
+function tierSpec() {
+  const spec = { '/sp': ['100', '101', '102', '103'] };
+  for (const [pid, comm] of [[100, 'chrome'], [101, 'node'], [102, 'bridge-stdio'], [103, 'java']]) {
+    spec[`/sp/${pid}/stat`] = pstat(pid, comm, 'S', 1000 + pid);
+    spec[`/sp/${pid}/comm`] = comm + '\n';
+    spec[`/sp/${pid}/fd`] = ['3'];
+    spec[`/sp/${pid}/fd/3`] = 'socket:[111]';
+    for (const t of ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6']) spec[`/sp/${pid}/net/${t}`] = t === 'tcp' ? PHDR + LO_LISTEN : PHDR;
+  }
+  return spec;
+}
+const runOf = (spec) => () => auditProc({ procRoot: '/sp', fs: synthFs(spec) });
+describe('PURE L5 audit caller enforcement (synthetic /proc; no socket, no process; not browser cases)', () => {
+  const REQ = ['chrome', 'node', 'bridge-stdio', 'java'];
+  test('K0 positive control: complete clean audit with live required processes is accepted', () => {
+    const into = [];
+    audit('K0', REQ, { run: runOf(tierSpec()), into });
+    assert.equal(into[0].pass, true);
+  });
+  test('K1 incomplete audit (all net tables EACCES on java, no violation, comms present) is REJECTED by the caller', () => {
+    const spec = tierSpec();
+    for (const t of ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6']) spec[`/sp/103/net/${t}`] = perr('EACCES');
+    const into = [];
+    assert.throws(() => audit('K1', REQ, { run: runOf(spec), into }), /complete clean audit/);
+    assert.equal(into.length, 1, 'evidence retained before the assertion');
+  });
+  test('K2 retained record keeps sanitized per-process read/error/lifecycle coverage for re-evaluation', () => {
+    const spec = tierSpec();
+    spec['/sp/101/fd'] = perr('EACCES');
+    const into = [];
+    assert.throws(() => audit('K2', REQ, { run: runOf(spec), into }));
+    const rec = JSON.parse(JSON.stringify(into[0]));
+    assert.deepEqual(rec.enumeration, { ok: true, code: null, entries: 4 });
+    assert.deepEqual(rec.incomplete, [{ pid: 101, comm: 'node', status: 'live', errors: [{ input: 'fd', code: 'EACCES' }] }]);
+    const p = rec.processes.find((x) => x.pid === 101);
+    for (const k of ['status', 'identity', 'lifecycle', 'reads', 'errors', 'fds_read', 'fds_closed', 'inet_sockets', 'non_inet_socket_inodes']) assert.ok(k in p, k);
+    assert.equal(p.reads.fd, 'EACCES');
+    assert.deepEqual(rec.live_comms, ['bridge-stdio', 'chrome', 'java', 'node']);
+  });
+  test('K3 a terminal (zombie) required process does not satisfy live coverage', () => {
+    const spec = tierSpec();
+    spec['/sp/103/stat'] = pstat(103, 'java', 'Z', 1103);
+    spec['/sp/103/fd'] = [];
+    for (const t of ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6']) spec[`/sp/103/net/${t}`] = perr('ENOENT');
+    const into = [];
+    assert.throws(() => audit('K3', REQ, { run: runOf(spec), into }), /audited processes include/);
+    assert.deepEqual(into[0].missing_required, ['java']);
   });
 });
