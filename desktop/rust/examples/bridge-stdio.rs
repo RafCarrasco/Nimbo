@@ -198,6 +198,7 @@ fn main() -> ExitCode {
                 let s = flow.stats();
                 let stats = json!({"workers": s.workers, "acceptors": s.acceptors,
                     "max_workers": s.max_workers, "max_acceptors": s.max_acceptors,
+                    "registered": s.registered,
                     "active": flow.is_active(), "activation": flow.activation_reserved()});
                 let _ = writeln!(out, "{}", json!({ "stats": stats }));
                 Some(Vec::new())

@@ -160,6 +160,8 @@ pub struct Stats {
     pub acceptors: usize,
     pub max_workers: usize,
     pub max_acceptors: usize,
+    /// Worker sockets currently in the close-on-cancel registry.
+    pub registered: usize,
 }
 
 enum State {
@@ -750,6 +752,7 @@ impl LoginFlow {
             acceptors: s.acceptors.load(SeqCst),
             max_workers: s.max_workers.load(SeqCst),
             max_acceptors: s.max_acceptors.load(SeqCst),
+            registered: relock(&s.registry).len(),
         }
     }
     /// Bounded supervision (never on the UI thread): polls until no worker/acceptor is left or

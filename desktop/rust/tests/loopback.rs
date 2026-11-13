@@ -72,6 +72,16 @@ fn live(limits: Limits) -> Live {
     }
 }
 
+/// Waits until a worker socket is in the registry, so a following cancel/replacement exercises
+/// the REGISTRY close path (not the register-after-stop guard).
+fn wait_registered(flow: &LoginFlow) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while flow.stats().registered == 0 {
+        assert!(Instant::now() < deadline, "worker registered");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Sends raw bytes and reads until EOF/reset (bounded by 5 s). Returns (bytes, reset).
 fn exchange(port: u16, raw: &[u8]) -> (Vec<u8>, bool) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -584,7 +594,7 @@ fn cancel_closes_a_registered_connection_promptly_without_response() {
     let mut held = TcpStream::connect(("127.0.0.1", port)).unwrap();
     held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let _ = held.write_all(b"POST /callback HTTP/1.1\r\n");
-    std::thread::sleep(Duration::from_millis(100));
+    wait_registered(&flow);
     let started = Instant::now();
     assert_eq!(flow.cancel(5).len(), 1);
     let mut buf = [0u8; 64];
@@ -610,11 +620,7 @@ fn replacement_closes_a_blocked_worker_of_the_old_login_promptly() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let _ = blocked.write_all(b"POST /callback HTTP/1.1\r\nHost: ");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while flow.stats().workers == 0 {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_registered(&flow);
     let started = Instant::now();
     let b = flow.begin(
         Caller {
