@@ -122,7 +122,7 @@ function audit(label, required, { run = auditProc, into = ev.audits } = {}) {
   const missing = required.filter((c) => !live.has(c));
   into.push({ label, pass: a.pass, enumeration: a.enumeration, missing_required: missing, comms: [...comms].sort(), live_comms: [...live].sort(),
     violations: a.violations, incomplete: a.incomplete,
-    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, status: p.status, identity: p.identity, lifecycle: p.lifecycle, reads: p.reads,
+    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, status: p.status, identity: p.identity, lifecycle: p.lifecycle, thread_group: p.thread_group, reads: p.reads,
       errors: p.errors, fds_read: p.fds_read, fds_closed: p.fds_closed, inet_sockets: p.inet_sockets.length, non_inet_socket_inodes: p.non_inet_socket_inodes })),
     sockets: a.processes.flatMap((p) => p.inet_sockets.map((s) => ({ pid: p.pid, comm: p.comm, ...s }))) });
   assert.deepEqual(missing, [], `${label}: audited processes include ${required.join(', ')}`);
@@ -294,6 +294,9 @@ const PHDR = '  sl  local_address rem_address   st tx_queue rx_queue tr tm->when
 const LO_LISTEN = `   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 10000        0 111 1 0000000000000000 100 0 0 10 0\n`;
 const perr = (code) => Object.assign(new Error('synthetic ' + code), { code });
 const pstat = (pid, comm, state, start) => `${pid} (${comm}) ${state} 1 1 1 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 ${start} 1000 100\n`;
+/** `/proc/<pid>/status` excerpt in kernel layout (the thread-group fields the collector reads). */
+const pstatus = (pid, comm, state, threads) => `Name:\t${comm}\nUmask:\t0022\nState:\t${state} (zombie)\nTgid:\t${pid}\nNgid:\t0\nPid:\t${pid}\nPPid:\t1\n`
+  + `TracerPid:\t0\nThreads:\t${threads}\nSigQ:\t0/127698\n`;
 function synthFs(spec) {
   const calls = {};
   const get = (p) => {
@@ -350,8 +353,38 @@ describe('PURE L5 audit caller enforcement (synthetic /proc; no socket, no proce
     spec['/sp/103/stat'] = pstat(103, 'java', 'Z', 1103);
     spec['/sp/103/fd'] = [];
     for (const t of ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6']) spec[`/sp/103/net/${t}`] = perr('ENOENT');
+    spec['/sp/103/status'] = pstatus(103, 'java', 'Z', 1);
+    spec['/sp/103/task'] = ['103'];
     const into = [];
     assert.throws(() => audit('K3', REQ, { run: runOf(spec), into }), /audited processes include/);
     assert.deepEqual(into[0].missing_required, ['java']);
+  });
+  /** Real-kernel shape of an extra Z leader (pid 104): fd EACCES, net ENOENT, status/task observations. */
+  const withZLeader = (threads, tasks) => {
+    const spec = tierSpec();
+    spec['/sp'] = ['100', '101', '102', '103', '104'];
+    spec['/sp/104/stat'] = pstat(104, 'python3', 'Z', 1104);
+    spec['/sp/104/comm'] = 'python3\n';
+    spec['/sp/104/fd'] = perr('EACCES');
+    for (const t of ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6']) spec[`/sp/104/net/${t}`] = perr('ENOENT');
+    spec['/sp/104/status'] = pstatus(104, 'python3', 'Z', threads);
+    spec['/sp/104/task'] = tasks;
+    return spec;
+  };
+  test('K4 extra process whose leader exited while another thread is alive -> REJECTED; retained record keeps the thread-group observation', () => {
+    const into = [];
+    assert.throws(() => audit('K4', REQ, { run: runOf(withZLeader(2, ['104', '105'])), into }), /complete clean audit/);
+    const p = JSON.parse(JSON.stringify(into[0])).processes.find((x) => x.pid === 104);
+    assert.equal(p.status, 'live');
+    assert.deepEqual(p.thread_group, { reads: { status: 'ok', task: 'ok', stat: 'ok' }, threads: 2, tasks: ['104', '105'], starttime: '1104', state: 'Z', proven: false });
+  });
+  test('K5 a genuine extra zombie is accepted; every retained process carries thread_group and the terminal proof is kept', () => {
+    const into = [];
+    audit('K5', REQ, { run: runOf(withZLeader(1, ['104'])), into });
+    const rec = JSON.parse(JSON.stringify(into[0]));
+    assert.ok(rec.processes.every((p) => 'thread_group' in p));
+    assert.deepEqual(rec.processes.find((x) => x.pid === 104).thread_group,
+      { reads: { status: 'ok', task: 'ok', stat: 'ok' }, threads: 1, tasks: ['104'], starttime: '1104', state: 'Z', proven: true });
+    assert.deepEqual(rec.processes.filter((x) => x.pid !== 104).map((x) => x.thread_group), [null, null, null, null]);
   });
 });

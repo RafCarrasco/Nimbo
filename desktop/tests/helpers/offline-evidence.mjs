@@ -147,6 +147,34 @@ export function parseProcStat(text) {
 }
 
 /**
+ * Whole-thread-group exit proof for a leader seen in state Z/X: ONE bounded read each of
+ * `status` (Threads), the `task` listing and `stat`. Proven only when Threads is 1, the task
+ * listing is exactly the leader, and the same start time is still in state Z/X. Any missing,
+ * unreadable, malformed or mismatched observation leaves it unproven (never retried).
+ */
+function threadGroupProof(f, base, name, starttime) {
+  const reads = {};
+  let threads = null, tasks = null, start = null, state = null;
+  try {
+    const m = /^Threads:\s*(\d+)\s*$/m.exec(f.readFileSync(path.join(base, 'status'), 'utf8'));
+    if (m) { threads = Number(m[1]); reads.status = 'ok'; } else reads.status = 'MALFORMED';
+  } catch (e) { reads.status = errCode(e); }
+  try {
+    const t = [...f.readdirSync(path.join(base, 'task'))].map(String);
+    if (!t.length) reads.task = 'EMPTY';
+    else if (!t.every((x) => /^\d+$/.test(x))) reads.task = 'MALFORMED';
+    else { tasks = t.sort((a, b) => Number(a) - Number(b)); reads.task = 'ok'; }
+  } catch (e) { reads.task = errCode(e); }
+  try {
+    const id = parseProcStat(f.readFileSync(path.join(base, 'stat'), 'utf8'));
+    if (id) { start = id.starttime; state = id.state; reads.stat = 'ok'; } else reads.stat = 'MALFORMED';
+  } catch (e) { reads.stat = errCode(e); }
+  const proven = reads.status === 'ok' && reads.task === 'ok' && reads.stat === 'ok' && threads === 1
+    && tasks.length === 1 && tasks[0] === name && start === starttime && /^[ZX]$/.test(state);
+  return { reads, threads, tasks, starttime: start, state, proven };
+}
+
+/**
  * Every process visible in this pid namespace: fd socket inodes joined with its net tables.
  * Each process carries explicit sanitized read coverage (`reads`: input -> 'ok' | error code),
  * its `errors` and a stat identity read before and after; missing data is never empty data.
@@ -216,20 +244,25 @@ export function auditProc({ procRoot = '/proc', fs: f = fs } = {}) {
     if (id0 && id1 && !identity.stable) fail('identity', 'CHANGED'); // pid reused mid-audit: unresolved
     else if (id0 && !id1) fail('identity', recheck); // identity not re-verified after the reads
     // Lifecycle: an error alone never proves exit. One bounded corroboration only: a stat recheck
-    // ENOENT plus absence from one re-enumeration proves exit; the same start time in state Z/X
-    // proves a terminal process. Anything else with an error stays a live, incomplete process.
-    let status = 'live', lifecycle = null;
+    // ENOENT plus absence from one re-enumeration proves exit. A leader in state Z/X with the same
+    // start time is NOT whole-group exit (other threads may still run and hold sockets), so it is
+    // terminal only with the whole-thread-group proof below. Anything else with an error stays a
+    // live, incomplete process.
+    let status = 'live', lifecycle = null, threadGroup = null;
     if (errors.length && recheck === 'ENOENT') {
       let listed = null;
       try { listed = f.readdirSync(procRoot).includes(name); } catch { listed = null; }
       lifecycle = { stat_recheck: 'ENOENT', listed_on_reenumeration: listed };
       if (listed === false) status = 'vanished';
     } else if (errors.length && identity.stable && /^[ZX]$/.test(id1.state)) {
-      lifecycle = { stat_recheck: 'ok', state: id1.state };
-      status = 'terminal';
+      threadGroup = threadGroupProof(f, base, name, identity.starttime);
+      if (threadGroup.proven) {
+        lifecycle = { stat_recheck: 'ok', state: id1.state };
+        status = 'terminal';
+      }
     }
     const matched = new Set(inet.map((s) => s.inode));
-    processes.push({ pid, comm, status, identity, lifecycle, reads, errors, fds_read: fdsRead, fds_closed: fdsClosed, inet_sockets: inet,
+    processes.push({ pid, comm, status, identity, lifecycle, thread_group: threadGroup, reads, errors, fds_read: fdsRead, fds_closed: fdsClosed, inet_sockets: inet,
       non_inet_socket_inodes: [...inodes].filter((i) => !matched.has(i)).length, tables_read: tables });
     if (status === 'live' && errors.length) incomplete.push({ pid, comm, status, errors });
   }

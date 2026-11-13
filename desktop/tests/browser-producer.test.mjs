@@ -98,7 +98,7 @@ function audit(label, required, { run = auditProc, into = ev.audits } = {}) {
   const missing = required.filter((c) => !live.has(c));
   into.push({ label, pass: a.pass, enumeration: a.enumeration, missing_required: missing, comms: [...comms].sort(), live_comms: [...live].sort(),
     violations: a.violations, incomplete: a.incomplete,
-    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, status: p.status, identity: p.identity, lifecycle: p.lifecycle, reads: p.reads,
+    processes: a.processes.map((p) => ({ pid: p.pid, comm: p.comm, status: p.status, identity: p.identity, lifecycle: p.lifecycle, thread_group: p.thread_group, reads: p.reads,
       errors: p.errors, fds_read: p.fds_read, fds_closed: p.fds_closed, inet_sockets: p.inet_sockets.length, non_inet_socket_inodes: p.non_inet_socket_inodes })),
     sockets: a.processes.flatMap((p) => p.inet_sockets.map((s) => ({ pid: p.pid, comm: p.comm, ...s }))) });
   assert.deepEqual(missing, [], `${label}: audited processes include ${required.join(', ')}`);
@@ -226,6 +226,9 @@ const P_TABLES = ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6'];
 const LO_LISTEN = prow('0100007F:1F90', '00000000:0000', '0A', '111');
 const EXT_EST = prow('0100007F:9C40', '08080808:01BB', '01', '222');
 const pstat = (pid, comm, state = 'S', start = 4242) => `${pid} (${comm}) ${state} 1 1 1 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 ${start} 1000 100\n`;
+/** `/proc/<pid>/status` excerpt in kernel layout (the thread-group fields the collector reads). */
+const pstatus = (pid, comm, state, threads) => `Name:\t${comm}\nUmask:\t0022\nState:\t${state} (${state === 'Z' ? 'zombie' : state === 'X' ? 'dead' : 'sleeping'})\n`
+  + `Tgid:\t${pid}\nNgid:\t0\nPid:\t${pid}\nPPid:\t1\nTracerPid:\t0\n${threads === null ? '' : `Threads:\t${threads}\n`}SigQ:\t0/127698\n`;
 const perr = (code) => Object.assign(new Error('synthetic ' + code), { code });
 /**
  * Synthetic /proc. Each value is a string/array, an Error (thrown), or a list of those under
@@ -340,7 +343,8 @@ describe('PURE auditProc regressions (synthetic /proc; no socket, no process; no
     assert.deepEqual(synthAudit(healthySpec()).a.enumeration, { ok: true, code: null, entries: 1 });
   });
   // Lifecycle: an error alone never proves exit. Proven exit = stat recheck ENOENT AND the pid
-  // absent from one bounded re-enumeration; terminal = the same start time read twice in state Z/X.
+  // absent from one bounded re-enumeration; terminal = the same start time read twice in state Z/X
+  // plus the whole-thread-group proof (T1-T18 below).
   test('L1 proven vanished process (stat ENOENT + absent on re-enumeration) is classified, not counted live', () => {
     const spec = healthySpec();
     spec['/sp'] = { seq: [['100', '200'], ['100']] };
@@ -374,6 +378,8 @@ describe('PURE auditProc regressions (synthetic /proc; no socket, no process; no
     spec['/sp/200/stat'] = pstat(200, 'chrome', 'Z', 777);
     spec['/sp/200/comm'] = 'chrome\n';
     spec['/sp/200/fd'] = [];
+    spec['/sp/200/status'] = pstatus(200, 'chrome', 'Z', 1);
+    spec['/sp/200/task'] = ['200'];
     const { a } = synthAudit(spec);
     const p = a.processes.find((x) => x.pid === 200);
     assert.equal(p.status, 'terminal');
@@ -517,6 +523,112 @@ describe('PURE auditProc regressions (synthetic /proc; no socket, no process; no
     assert.equal(a.processes.find((x) => x.pid === 200).status, 'live');
     assert.equal(a.pass, false);
   });
+
+  // Thread-group corroboration (F1-R). A leader in state Z/X is not whole-group exit: on Linux the
+  // leader can pthread_exit while another thread keeps running and holding sockets; then the leader's
+  // fd directory is EACCES and its net tables ENOENT. "terminal" needs, after the reads, ONE bounded
+  // read each of status (Threads), the task listing and stat: Threads 1, the task listing exactly the
+  // leader, and the same start time still in Z/X. Anything else stays an incomplete live process.
+  /** Real-kernel shape of a Z leader (pid 200, start 777): fd EACCES, all six net tables ENOENT. */
+  const zSpec = ({ threads = 1, tasks = ['200'], state = 'Z' } = {}) => {
+    const spec = healthySpec();
+    spec['/sp'] = ['100', '200'];
+    spec['/sp/200/stat'] = pstat(200, 'python3', state, 777);
+    spec['/sp/200/comm'] = 'python3\n';
+    spec['/sp/200/fd'] = perr('EACCES');
+    for (const t of P_TABLES) spec[`/sp/200/net/${t}`] = perr('ENOENT');
+    spec['/sp/200/status'] = pstatus(200, 'python3', state, threads);
+    spec['/sp/200/task'] = tasks;
+    return spec;
+  };
+  const z200 = (a) => a.processes.find((x) => x.pid === 200);
+  test('T1 genuine ordinary zombie (Threads 1, task listing exactly the leader, same start time in Z) -> terminal, clean', () => {
+    const { a, calls } = synthAudit(zSpec());
+    assert.equal(z200(a).status, 'terminal');
+    assert.deepEqual(z200(a).lifecycle, { stat_recheck: 'ok', state: 'Z' });
+    assert.deepEqual(a.incomplete, []);
+    assert.equal(a.pass, true, JSON.stringify(a.incomplete));
+    assert.deepEqual([calls['/sp/200/status'], calls['/sp/200/task'], calls['/sp/200/stat']], [1, 1, 3], 'one bounded corroboration read each');
+  });
+  test('T2 terminal record retains its whole-thread-group proof', () => {
+    assert.deepEqual(z200(synthAudit(zSpec()).a).thread_group,
+      { reads: { status: 'ok', task: 'ok', stat: 'ok' }, threads: 1, tasks: ['200'], starttime: '777', state: 'Z', proven: true });
+  });
+  test('T3 leader exited, another thread still alive (Z leader, Threads 2, two tasks) -> NOT terminal, incomplete, fail', () => {
+    const { a } = synthAudit(zSpec({ threads: 2, tasks: ['200', '201'] }));
+    const p = z200(a);
+    assert.equal(p.status, 'live', 'a surviving thread means the process is alive');
+    assert.equal(p.lifecycle, null);
+    assert.deepEqual(a.incomplete.map((x) => x.pid), [200]);
+    assert.equal(a.pass, false, 'unread fd/net of a live thread group must not pass');
+    assert.deepEqual(p.thread_group, { reads: { status: 'ok', task: 'ok', stat: 'ok' }, threads: 2, tasks: ['200', '201'], starttime: '777', state: 'Z', proven: false });
+  });
+  const unproven = {
+    'T4 Threads 1 but the task listing has two tasks (mismatch)': { threads: 1, tasks: ['200', '201'] },
+    'T5 Threads 2 but the task listing has only the leader (mismatch)': { threads: 2, tasks: ['200'] },
+    'T6 task listing names only another thread, not the leader': { threads: 1, tasks: ['201'] },
+    'T7 status has no Threads line (malformed)': { threads: null, read: 'status', code: 'MALFORMED' },
+    'T8 status EACCES': { mut: (s) => { s['/sp/200/status'] = perr('EACCES'); }, read: 'status', code: 'EACCES' },
+    'T9 status missing (ENOENT)': { mut: (s) => { delete s['/sp/200/status']; }, read: 'status', code: 'ENOENT' },
+    'T10 task listing EACCES': { mut: (s) => { s['/sp/200/task'] = perr('EACCES'); }, read: 'task', code: 'EACCES' },
+    'T11 task listing empty': { tasks: [], read: 'task', code: 'EMPTY' },
+    'T12 task listing with a non-numeric entry (malformed)': { tasks: ['200', 'x'], read: 'task', code: 'MALFORMED' },
+    'T13 identity changes during the corroboration (third stat: new start time)': { mut: (s) => { s['/sp/200/stat'] = { seq: [pstat(200, 'python3', 'Z', 777), pstat(200, 'python3', 'Z', 777), pstat(200, 'node', 'S', 999)] }; } },
+    'T14 stat disappears during the corroboration (third stat ENOENT, still listed)': { mut: (s) => { s['/sp/200/stat'] = { seq: [pstat(200, 'python3', 'Z', 777), pstat(200, 'python3', 'Z', 777), perr('ENOENT')] }; }, read: 'stat', code: 'ENOENT' },
+    'T15 stat malformed during the corroboration': { mut: (s) => { s['/sp/200/stat'] = { seq: [pstat(200, 'python3', 'Z', 777), pstat(200, 'python3', 'Z', 777), 'garbage\n'] }; }, read: 'stat', code: 'MALFORMED' },
+  };
+  for (const [name, c] of Object.entries(unproven)) {
+    test(name + ' -> no whole-group proof, NOT terminal, fail', () => {
+      const spec = zSpec(c);
+      if (c.mut) c.mut(spec);
+      const { a } = synthAudit(spec);
+      const p = z200(a);
+      assert.equal(p.status, 'live');
+      assert.equal(p.thread_group.proven, false);
+      if (c.read) assert.equal(p.thread_group.reads[c.read], c.code);
+      assert.deepEqual(a.incomplete.map((x) => x.pid), [200]);
+      assert.equal(a.pass, false);
+    });
+  }
+  test('T16 state X (dead) leader with complete whole-group proof -> terminal', () => {
+    const { a } = synthAudit(zSpec({ state: 'X' }));
+    assert.equal(z200(a).status, 'terminal');
+    assert.equal(a.pass, true);
+  });
+  test('T17 healthy multithreaded live process: no corroboration reads, thread_group null, clean', () => {
+    const spec = healthySpec();
+    spec['/sp/100/status'] = pstatus(100, 'chrome', 'S', 4);
+    spec['/sp/100/task'] = ['100', '101', '102', '103'];
+    const { a, calls } = synthAudit(spec);
+    assert.equal(a.processes[0].status, 'live');
+    assert.equal(a.processes[0].thread_group, null);
+    assert.equal(calls['/sp/100/status'], undefined);
+    assert.equal(calls['/sp/100/task'], undefined);
+    assert.equal(a.pass, true);
+  });
+  test('T18 vanished process keeps thread_group null (lifecycle path unchanged)', () => {
+    const spec = healthySpec();
+    spec['/sp'] = { seq: [['100', '200'], ['100']] };
+    const { a } = synthAudit(spec);
+    assert.equal(z200(a).status, 'vanished');
+    assert.equal(z200(a).thread_group, null);
+  });
+  test('T19 corroboration stat shows another zombie (state Z, different start time: pid reused) -> NOT terminal, fail', () => {
+    const spec = zSpec();
+    spec['/sp/200/stat'] = { seq: [pstat(200, 'python3', 'Z', 777), pstat(200, 'python3', 'Z', 777), pstat(200, 'python3', 'Z', 778)] };
+    const { a } = synthAudit(spec);
+    assert.equal(z200(a).status, 'live');
+    assert.deepEqual([z200(a).thread_group.starttime, z200(a).thread_group.proven], ['778', false]);
+    assert.equal(a.pass, false);
+  });
+  test('T20 corroboration stat no longer in Z/X (same start time, state S) -> NOT terminal, fail', () => {
+    const spec = zSpec();
+    spec['/sp/200/stat'] = { seq: [pstat(200, 'python3', 'Z', 777), pstat(200, 'python3', 'Z', 777), pstat(200, 'python3', 'S', 777)] };
+    const { a } = synthAudit(spec);
+    assert.equal(z200(a).status, 'live');
+    assert.equal(z200(a).thread_group.proven, false);
+    assert.equal(a.pass, false);
+  });
 });
 
 // PURE caller regressions: the L2 `audit` used by the live tier, driven with synthetic auditProc
@@ -566,5 +678,37 @@ describe('PURE L2 audit caller enforcement (synthetic /proc; no socket, no proce
     assert.throws(() => audit('K3', REQ, { run: runOf(spec), into }), /audited processes include/);
     assert.deepEqual(into[0].missing_required, ['bridge-stdio']);
     assert.equal(into[0].pass, true, 'the audit itself is complete; only live coverage is missing');
+  });
+  /** Real-kernel shape of a Z leader: fd EACCES, net ENOENT, plus its status/task observations. */
+  const zLeader = (spec, pid, comm, start, threads, tasks) => {
+    spec[`/sp/${pid}/stat`] = pstat(pid, comm, 'Z', start);
+    spec[`/sp/${pid}/fd`] = perr('EACCES');
+    for (const t of P_TABLES) spec[`/sp/${pid}/net/${t}`] = perr('ENOENT');
+    spec[`/sp/${pid}/status`] = pstatus(pid, comm, 'Z', threads);
+    spec[`/sp/${pid}/task`] = tasks;
+  };
+  test('K4 extra process whose leader exited while another thread is alive -> REJECTED; retained record keeps the thread-group observation', () => {
+    const spec = tierSpec();
+    spec['/sp'] = ['100', '101', '102', '103'];
+    procEntry(spec, 103, { comm: 'python3', start: 7000 });
+    zLeader(spec, 103, 'python3', 7000, 2, ['103', '104']);
+    const into = [];
+    assert.throws(() => audit('K4', REQ, { run: runOf(spec), into }), /complete clean audit/);
+    const p = JSON.parse(JSON.stringify(into[0])).processes.find((x) => x.pid === 103);
+    assert.equal(p.status, 'live');
+    assert.deepEqual(p.thread_group, { reads: { status: 'ok', task: 'ok', stat: 'ok' }, threads: 2, tasks: ['103', '104'], starttime: '7000', state: 'Z', proven: false });
+  });
+  test('K5 a genuine extra zombie is accepted; every retained process carries thread_group and the terminal proof is kept', () => {
+    const spec = tierSpec();
+    spec['/sp'] = ['100', '101', '102', '103'];
+    procEntry(spec, 103, { comm: 'python3', start: 7000 });
+    zLeader(spec, 103, 'python3', 7000, 1, ['103']);
+    const into = [];
+    audit('K5', REQ, { run: runOf(spec), into });
+    const rec = JSON.parse(JSON.stringify(into[0]));
+    assert.ok(rec.processes.every((p) => 'thread_group' in p));
+    assert.deepEqual(rec.processes.find((x) => x.pid === 103).thread_group,
+      { reads: { status: 'ok', task: 'ok', stat: 'ok' }, threads: 1, tasks: ['103'], starttime: '7000', state: 'Z', proven: true });
+    assert.deepEqual(rec.processes.filter((x) => x.pid !== 103).map((x) => x.thread_group), [null, null, null]);
   });
 });
