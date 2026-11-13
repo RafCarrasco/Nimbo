@@ -1,0 +1,197 @@
+// EVIDENCE (detection level) for the S2-integration browser tiers. This is NOT the no-network
+// guarantee: the browser tiers run only inside the approved network-none container, whose
+// kernel namespace makes any external route impossible. These collectors only DETECT attempts:
+// a CDP URL log (Network.* events, masked) and a /proc socket audit of every process at the end
+// of a tier. Any non-loopback entry fails the tier even though the namespace made it unroutable.
+// Nothing here opens a socket. Recorded URLs never carry the login state, tokens or keys.
+import fs from 'node:fs';
+import path from 'node:path';
+
+const LOOPBACK_SCHEMES = new Set(['http:', 'https:', 'ws:', 'wss:']);
+const INTERNAL_SCHEMES = new Set(['about:', 'data:', 'blob:', 'chrome-error:']);
+
+/** IPv4 127.0.0.0/8 or IPv6 ::1 / ::ffff:127.x (literal hostnames only; no DNS). */
+function loopbackHostname(hostname) {
+  if (hostname === 'localhost' || hostname === '[::1]') return true;
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(hostname)) return hostname.split('.').every((n) => Number(n) <= 255);
+  return /^\[::ffff:127\.\d{1,3}\.\d{1,3}\.\d{1,3}\]$/.test(hostname) || /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(hostname);
+}
+
+/** 'loopback' | 'internal' | 'external'. Unknown or unparsable input is external (fail closed). */
+export function classifyUrl(url) {
+  let u;
+  try {
+    u = new URL(String(url));
+  } catch {
+    return 'external';
+  }
+  if (INTERNAL_SCHEMES.has(u.protocol)) return 'internal';
+  if (LOOPBACK_SCHEMES.has(u.protocol) && loopbackHostname(u.hostname)) return 'loopback';
+  return 'external';
+}
+
+const SECRET_PARAMS = new Set(['state', 'idtoken', 'accesstoken', 'id_token', 'access_token', 'refresh_token', 'refreshtoken',
+  'key', 'apikey', 'token', 'code', 'oobcode', 'secret', 'password', 'credential', 'postbody']);
+
+/** Host/path kept; secret-bearing query values, the whole fragment and long data: URLs masked. */
+export function maskUrl(url) {
+  const s = String(url);
+  if (s.startsWith('data:')) {
+    const c = s.indexOf(',');
+    return `${s.slice(0, c > 0 ? Math.min(c, 48) : 48)},<${s.length} chars>`;
+  }
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return '<unparsable url>';
+  }
+  for (const k of [...u.searchParams.keys()]) {
+    if (SECRET_PARAMS.has(k.toLowerCase())) u.searchParams.set(k, '<masked>');
+  }
+  if (u.hash) u.hash = '#<masked>';
+  return u.href.replace(/%3Cmasked%3E/g, '<masked>');
+}
+
+// ---------------------------------------------------------------- run guard
+/**
+ * The browser tiers run ONLY inside the approved network-none container: the network namespace
+ * must have the loopback interface alone and no non-loopback route, and the container's
+ * allowlisted NIMBO_CHROME / NIMBO_BRIDGE_STDIO_BIN must be set. Anywhere else (for example the
+ * coordinator host) the tiers are refused before any browser, server or emulator traffic.
+ */
+export function isolationGuard({ procRoot = '/proc', env = process.env, fs: f = fs } = {}) {
+  const read = (p) => { try { return f.readFileSync(p, 'utf8'); } catch { return null; } };
+  const dev = read(path.join(procRoot, 'net/dev'));
+  const interfaces = dev === null ? null : dev.split('\n').slice(2).map((l) => l.split(':')[0].trim()).filter(Boolean);
+  const route = read(path.join(procRoot, 'net/route'));
+  const v4 = route === null ? null : route.split('\n').slice(1).map((l) => l.trim().split(/\s+/)[0]).filter(Boolean).filter((d) => d !== 'lo');
+  const r6 = read(path.join(procRoot, 'net/ipv6_route'));
+  const v6 = r6 === null ? [] : r6.split('\n').map((l) => l.trim().split(/\s+/).at(-1)).filter(Boolean).filter((d) => d !== 'lo');
+  const reasons = [];
+  if (!(interfaces && interfaces.length === 1 && interfaces[0] === 'lo')) reasons.push(`interfaces ${JSON.stringify(interfaces)} are not exactly [lo]`);
+  if (v4 === null || v4.length || v6.length) reasons.push('a non-loopback route exists (or routes unreadable)');
+  if (!env.NIMBO_CHROME) reasons.push('NIMBO_CHROME unset');
+  if (!env.NIMBO_BRIDGE_STDIO_BIN) reasons.push('NIMBO_BRIDGE_STDIO_BIN unset');
+  return { ok: reasons.length === 0, interfaces, reasons };
+}
+
+// ---------------------------------------------------------------- /proc socket audit
+/** Kernel hex address: IPv4 is one little-endian word; IPv6 is four little-endian words. */
+export function isLoopbackHex(hex) {
+  const h = String(hex).toUpperCase();
+  if (h.length === 8) return h.slice(6, 8) === '7F';
+  if (h.length !== 32) return false;
+  if (h === '00000000000000000000000001000000') return true; // ::1
+  return h.startsWith('0000000000000000FFFF0000') && h.slice(30, 32) === '7F'; // ::ffff:127.x
+}
+export const isUnspecifiedHex = (hex) => /^0+$/.test(String(hex)) && (String(hex).length === 8 || String(hex).length === 32);
+
+export function parseProcNet(text, proto) {
+  const rows = [];
+  for (const line of String(text).split('\n').slice(1)) {
+    const f = line.trim().split(/\s+/);
+    if (f.length < 10 || !f[1].includes(':')) continue;
+    const addr = (a) => { const [hex, port] = a.split(':'); return { hex, port: parseInt(port, 16) }; };
+    rows.push({ proto, local: addr(f[1]), remote: addr(f[2]), state: f[3], uid: f[7], inode: f[9] });
+  }
+  return rows;
+}
+
+/** null when allowed; otherwise the reason. Local must be loopback (a wildcard bind is reported). */
+export function socketViolation(row) {
+  if (!isLoopbackHex(row.local.hex)) return `local address ${row.local.hex} is not loopback`;
+  if (!isLoopbackHex(row.remote.hex) && !isUnspecifiedHex(row.remote.hex)) return `remote address ${row.remote.hex} is not loopback`;
+  return null;
+}
+
+const NET_TABLES = ['tcp', 'tcp6', 'udp', 'udp6', 'raw', 'raw6'];
+
+/** Every process visible in this pid namespace: fd socket inodes joined with its net tables. */
+export function auditProc({ procRoot = '/proc', fs: f = fs } = {}) {
+  const read = (p) => { try { return f.readFileSync(p, 'utf8'); } catch { return null; } };
+  const processes = [], violations = [];
+  for (const name of f.readdirSync(procRoot)) {
+    if (!/^\d+$/.test(name)) continue;
+    const pid = Number(name), base = path.join(procRoot, name);
+    const comm = (read(path.join(base, 'comm')) || '').trim();
+    let fdNames = [];
+    try { fdNames = f.readdirSync(path.join(base, 'fd')); } catch { /* exited or not ours */ }
+    const inodes = new Set();
+    for (const fd of fdNames) {
+      let target = '';
+      try { target = f.readlinkSync(path.join(base, 'fd', fd)); } catch { continue; }
+      const m = /^socket:\[(\d+)\]$/.exec(target);
+      if (m) inodes.add(m[1]);
+    }
+    const inet = [];
+    const tables = {};
+    for (const t of NET_TABLES) {
+      const text = read(path.join(base, 'net', t));
+      tables[t] = text !== null;
+      if (text === null) continue;
+      for (const row of parseProcNet(text, t)) {
+        if (!inodes.has(row.inode)) continue;
+        const v = socketViolation(row);
+        const rec = { proto: t, local: row.local, remote: row.remote, state: row.state, inode: row.inode };
+        inet.push(rec);
+        if (v) violations.push({ pid, comm, reason: v, ...rec });
+      }
+    }
+    const matched = new Set(inet.map((s) => s.inode));
+    processes.push({ pid, comm, fds_read: fdNames.length, inet_sockets: inet,
+      non_inet_socket_inodes: [...inodes].filter((i) => !matched.has(i)).length, tables_read: tables });
+  }
+  return { label: 'EVIDENCE (detection only; network-none namespace is the guarantee)', processes, violations,
+    pass: processes.length > 0 && violations.length === 0 };
+}
+
+// ---------------------------------------------------------------- CDP URL log
+const URL_EVENTS = new Set(['Network.requestWillBeSent', 'Network.webSocketCreated']);
+const LOGGED_EVENTS = new Set([...URL_EVENTS, 'Network.loadingFailed', 'Network.responseReceived',
+  'Network.webSocketHandshakeResponseReceived', 'Network.webSocketFrameError']);
+
+/** Masked, ordered network evidence from every attached CDP session. */
+export class UrlLog {
+  constructor() { this.entries = []; this.urls = new Map(); }
+  record(method, params = {}, sessionId = null) {
+    if (!LOGGED_EVENTS.has(method)) return;
+    const raw = method === 'Network.webSocketCreated' ? params.url
+      : method === 'Network.requestWillBeSent' ? params.request?.url
+      : method === 'Network.responseReceived' ? params.response?.url : undefined;
+    const key = `${sessionId}|${params.requestId}`;
+    if (raw !== undefined) this.urls.set(key, { url: maskUrl(raw), cls: classifyUrl(raw) });
+    const known = this.urls.get(key) || {};
+    const e = { seq: this.entries.length, method, sessionId, requestId: params.requestId ?? null, url: known.url ?? null, url_class: known.cls ?? null };
+    if (method === 'Network.requestWillBeSent') Object.assign(e, { http_method: params.request?.method ?? null, type: params.type ?? null,
+      redirect_from: params.redirectResponse ? maskUrl(params.redirectResponse.url) : null });
+    if (method === 'Network.loadingFailed') Object.assign(e, { errorText: params.errorText ?? null, canceled: !!params.canceled });
+    if (method === 'Network.responseReceived') Object.assign(e, { status: params.response?.status ?? null, remoteIPAddress: params.response?.remoteIPAddress ?? null });
+    if (method === 'Network.webSocketHandshakeResponseReceived') e.status = params.response?.status ?? null;
+    this.entries.push(e);
+  }
+  count(method) { return this.entries.filter((e) => e.method === method).length; }
+  /** URL-bearing events whose URL is not loopback/internal, plus responses from a non-loopback IP. */
+  violations() {
+    return this.entries.filter((e) => (URL_EVENTS.has(e.method) && e.url_class === 'external')
+      || (e.method === 'Network.responseReceived' && e.remoteIPAddress && !loopbackHostname(e.remoteIPAddress.includes(':') ? `[${e.remoteIPAddress}]` : e.remoteIPAddress)));
+  }
+}
+
+// ---------------------------------------------------------------- retained-evidence scan
+const PATTERNS = [
+  ['jwt', /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g],
+  ['google-api-key', /AIza[0-9A-Za-z_-]{35}/g],
+  ['state-48hex', /(?<![0-9a-fA-F])[0-9a-f]{48}(?![0-9a-fA-F])/g],
+  ['bearer', /Bearer\s+[A-Za-z0-9._-]{20,}/g],
+];
+/** Positions and kinds only; the matched text is never returned. */
+export function scanForSecrets(text, markers = []) {
+  const s = String(text), hits = [];
+  for (const [kind, re] of PATTERNS) for (const m of s.matchAll(re)) hits.push({ kind, index: m.index, length: m[0].length });
+  for (const marker of markers) {
+    let i = -1;
+    while (marker && (i = s.indexOf(marker, i + 1)) !== -1) hits.push({ kind: 'marker', index: i, length: marker.length });
+  }
+  return hits;
+}
