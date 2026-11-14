@@ -22,10 +22,14 @@ pub struct Shell {
 }
 
 /// Script injetado antes dos scripts da página.
-pub fn script(origin: &Origin) -> String {
+pub fn script(origin: &Origin, version: &impl std::fmt::Display) -> String {
     let origin =
         serde_json::to_string(&origin.ascii_serialization()).expect("uma string sempre vira JSON");
-    include_str!("bridge.js").replace("__NIMBO_APP_ORIGIN__", &origin)
+    // Versão do app para a página: o user agent do WebView2 não leva o nome do app.
+    let version = serde_json::to_string(&version.to_string()).expect("uma string sempre vira JSON");
+    include_str!("bridge.js")
+        .replace("__NIMBO_APP_ORIGIN__", &origin)
+        .replace("__NIMBO_APP_VERSION__", &version)
 }
 
 /// Prova de que o comando foi chamado pela página do Nimbo na janela principal. Todo comando
@@ -270,9 +274,14 @@ mod tests {
 
     #[test]
     fn script_carries_the_origin_as_a_js_string() {
-        let script = script(&origin("https://golive-ad118.web.app/qualquer/pagina"));
+        let script = script(
+            &origin("https://golive-ad118.web.app/qualquer/pagina"),
+            &"0.1.0",
+        );
         assert!(script.contains(r#"location.origin !== "https://golive-ad118.web.app")"#));
         assert!(!script.contains("__NIMBO_APP_ORIGIN__"));
+        assert!(script.contains("appVersion: \"0.1.0\","));
+        assert!(!script.contains("__NIMBO_APP_VERSION__"));
     }
 
     /// Nomes das chaves de um objeto literal, uma por linha, com exatamente este recuo.
@@ -303,6 +312,8 @@ mod tests {
         assert!(expected.insert("engine"));
         // O motor de mídia só existe no app em Rust (ver media.rs).
         assert!(expected.insert("media"));
+        // Versão do app em Rust (o Electron informa a dele pelo user agent).
+        assert!(expected.insert("appVersion"));
         assert_eq!(keys(object, "    "), expected);
 
         // Mesma versão de contrato que o Electron expõe.

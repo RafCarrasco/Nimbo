@@ -13,6 +13,8 @@ fn main() {
         "media_sources",
         "media_thumbnail",
         "media_icon",
+        "watch_update",
+        "install_update",
     ]);
     let attributes = tauri_build::Attributes::new().app_manifest(commands);
     if let Err(e) = tauri_build::try_build(attributes) {

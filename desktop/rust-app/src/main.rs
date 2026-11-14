@@ -9,6 +9,7 @@
 //! - `NIMBO_LOGIN_PRINT`: escreve o link de login no stdout em vez de abrir o navegador.
 //! - `NIMBO_SELFTEST=<arquivo>`: confere a ponte com o site carregado e fecha (ver `selftest.rs`).
 //! - `NIMBO_SELFTEST_SCRIPT=<arquivo .js>`: com a anterior, roda esse roteiro no lugar da conferência.
+//! - `NIMBO_UPDATE_URL`: outro endereço do `latest-beta.json` (ver `update.rs`).
 
 // Sem janela de console atrás do app instalado.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -18,6 +19,7 @@ mod login;
 mod media;
 mod selftest;
 mod sources;
+mod update;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -59,6 +61,7 @@ fn main() -> ExitCode {
         // O identificador dá nome à trava de instância única e à pasta de dados do WebView2.
         context.config_mut().identifier = identifier;
     }
+    update::prepare(context.config_mut());
     let shell = Shell {
         origin: app_url.origin(),
         app_url,
@@ -70,6 +73,8 @@ fn main() -> ExitCode {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             focus_main(app);
         }))
+        .plugin(update::updater())
+        .plugin(update::plugin())
         .manage(shell)
         .manage(media::Media::default())
         .manage(sources::Sources::default())
@@ -84,7 +89,9 @@ fn main() -> ExitCode {
             media::media_state,
             sources::media_sources,
             sources::media_thumbnail,
-            sources::media_icon
+            sources::media_icon,
+            update::watch_update,
+            update::install_update
         ])
         .setup(|app| {
             open_main_window(app.handle())?;
@@ -123,7 +130,9 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
             .permission("allow-media-state")
             .permission("allow-media-sources")
             .permission("allow-media-thumbnail")
-            .permission("allow-media-icon"),
+            .permission("allow-media-icon")
+            .permission("allow-watch-update")
+            .permission("allow-install-update"),
     )?;
 
     let selftest = selftest::requested();
@@ -141,7 +150,7 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
     // O tratador de arrastar do Tauri engole o arrastar-e-soltar da própria página.
     .disable_drag_drop_handler()
     .additional_browser_args(BROWSER_ARGS)
-    .initialization_script(bridge::script(&origin))
+    .initialization_script(bridge::script(&origin, &app.package_info().version))
     // A janela nunca sai do Nimbo; link para fora abre no navegador do sistema.
     .on_navigation({
         let origin = origin.clone();

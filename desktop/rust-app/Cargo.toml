@@ -6,7 +6,7 @@ publish = false
 description = "Nimbo desktop shell in Rust (Tauri 2): the site inside WebView2 plus the native bridge. Experimental."
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
 # custom-protocol: build de produção sem o tauri-cli (sem ele o Tauri se comporta como "dev").
@@ -20,6 +20,10 @@ nimbo-media = { path = "../rust-media" }
 nimbo-native = { path = "../rust-native" }
 # Miniaturas e ícones vão para a página como data URL.
 base64 = "0.22"
+# Atualização automática: confere a assinatura do instalador novo antes de instalar (src/update.rs).
+# native-tls: usa os certificados do Windows, como o navegador (antivírus e proxy que inspecionam
+# HTTPS instalam a raiz deles lá). Sem "zip": no Windows a atualização é o próprio instalador.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
