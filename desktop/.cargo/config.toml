@@ -1,0 +1,7 @@
+# Vale para todos os crates em desktop/ (o cargo procura este arquivo nas pastas acima).
+[env]
+# O libopus (codificador de áudio) é compilado pelo CMake. Com o gerador escolhido sozinho, a crate
+# `cmake` deixa o MSVC sem otimização e ele sai ~3x mais lento (287 µs contra 97 µs por pacote,
+# medido). Com o gerador dito aqui, o CMake usa as opções normais de Release (/O2).
+# Se o Visual Studio do build mudar de versão, o erro aparece na hora: é só trocar esta linha.
+CMAKE_GENERATOR = "Visual Studio 17 2022"
