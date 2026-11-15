@@ -12,6 +12,7 @@
     "desktop:pack": "npm run desktop:audio && electron-builder --win nsis --publish never",
     "rules:build": "node scripts/build-rules.mjs",
     "test:desktop": "node --test desktop/tests/contracts.test.mjs",
+    "test:live": "node --experimental-strip-types --test tests/ice-order.test.mjs",
     "test:rules": "firebase emulators:exec --only database --project demo-nimbo \"node --test tests/rules.test.mjs\"",
     "emulators": "firebase emulators:start --only auth,database --project demo-nimbo",
     "dev:local": "vite --mode emulator",

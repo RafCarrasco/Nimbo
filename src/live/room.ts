@@ -26,6 +26,23 @@ import {
 } from './native';
 import type { StreamKind } from './capture';
 import { APP_LABEL } from '../lib/version';
+import {
+  forcedOrder,
+  HOLD_MAX_MS,
+  HOLD_MIN_MS,
+  iceUfrag,
+  leaderOf,
+  lesson,
+  mustLead,
+  orderFor,
+  remember,
+  ROUND_MAX_MS,
+  SAME_ROUND_MS,
+  WAIT_MS,
+  withoutCandidates,
+  type IceOrder,
+  type IceSide,
+} from './iceOrder';
 
 // Sinalização: rooms/{room}/signals/{destinatário}/{remetente}/{id}
 type Signal =
@@ -95,6 +112,8 @@ export type PeerDiagnostics = {
   remoteCandidates: string;
   pairs: string;
   iceRestarts: number;
+  // Quem mandou o primeiro pacote na rodada atual de procura de caminho (ver iceOrder.ts).
+  firstPacket: string;
   encoder: string;
 };
 
@@ -112,6 +131,17 @@ type Peer = {
   lastIceRestart: number;
   // Envios de vídeo que preferem o codificador da placa de vídeo.
   hardware: Set<RTCRtpTransceiver>;
+  // Rodada atual de procura de caminho: quem manda o primeiro pacote (ver iceOrder.ts).
+  order: IceOrder;
+  roundAt: number;
+  // Ordem 'me': os meus endereços ficam aqui até eu já ter mandado testes para os do outro lado.
+  holding: boolean;
+  held: RTCIceCandidateInit[];
+  firstRemoteAt: number;
+  // Ordem 'them': os endereços do outro lado esperam em `candidates` para ele mandar primeiro.
+  waiting: boolean;
+  remoteUfrag: string;
+  timers: Array<ReturnType<typeof setTimeout>>;
 };
 
 type LocalLive = {
@@ -268,6 +298,10 @@ export class LiveRoom {
   private apps: Record<string, string> = {};
   // Ofertas da mesma pessoa para a mesma live são atendidas uma de cada vez.
   private nativeQueue = new Map<string, Promise<void>>();
+  // Procura de caminho com cada pessoa: quantas rodadas já começaram desde a última conexão que deu
+  // certo, e quem mandou primeiro nas que falharam (ver iceOrder.ts).
+  private iceAttempts: Record<string, number> = {};
+  private iceFailed: Record<string, Set<IceSide>> = {};
 
   constructor(
     private db: Database,
@@ -556,14 +590,23 @@ export class LiveRoom {
       iceRestarts: 0,
       lastIceRestart: 0,
       hardware: new Set(),
+      order: 'natural',
+      roundAt: 0,
+      holding: false,
+      held: [],
+      firstRemoteAt: 0,
+      waiting: false,
+      remoteUfrag: '',
+      timers: [],
     };
     this.peers.set(id, peer);
+    this.beginRound(id, peer);
     pc.onnegotiationneeded = async () => {
       try {
         peer.makingOffer = true;
         await pc.setLocalDescription();
         const desc = pc.localDescription!;
-        await this.send(id, { type: desc.type as 'offer', sdp: desc.toJSON() });
+        await this.send(id, { type: desc.type as 'offer', sdp: this.outgoing(peer, desc) });
       } catch (e) {
         console.warn('[nimbo] oferta', id, e);
       } finally {
@@ -571,18 +614,22 @@ export class LiveRoom {
       }
     };
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate?.candidate)
-        void this.send(id, { type: 'ice', candidate: candidate.toJSON() }).catch(() => {});
+      if (!candidate?.candidate) return;
+      // Ordem 'me': o outro lado só recebe os meus endereços depois que eu já mandei para os dele.
+      if (peer.holding) peer.held.push(candidate.toJSON());
+      else void this.send(id, { type: 'ice', candidate: candidate.toJSON() }).catch(() => {});
     };
     pc.oniceconnectionstatechange = () => {
       console.info('[nimbo] ICE', id.slice(0, 5), pc.iceConnectionState);
       if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') peer.iceRestarts = 0;
-      if (pc.iceConnectionState === 'failed') pc.restartIce();
+      if (pc.iceConnectionState === 'failed') this.newRoute(id, peer);
     };
     pc.onconnectionstatechange = () => {
       console.info('[nimbo] conexão', id.slice(0, 5), pc.connectionState);
-      if (pc.connectionState === 'connected') this.failed.delete(id);
-      else if (pc.connectionState === 'failed') this.failed.add(id);
+      if (pc.connectionState === 'connected') {
+        this.failed.delete(id);
+        this.roundConnected(id, peer);
+      } else if (pc.connectionState === 'failed') this.failed.add(id);
       this.emit();
     };
     pc.ontrack = ({ track, streams }) => {
@@ -599,6 +646,114 @@ export class LiveRoom {
     };
     for (const kind of this.locals.keys()) this.syncSenders(peer, kind);
     return peer;
+  }
+
+  // Começa uma rodada de procura de caminho com alguém (conexão nova ou "rota nova") e decide quem
+  // manda o primeiro pacote nela. Ver iceOrder.ts.
+  private beginRound(id: string, peer: Peer) {
+    const now = Date.now();
+    // Os dois lados pediram rota nova quase juntos: é a mesma rodada.
+    if (peer.roundAt && now - peer.roundAt < SAME_ROUND_MS) return;
+    this.roundFailed(id, peer);
+    const attempt = this.iceAttempts[id] ?? 0;
+    this.iceAttempts[id] = attempt + 1;
+    for (const timer of peer.timers.splice(0)) clearTimeout(timer);
+    // Endereços guardados da rodada anterior não servem para a nova.
+    if (peer.roundAt) peer.candidates = [];
+    peer.order = forcedOrder() ?? orderFor(attempt, this.uid < id, mustLead());
+    peer.roundAt = now;
+    peer.held = [];
+    peer.firstRemoteAt = 0;
+    peer.holding = peer.order === 'me';
+    peer.waiting = peer.order === 'them';
+    if (peer.order === 'natural') return;
+    console.info('[nimbo] caminho com', id.slice(0, 5), 'tentativa', attempt + 1, 'primeiro pacote:', peer.order);
+    // Teto: nenhuma espera passa daqui (por exemplo, os dois lados segurando os endereços).
+    peer.timers.push(
+      setTimeout(() => {
+        this.releaseHeld(id, peer);
+        this.stopWaiting(peer);
+      }, ROUND_MAX_MS),
+    );
+  }
+
+  // A rodada anterior acabou sem conectar: anota quem tinha mandado primeiro nela.
+  private roundFailed(id: string, peer: Peer) {
+    if (!peer.roundAt || peer.pc.connectionState === 'connected' || !peer.pc.remoteDescription) return;
+    (this.iceFailed[id] ??= new Set()).add(leaderOf(peer.order, peer.pc.localDescription?.type === 'answer'));
+  }
+
+  private roundConnected(id: string, peer: Peer) {
+    const leader = leaderOf(peer.order, peer.pc.localDescription?.type === 'answer');
+    remember(lesson(leader, this.iceFailed[id] ?? new Set()));
+    this.iceAttempts[id] = 0;
+    delete this.iceFailed[id];
+    this.releaseHeld(id, peer);
+    this.stopWaiting(peer);
+  }
+
+  // "Rota nova": o navegador refaz a procura de caminho, com portas novas, numa rodada nova.
+  private newRoute(id: string, peer: Peer) {
+    this.beginRound(id, peer);
+    peer.pc.restartIce();
+  }
+
+  // Oferta ou resposta que sai: sem os meus endereços enquanto eu os estiver segurando.
+  private outgoing(peer: Peer, desc: RTCSessionDescription) {
+    return peer.holding ? withoutCandidates(desc.toJSON()) : desc.toJSON();
+  }
+
+  // Um endereço do outro lado foi aplicado. Segurando os meus (ordem 'me'), a partir daqui o
+  // navegador já manda testes para ele: quando todos os pares tiverem saído, entrego os meus.
+  private remoteAdded(id: string, peer: Peer) {
+    if (!peer.holding || peer.firstRemoteAt) return;
+    const round = (peer.firstRemoteAt = Date.now());
+    const check = async () => {
+      if (!peer.holding || peer.firstRemoteAt !== round || peer.pc.signalingState === 'closed') return;
+      const waited = Date.now() - round;
+      let sent = false;
+      if (waited >= HOLD_MIN_MS && waited < HOLD_MAX_MS) {
+        const stats = await peer.pc.getStats().catch(() => null);
+        let pairs = 0;
+        let pending = 0;
+        stats?.forEach((r: Record<string, unknown>) => {
+          if (r.type !== 'candidate-pair') return;
+          pairs++;
+          if (!r.requestsSent) pending++;
+        });
+        sent = pairs > 0 && pending === 0;
+      }
+      if (sent || waited >= HOLD_MAX_MS) this.releaseHeld(id, peer);
+      else peer.timers.push(setTimeout(() => void check(), 150));
+    };
+    peer.timers.push(setTimeout(() => void check(), HOLD_MIN_MS));
+  }
+
+  private releaseHeld(id: string, peer: Peer) {
+    if (!peer.holding) return;
+    peer.holding = false;
+    console.info('[nimbo] endereços entregues a', id.slice(0, 5), 'após', Date.now() - peer.roundAt, 'ms:', peer.held.length);
+    for (const candidate of peer.held.splice(0)) void this.send(id, { type: 'ice', candidate }).catch(() => {});
+  }
+
+  // Ordem 'them': a oferta e a resposta já estão aplicadas; o outro lado tem um tempo para mandar
+  // primeiro antes de os endereços dele valerem aqui.
+  private scheduleWaitEnd(peer: Peer) {
+    if (!peer.waiting || !peer.pc.remoteDescription || !peer.pc.localDescription) return;
+    peer.timers.push(setTimeout(() => this.stopWaiting(peer), WAIT_MS));
+  }
+
+  private stopWaiting(peer: Peer) {
+    if (!peer.waiting) return;
+    peer.waiting = false;
+    console.info('[nimbo] endereços do outro lado aplicados após', Date.now() - peer.roundAt, 'ms:', peer.candidates.length);
+    // Na fila da conexão, para não passar na frente de uma oferta ou resposta ainda sendo aplicada.
+    peer.queue = peer.queue
+      .then(async () => {
+        if (peer.pc.signalingState === 'closed' || !peer.pc.remoteDescription) return;
+        for (const c of peer.candidates.splice(0)) await peer.pc.addIceCandidate(c).catch(() => {});
+      })
+      .catch(() => {});
   }
 
   // Põe nos envios desta conexão as faixas atuais da live (ou nada, se ela parou). Os canais de envio
@@ -732,12 +887,14 @@ export class LiveRoom {
     const { pc } = peer;
     if (pc.signalingState === 'closed') return;
     if (msg.type === 'ice') {
-      if (!pc.remoteDescription) {
+      // Sem a oferta/resposta aplicada ainda, ou esperando o outro lado mandar primeiro (ordem 'them').
+      if (!pc.remoteDescription || peer.waiting) {
         peer.candidates.push(msg.candidate);
         return;
       }
       try {
         await pc.addIceCandidate(msg.candidate);
+        this.remoteAdded(id, peer);
       } catch (e) {
         if (!peer.ignoreOffer) throw e;
       }
@@ -746,19 +903,30 @@ export class LiveRoom {
     const collision = msg.type === 'offer' && (peer.makingOffer || pc.signalingState !== 'stable');
     peer.ignoreOffer = !peer.polite && collision;
     if (peer.ignoreOffer) return;
+    // Oferta com rodada de rotas nova (o outro lado pediu "rota nova"): começa a rodada aqui também.
+    const ufrag = iceUfrag(msg.sdp.sdp);
+    if (msg.type === 'offer' && peer.remoteUfrag && ufrag && ufrag !== peer.remoteUfrag) this.beginRound(id, peer);
+    if (ufrag) peer.remoteUfrag = ufrag;
     await pc.setRemoteDescription(msg.sdp); // rollback implícito quando há colisão
-    for (const c of peer.candidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
+    if (!peer.waiting) {
+      const pending = peer.candidates.splice(0);
+      for (const c of pending) await pc.addIceCandidate(c).catch(() => {});
+      if (pending.length || /^a=candidate:/m.test(msg.sdp.sdp || '')) this.remoteAdded(id, peer);
+    }
     if (msg.type === 'offer') {
       await pc.setLocalDescription();
       const desc = pc.localDescription!;
-      await this.send(id, { type: 'answer', sdp: desc.toJSON() });
+      await this.send(id, { type: 'answer', sdp: this.outgoing(peer, desc) });
     }
+    this.scheduleWaitEnd(peer);
   }
 
   private closePeer(id: string) {
     const peer = this.peers.get(id);
     if (!peer) return;
     peer.pc.onnegotiationneeded = null;
+    this.roundFailed(id, peer);
+    for (const timer of peer.timers.splice(0)) clearTimeout(timer);
     peer.pc.close();
     this.peers.delete(id);
     delete this.remote[id];
@@ -779,7 +947,7 @@ export class LiveRoom {
     const peer = this.peers.get(id);
     this.failed.delete(id);
     if (peer && Object.keys(this.remote[id] || {}).length) {
-      peer.pc.restartIce();
+      this.newRoute(id, peer);
       this.emit();
       return;
     }
@@ -818,7 +986,7 @@ export class LiveRoom {
         peer.lastIceRestart = now;
         peer.checkingSince = now;
         console.info('[nimbo] rota nova para', id.slice(0, 5), 'tentativa', peer.iceRestarts);
-        peer.pc.restartIce();
+        this.newRoute(id, peer);
       }
     }
     const waiting = Object.keys(this.broadcasts).filter(
@@ -895,6 +1063,7 @@ export class LiveRoom {
           remoteCandidates: [...remoteTypes].join(' ') || 'nenhum',
           pairs: Object.entries(pairs).map(([k, v]) => `${k}:${v}`).join(' ') || 'nenhum',
           iceRestarts: this.peers.get(id)?.iceRestarts || 0,
+          firstPacket: `${this.peers.get(id)?.order || 'natural'} (rodada ${this.iceAttempts[id] ?? 0})${mustLead() ? ', esta rede manda primeiro' : ''}`,
           encoder: [...encoders].join(', ') || 'nenhum',
         };
       }),
