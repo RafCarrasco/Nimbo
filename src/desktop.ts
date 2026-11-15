@@ -46,7 +46,15 @@ type DesktopBridge = {
     start(
       source: { monitor: number } | { window: number } | null,
       quality: { fps: number; bitrate: number; maxHeight: number },
+      // audio: "system" = tudo menos o próprio Nimbo; { app: pid } = só aquele programa; sem o campo, sem som.
+      // watch: processo do jogo, para saber quando ele sai da frente ou fecha (ver state).
+      options?: { audio?: 'system' | { app: number }; watch?: number },
     ): Promise<Result<null>>;
+    // Live pausada: quem assiste vê uma tela escura no lugar da captura.
+    pause?(paused: boolean): Promise<Result<null>>;
+    // capturing: a fonte ainda existe. foreground: o jogo vigiado está na frente (null = não se sabe
+    // ou não há jogo vigiado). ended: o processo do jogo terminou.
+    state?(): Promise<Result<{ capturing: boolean; foreground: boolean | null; ended: boolean }>>;
     // Oferta WebRTC de um espectador (JSON) → identificador da conexão e resposta (JSON).
     accept(offer: string): Promise<Result<{ id: number; answer: string }>>;
     close(id: number): Promise<void>;
@@ -163,6 +171,20 @@ export type GameWatch = {
 const gameWatches = new WeakMap<MediaStream, GameWatch>();
 export const gameWatchOf = (stream: MediaStream) => gameWatches.get(stream);
 
+// Liga a vigia à live: o resto do app a encontra por gameWatchOf, e ela para junto com o vídeo.
+export function attachGameWatch(stream: MediaStream, watch: GameWatch) {
+  gameWatches.set(stream, watch);
+  const video = stream.getVideoTracks()[0];
+  if (video) {
+    const stop = video.stop.bind(video);
+    video.stop = () => {
+      stop();
+      watch.stop();
+    };
+    video.addEventListener('ended', watch.stop);
+  }
+}
+
 export async function watchGameFor(stream: MediaStream) {
   if (!desktop?.startGameWatch || !desktop.onGameState) return;
   const started = await desktop.startGameWatch();
@@ -203,14 +225,5 @@ export async function watchGameFor(stream: MediaStream) {
       void desktop?.stopGameWatch?.(id);
     },
   };
-  gameWatches.set(stream, watch);
-  const video = stream.getVideoTracks()[0];
-  if (video) {
-    const stop = video.stop.bind(video);
-    video.stop = () => {
-      stop();
-      watch.stop();
-    };
-    video.addEventListener('ended', watch.stop);
-  }
+  attachGameWatch(stream, watch);
 }

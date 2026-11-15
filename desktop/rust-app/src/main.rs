@@ -80,6 +80,8 @@ fn main() -> ExitCode {
             media::media_accept,
             media::media_close,
             media::media_stop,
+            media::media_pause,
+            media::media_state,
             sources::media_sources,
             sources::media_thumbnail,
             sources::media_icon
@@ -117,6 +119,8 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
             .permission("allow-media-accept")
             .permission("allow-media-close")
             .permission("allow-media-stop")
+            .permission("allow-media-pause")
+            .permission("allow-media-state")
             .permission("allow-media-sources")
             .permission("allow-media-thumbnail")
             .permission("allow-media-icon"),

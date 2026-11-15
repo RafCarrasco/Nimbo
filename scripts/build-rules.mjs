@@ -113,6 +113,7 @@ const rules = {
                 "newData.child('streamId').val().length <= 100",
                 // Live enviada pelo motor do app (src/live/native.ts).
                 "(!newData.child('native').exists() || newData.child('native').isBoolean())",
+                "(!newData.child('sound').exists() || newData.child('sound').isBoolean())",
               ),
             },
           },

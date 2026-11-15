@@ -30,7 +30,9 @@
     onAudio: neverFires,
     // Motor de mídia do app: captura, codifica uma vez e envia para todos (src/live/native.ts).
     media: Object.freeze({
-      start: (source, quality) => invoke('media_start', { source, quality }),
+      start: (source, quality, options) => invoke('media_start', { source, quality, options: options ?? null }),
+      pause: (paused) => invoke('media_pause', { paused: Boolean(paused) }),
+      state: () => invoke('media_state'),
       accept: (offer) => invoke('media_accept', { offer }),
       close: (id) => invoke('media_close', { id }),
       stop: () => invoke('media_stop'),

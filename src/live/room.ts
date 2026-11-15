@@ -18,6 +18,7 @@ import {
   isNativeLive,
   nativeMedia,
   NativeReceiver,
+  nativeSound,
   releaseNativePreview,
   stopNative,
   type NativeSignal,
@@ -34,7 +35,8 @@ type Signal =
 // Cada pessoa pode ter até duas lives: tela e câmera. streamId é o id do MediaStream anunciado na
 // negociação; é como quem assiste sabe qual stream recebido é a tela e qual é a câmera.
 // native: a live é enviada pelo motor do app; quem assiste abre uma conexão própria (native.ts).
-export type Broadcast = { startedAt: number; streamId: string; native?: boolean };
+// sound: a live nativa leva som (quem assiste só pede áudio nesse caso).
+export type Broadcast = { startedAt: number; streamId: string; native?: boolean; sound?: boolean };
 export type Broadcasts = Record<string, Partial<Record<StreamKind, Broadcast>>>;
 export const STREAM_KINDS: StreamKind[] = ['screen', 'camera'];
 
@@ -350,7 +352,7 @@ export class LiveRoom {
     await set(this.path(`streams/${this.uid}/${kind}`), {
       startedAt: live.startedAt,
       streamId: live.announced.id,
-      ...(isNativeLive(live.stream) ? { native: true } : {}),
+      ...(isNativeLive(live.stream) ? { native: true, ...(nativeSound(live.stream) ? { sound: true } : {}) } : {}),
     });
   }
 
@@ -918,8 +920,10 @@ export class LiveRoom {
     live.paused = false;
     this.watchEnded(stream, kind);
     for (const peer of this.peers.values()) this.syncSenders(peer, kind);
-    // Live nativa: a captura já trocou de fonte no motor; só a prévia antiga é fechada.
+    // Live nativa: a captura já trocou de fonte no motor; só a prévia antiga é fechada. O anúncio é
+    // refeito porque a fonte nova pode ter (ou não ter) som.
     releaseNativePreview(old);
+    if (isNativeLive(stream)) void this.publishStream(kind).catch(() => {});
     old.getTracks().forEach((t) => t.stop());
     this.emit();
   }
@@ -934,6 +938,8 @@ export class LiveRoom {
     const live = this.locals.get(kind);
     if (!live || live.stream !== stream || Boolean(live.paused) === paused) return;
     live.paused = paused;
+    // Live nativa: quem pausa é o motor, que manda uma tela escura para todos.
+    if (isNativeLive(live.stream)) void nativeMedia?.pause?.(paused)?.catch(() => {});
     for (const peer of this.peers.values()) this.syncSenders(peer, kind);
     this.emit();
   }

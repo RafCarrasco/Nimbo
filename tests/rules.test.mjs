@@ -399,6 +399,8 @@ describe('sinalização WebRTC', () => {
     const live = { startedAt: 1, streamId: 'abc' };
     await assertSucceeds(set(ref(member(), 'rooms/geral/streams/member/screen'), { ...live, native: true }));
     await assertFails(set(ref(member(), 'rooms/geral/streams/member/screen'), { ...live, native: 'sim' }));
+    await assertSucceeds(set(ref(member(), 'rooms/geral/streams/member/screen'), { ...live, native: true, sound: true }));
+    await assertFails(set(ref(member(), 'rooms/geral/streams/member/screen'), { ...live, native: true, sound: 'alto' }));
     // Ninguém marca a live dos outros como nativa.
     await assertFails(set(ref(member(), 'rooms/geral/streams/owner/screen'), { ...live, native: true }));
   });

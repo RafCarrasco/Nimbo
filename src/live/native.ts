@@ -6,11 +6,11 @@
 //
 // Quem assiste (site, celular ou app): vê `native: true` no anúncio da live e abre uma conexão
 // própria, só de recepção, direto com o motor do transmissor.
-import { desktop } from '../desktop';
+import { attachGameWatch, desktop, type GameWatch } from '../desktop';
 import { pickNativeSource } from '../components/SourcePicker';
 import { CaptureCancelled } from '../lib/errors';
 import type { Broadcasts } from './room';
-import type { StreamKind } from './capture';
+import type { AudioMode, StreamKind } from './capture';
 
 export type NativeQuality = { fps: number; bitrate: number; maxHeight: number };
 // nonce: liga a resposta à oferta que a pediu. Sem isso, com duas ofertas pendentes (nova tentativa),
@@ -26,7 +26,9 @@ export type NativeSignal = {
 export const nativeMedia = desktop?.media;
 
 // Prévia local de cada live nativa: é uma conexão de espectador com o próprio motor.
-const previews = new WeakMap<MediaStream, { pc: RTCPeerConnection; id: number }>();
+const previews = new WeakMap<MediaStream, { pc: RTCPeerConnection; id: number; sound: boolean }>();
+// A live nativa leva som? Vai no anúncio da live: quem assiste só pede áudio se houver.
+export const nativeSound = (stream: MediaStream) => Boolean(previews.get(stream)?.sound);
 // Quantas prévias estão abertas: uma troca de fonte que falha não pode derrubar a live que já está no ar.
 let activePreviews = 0;
 // Chamadas ao app que não podem virar erro solto no console se o app recusar.
@@ -52,18 +54,25 @@ function gathered(pc: RTCPeerConnection, maxMs: number) {
 
 // Começa a captura no motor e devolve a prévia. O MediaStream devolvido representa a live: é o que
 // o resto do app recebe no lugar do stream do getDisplayMedia.
-export async function captureScreenNative(quality: NativeQuality): Promise<MediaStream> {
+export async function captureScreenNative(quality: NativeQuality, audio: AudioMode = 'none'): Promise<MediaStream> {
   const media = nativeMedia;
   if (!media) throw new Error('Disponível só no app.');
   // A pessoa escolhe a tela ou janela na própria página. App mais antigo, sem a lista: tela principal.
   // Fica antes de tudo: desistir aqui não pode mexer numa live que já está no ar (troca de fonte).
   let source: Parameters<typeof media.start>[0] = null;
+  let chosen: Awaited<ReturnType<typeof pickNativeSource>> = null;
   if (media.sources) {
-    const chosen = await pickNativeSource(media);
+    chosen = await pickNativeSource(media);
     if (!chosen) throw new CaptureCancelled();
     source = chosen.source;
   }
-  const started = await media.start(source, quality);
+  // Som: "só do programa" precisa saber qual é o programa; sem isso vale o som do computador (sempre
+  // sem o do próprio Nimbo, para as lives que você assiste não voltarem na sua).
+  const sound = audio === 'none' ? undefined : audio === 'window' && chosen?.pid ? { app: chosen.pid } : ('system' as const);
+  // Vigia o programa escolhido: se é um jogo em tela cheia (transmitido pelo monitor), a live pausa
+  // quando ele sai da frente; em qualquer caso, acaba quando ele fecha.
+  const watched = chosen?.kind === 'window' ? chosen.pid : undefined;
+  const started = await media.start(source, quality, { audio: sound, watch: watched });
   if (!started.ok) throw new Error(started.error);
   const pc = new RTCPeerConnection();
   try {
@@ -81,14 +90,57 @@ export async function captureScreenNative(quality: NativeQuality): Promise<Media
     if (!answer.ok) throw new Error(answer.error);
     await pc.setRemoteDescription(JSON.parse(answer.value.answer) as RTCSessionDescriptionInit);
     const stream = new MediaStream([await track]);
-    previews.set(stream, { pc, id: answer.value.id });
+    previews.set(stream, { pc, id: answer.value.id, sound: Boolean(sound) });
     activePreviews++;
+    followCapture(stream, chosen?.title || 'Tela', Boolean(watched) && source !== null && 'monitor' in source, Boolean(chosen?.game));
     return stream;
   } catch (e) {
     pc.close();
     if (!activePreviews) quiet(media.stop());
     throw e;
   }
+}
+
+// Acompanha a captura pelo estado do app: pausa quando o jogo em tela cheia sai da frente, e avisa
+// quando o jogo fecha ou a janela capturada deixa de existir.
+function followCapture(stream: MediaStream, label: string, pausable: boolean, game: boolean) {
+  const media = nativeMedia;
+  if (!media?.state) return;
+  const changes: Array<(active: boolean) => void> = [];
+  const endings: Array<() => void> = [];
+  let active: boolean | null = null;
+  let ended = false;
+  const timer = setInterval(async () => {
+    if (!previews.has(stream)) return watch.stop();
+    const result = await media.state!().catch(() => null);
+    if (!result?.ok || ended) return;
+    const { capturing, foreground, ended: exited } = result.value;
+    if (pausable && foreground !== null && foreground !== active) {
+      active = foreground;
+      changes.forEach((cb) => cb(foreground));
+    }
+    if (exited || !capturing) {
+      ended = true;
+      watch.stop();
+      // Jogo que fechou: a live termina com aviso. Janela comum que sumiu: termina como se a pessoa
+      // tivesse parado de compartilhar.
+      if (game) endings.forEach((cb) => cb());
+      else stream.getVideoTracks()[0]?.dispatchEvent(new Event('ended'));
+    }
+  }, pausable ? 500 : 1000);
+  const watch: GameWatch = {
+    label,
+    onChange: (cb) => {
+      changes.push(cb);
+      if (active !== null) cb(active);
+    },
+    onEnded: (cb) => {
+      endings.push(cb);
+      if (ended && game) cb();
+    },
+    stop: () => clearInterval(timer),
+  };
+  attachGameWatch(stream, watch);
 }
 
 // Fecha só a prévia. A captura continua (troca de fonte) até alguém chamar stopNative.
@@ -115,12 +167,22 @@ export async function answerNative(offer: RTCSessionDescriptionInit) {
   return { id: result.value.id, answer: JSON.parse(result.value.answer) as RTCSessionDescriptionInit };
 }
 
+// Acrescenta stereo=1 ao formato Opus da oferta (RFC 7587: sem isso, quem envia pode mandar mono).
+export function stereoOpus(sdp: string) {
+  const opus = [...sdp.matchAll(/^a=rtpmap:(\d+) opus\/48000\/2\r?$/gim)].map((m) => m[1]);
+  let out = sdp;
+  for (const pt of opus)
+    out = out.replace(new RegExp(`^(a=fmtp:${pt} (?!.*stereo=)[^\\r\\n]*)`, 'm'), '$1;stereo=1');
+  return out;
+}
+
 type Incoming = {
   pc: RTCPeerConnection;
   uid: string;
   kind: StreamKind;
   streamId: string;
   stream: MediaStream;
+  sound: boolean;
   nonce: string;
   // Falhas seguidas desta live; volta a zero quando conecta.
   tries: number;
@@ -151,14 +213,24 @@ export class NativeReceiver {
 
   // Abre conexão para as lives nativas anunciadas e fecha as que acabaram.
   sync(broadcasts: Broadcasts, members: string[], self: string) {
-    const wanted = new Map<string, { uid: string; kind: StreamKind; streamId: string }>();
+    const wanted = new Map<string, { uid: string; kind: StreamKind; streamId: string; sound: boolean }>();
     for (const [uid, kinds] of Object.entries(broadcasts)) {
       if (uid === self || !members.includes(uid)) continue;
       for (const [kind, live] of Object.entries(kinds))
-        if (live?.native) wanted.set(`${uid}:${kind}`, { uid, kind: kind as StreamKind, streamId: live.streamId });
+        if (live?.native)
+          wanted.set(`${uid}:${kind}`, {
+            uid,
+            kind: kind as StreamKind,
+            streamId: live.streamId,
+            sound: Boolean(live.sound),
+          });
     }
     for (const [key, conn] of this.conns)
-      if (wanted.get(key)?.streamId !== conn.streamId) this.close(key);
+      {
+      const live = wanted.get(key);
+      // Live acabou, recomeçou, ou passou a ter (ou deixou de ter) som: refaz a conexão.
+      if (live?.streamId !== conn.streamId || live.sound !== conn.sound) this.close(key);
+    }
     for (const key of [...this.gaveUp]) {
       const [base, streamId] = key.split('|');
       if (wanted.get(base)?.streamId !== streamId) this.gaveUp.delete(key);
@@ -167,7 +239,11 @@ export class NativeReceiver {
       if (!this.conns.has(key) && !this.gaveUp.has(`${key}|${live.streamId}`)) this.open(key, live, 0);
   }
 
-  private open(key: string, live: { uid: string; kind: StreamKind; streamId: string }, tries: number) {
+  private open(
+    key: string,
+    live: { uid: string; kind: StreamKind; streamId: string; sound: boolean },
+    tries: number,
+  ) {
     const pc = new RTCPeerConnection(this.deps.ice());
     const stream = new MediaStream();
     const retry = () => {
@@ -185,6 +261,7 @@ export class NativeReceiver {
     const conn: Incoming = { pc, ...live, stream, nonce, tries, timer: setTimeout(retry, CONNECT_MS) };
     this.conns.set(key, conn);
     pc.addTransceiver('video', { direction: 'recvonly' });
+    if (live.sound) pc.addTransceiver('audio', { direction: 'recvonly' });
     pc.ontrack = ({ track }) => {
       stream.addTrack(track);
       track.onunmute = () => this.deps.onChange();
@@ -201,7 +278,9 @@ export class NativeReceiver {
       this.deps.onChange();
     };
     void (async () => {
-      await pc.setLocalDescription();
+      const offer = await pc.createOffer();
+      // Sem pedir estéreo, o navegador recebe o som do jogo em mono.
+      await pc.setLocalDescription({ type: 'offer', sdp: stereoOpus(offer.sdp || '') });
       await gathered(pc, 2000);
       if (this.conns.get(key)?.pc !== pc || !pc.localDescription) return;
       await this.deps.send(live.uid, { type: 'offer', sdp: pc.localDescription.toJSON(), native: live.kind, nonce });

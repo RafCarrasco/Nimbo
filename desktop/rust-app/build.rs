@@ -8,6 +8,8 @@ fn main() {
         "media_accept",
         "media_close",
         "media_stop",
+        "media_pause",
+        "media_state",
         "media_sources",
         "media_thumbnail",
         "media_icon",

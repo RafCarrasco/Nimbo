@@ -62,11 +62,14 @@ export async function captureScreen(settings: CaptureSettings): Promise<MediaStr
   const wantsAudio = settings.audio !== 'none';
   // App em Rust: o motor nativo captura e envia; aqui só chega a prévia.
   if (nativeMedia)
-    return captureScreenNative({
-      fps: settings.frameRate,
-      bitrate: maxBitrate('screen', settings),
-      maxHeight: settings.quality,
-    });
+    return captureScreenNative(
+      {
+        fps: settings.frameRate,
+        bitrate: maxBitrate('screen', settings),
+        maxHeight: settings.quality,
+      },
+      settings.audio,
+    );
   if (desktop) return captureScreenDesktop(settings, wantsAudio);
   const options: DisplayOptions = {
     video: { ...videoConstraints(settings), displaySurface: settings.surface } as MediaTrackConstraints,
