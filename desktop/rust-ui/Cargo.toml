@@ -1,0 +1,27 @@
+[package]
+name = "nimbo-ui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Nimbo native interface in Rust (egui). Experimental: the official app is still desktop/rust-app."
+
+[[bin]]
+name = "nimbo-native"
+path = "src/main.rs"
+
+[dependencies]
+# Login e banco em tempo real, sem interface (desktop/rust-core).
+nimbo-core = { path = "../rust-core" }
+# Janela e desenho. wgpu: a mesma placa que decodifica a live desenha a interface.
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.37"
+# Os mesmos ícones do site (lucide), como fonte.
+lucide-icons = "1"
+serde_json = "1"
+# Logo e fotos de perfil (PNG e WebP).
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

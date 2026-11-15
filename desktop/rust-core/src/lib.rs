@@ -3,6 +3,7 @@
 //! Ver `docs/rust-app.md` (seção "App full Rust") para o plano e o estado de cada etapa.
 
 pub mod auth;
+pub mod community;
 pub mod config;
 pub mod rtdb;
 
