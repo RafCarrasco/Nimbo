@@ -206,6 +206,11 @@ export function LiveTile({
         if ((e.target as HTMLElement).closest('button, input')) return;
         if (!fullscreen) onSelect?.();
       }}
+      // Como no Discord: duplo clique na imagem abre (ou fecha) a tela cheia.
+      onDoubleClick={(e) => {
+        if ((e.target as HTMLElement).closest('button, input')) return;
+        toggleFullscreen();
+      }}
     >
       <video ref={video} autoPlay playsInline muted={silent} />
       {(state !== 'playing' || !hasFrames) && (

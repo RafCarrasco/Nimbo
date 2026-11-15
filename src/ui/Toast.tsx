@@ -3,9 +3,11 @@ import { CircleAlert, CircleCheck, Info, X } from 'lucide-react';
 import { errorMessage } from '../lib/errors';
 
 type ToastType = 'success' | 'error' | 'info';
-type Toast = { id: number; text: string; type: ToastType };
+// action: botão dentro do aviso ("Assistir"); o aviso fecha ao clicar.
+type ToastAction = { label: string; run: () => void };
+type Toast = { id: number; text: string; type: ToastType; action?: ToastAction };
 type ToastApi = {
-  show: (text: string, type?: ToastType) => void;
+  show: (text: string, type?: ToastType, action?: ToastAction) => void;
   success: (text: string) => void;
   error: (e: unknown) => void;
   info: (text: string) => void;
@@ -19,11 +21,12 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const next = useRef(1);
   const dismiss = useCallback((id: number) => setToasts((list) => list.filter((t) => t.id !== id)), []);
   const show = useCallback(
-    (text: string, type: ToastType = 'info') => {
+    (text: string, type: ToastType = 'info', action?: ToastAction) => {
       const id = next.current++;
       // Mensagens repetidas substituem a anterior em vez de empilhar.
-      setToasts((list) => [...list.filter((t) => t.text !== text).slice(-2), { id, text, type }]);
-      setTimeout(() => dismiss(id), type === 'error' ? 6000 : 3500);
+      setToasts((list) => [...list.filter((t) => t.text !== text).slice(-2), { id, text, type, action }]);
+      // Aviso com botão fica mais tempo: dá para ler e decidir.
+      setTimeout(() => dismiss(id), action ? 9000 : type === 'error' ? 6000 : 3500);
     },
     [dismiss],
   );
@@ -46,6 +49,17 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             <div key={t.id} className={'toast ' + t.type}>
               <Icon size={18} aria-hidden />
               <span>{t.text}</span>
+              {t.action && (
+                <button
+                  className="toast-action"
+                  onClick={() => {
+                    t.action?.run();
+                    dismiss(t.id);
+                  }}
+                >
+                  {t.action.label}
+                </button>
+              )}
               <button className="icon-button" aria-label="Fechar aviso" onClick={() => dismiss(t.id)}>
                 <X size={16} />
               </button>
