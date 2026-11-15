@@ -39,6 +39,8 @@ jobs:
       - run: npm run build
       - name: Desktop (Electron) contract tests
         run: npm run test:desktop
+      - name: Live connection logic tests
+        run: npm run test:live
       - name: Rules are generated from scripts/build-rules.mjs
         run: npm run rules:build && git diff --exit-code database.rules.json
       - name: Security rules tests (emulator)

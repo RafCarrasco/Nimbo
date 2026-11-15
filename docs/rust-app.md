@@ -203,6 +203,44 @@ verdade e silêncio de 8 s (`NIMBO_QUIET_MS=8000`): o espectador remoto mandou p
 - Nesta máquina, UDP entre dois soquetes em 127.0.0.1 não é entregue (filtro de rede local): testes de rede usam
   o endereço da placa.
 
+### Lives pelo navegador: quem manda o primeiro pacote (site, 15/11/2026)
+
+O silêncio do motor só vale para as lives de tela do app. Webcam e quem transmite pelo site usam a conexão do
+navegador, onde quem responde à oferta acaba testando os caminhos primeiro. Com quem transmite atrás de um
+modem como o da Vivo, o primeiro pacote chegava de fora e a conversa morria.
+
+O navegador não deixa escolher a hora do pacote, mas um lado só consegue mandar para os endereços que já
+recebeu. Medido em 15/11/2026 com o PC do dono ligado direto no modem da Vivo (modo roteador) e um Chrome num
+servidor do GitHub Actions, no app (WebView2) e no Electron:
+
+| Como a oferta sai daqui | Resultado nos dois programas |
+| --- | --- |
+| Com os endereços (o lado de fora testa primeiro) | falhou |
+| Sem os endereços; eles seguem 1,5 s depois de a resposta ser aplicada (este lado testa primeiro) | conectou, IPv4 público dos dois lados |
+
+Também medido: pedir "rota nova" no Chromium abre portas novas (61338/61339 viraram 61340/61341), então uma
+conversa morta numa tentativa não contamina a seguinte.
+
+O que o site faz agora (`src/live/iceOrder.ts`, usado em `src/live/room.ts`):
+
+- **Primeira tentativa**: como sempre foi, a não ser que este aparelho já tenha aprendido que a rede dele
+  precisa mandar primeiro.
+- **Depois de uma falha**, as duas ordens são tentadas em sequência. Quem manda primeiro segura os próprios
+  endereços até já ter mandado testes para os do outro lado (confere pelos números do próprio navegador, com
+  mínimo de 0,7 s e teto de 2,5 s); o outro lado espera 2 s antes de aplicar os endereços recebidos. Cada lado
+  age sozinho e as duas ações dão no mesmo, então funciona com o outro lado em versão antiga do site.
+- **Aprendizado**: se só conectou com este lado mandando primeiro, depois de falhar do outro jeito, o aparelho
+  guarda isso por 30 dias (`nimbo.ice.lead` no armazenamento local) e passa a mandar primeiro já na primeira
+  tentativa. O contrário apaga a anotação.
+- O "Copiar diagnóstico" mostra a ordem da rodada atual (`firstPacket`).
+
+No emulador, com duas contas e uma webcam de teste, as quatro combinações conectaram: um lado segurando, um
+lado esperando, os dois esperando (2 s) e os dois segurando (libera sozinho em 5 s).
+
+Não resolve: os **dois** lados atrás de roteadores assim (nenhuma ordem serve; só o servidor de retransmissão)
+e NAT simétrico. Não medido: a correção rodando no site entre duas casas de verdade (a bancada mediu o
+mecanismo com uma página de teste, não o `room.ts`), Firefox e Safari, e celular.
+
 ### Qualidade com rede apertada (0.5.5)
 
 Bancada de 15/11/2026: janela de teste com movimento fora da tela (1080p, ~48 quadros por segundo), o servidor
@@ -237,8 +275,8 @@ limpa o buffer de quem assiste fica em 8 a 10 ms, sem sinal de acúmulo) e inter
 A queda periódica a cada ~18 s vista no mesmo dia não era rede nem motor: eram duas sessões da mesma conta no
 canal (app e uma aba de navegador), corrigido no site com `members/{uid}/sid`.
 
-Limites: as lives pelo navegador embutido (webcam) e quem assiste pelo site não passam pelo motor e continuam
-dependendo de quem testa primeiro; e é quem transmite que precisa estar na 0.5.2. O relógio da máquina do dono
+Limites: as lives pelo navegador embutido (webcam) e quem assiste pelo site não passam pelo motor (para elas,
+ver "Lives pelo navegador: quem manda o primeiro pacote"); e é quem transmite que precisa estar na 0.5.2. O relógio da máquina do dono
 estava 111 s adiantado: testes com horário combinado entre máquinas precisam medir essa diferença antes.
 
 O "Copiar diagnóstico" de uma live nativa agora traz, por tentativa: os caminhos que cada lado ofereceu (só o tipo
