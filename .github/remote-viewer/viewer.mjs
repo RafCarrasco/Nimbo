@@ -160,7 +160,23 @@ try {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     for (let i = 0; i < 40 && pc.connectionState !== 'connected' && pc.connectionState !== 'failed'; i++) await wait(500);
     const settled = Math.round(performance.now() - from);
-    if (pc.connectionState === 'connected') await wait(5000);
+    // Fica assistindo por um bom tempo: houve queda sempre aos 18 s, e 5 s de teste não mostravam.
+    const watched = [];
+    if (pc.connectionState === 'connected') {
+      let before = 0;
+      for (let second = 1; second <= 45; second++) {
+        await wait(1000);
+        let now = 0;
+        (await pc.getStats()).forEach((s) => {
+          if (s.type === 'inbound-rtp' && s.kind === 'video') now = s.framesDecoded || 0;
+        });
+        if (second % 5 === 0) {
+          watched.push(`${second}s: ${now - before} quadros, ${pc.iceConnectionState}/${pc.connectionState}`);
+          before = now;
+        }
+      }
+    }
+    window.watched = watched;
     const stats = await pc.getStats();
     const byId = new Map();
     stats.forEach((s) => byId.set(s.id, s));
@@ -189,6 +205,7 @@ try {
       bytesDeVideo: bytes,
       pares: pairs,
       estados: window.states,
+      assistido: window.watched,
     };
   }, answer);
   console.log('RESULTADO', JSON.stringify(result, null, 1));
