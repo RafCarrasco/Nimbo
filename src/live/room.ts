@@ -26,6 +26,7 @@ import {
   type NativeSignal,
 } from './native';
 import type { StreamKind } from './capture';
+import { PREVIEW_EVERY_MS, PREVIEW_FIRST_MS, snapshotOf, validPreview } from './preview';
 import { APP_LABEL } from '../lib/version';
 import {
   forcedOrder,
@@ -101,6 +102,8 @@ export type LiveSnapshot = {
   apps?: Record<string, string>;
   // Quem está assistindo cada live ("uid:tipo" → pessoas), como cada uma informou.
   watchers?: Record<string, string[]>;
+  // Prévia (foto pequena) de cada live, "uid:tipo" → data URL. Só vem enquanto a interface pede.
+  previews?: Record<string, string>;
   // Relógio do servidor menos o deste aparelho, em ms. As lives guardam o início na hora do servidor,
   // para o tempo no ar sair certo mesmo com o relógio de alguém errado.
   clockOffset?: number;
@@ -311,6 +314,9 @@ export class LiveRoom {
   private watching: string[] = [];
   private watchers: Record<string, string[]> = {};
   private clockOffset = 0;
+  // Prévias das lives do canal, lidas só enquanto a interface pede (cartões do palco).
+  private previews: Record<string, string> = {};
+  private previewsOff: (() => void) | null = null;
   // Procura de caminho com cada pessoa: quantas rodadas já começaram desde a última conexão que deu
   // certo, e quem mandou primeiro nas que falharam (ver iceOrder.ts).
   private iceAttempts: Record<string, number> = {};
@@ -350,6 +356,7 @@ export class LiveRoom {
       native: this.nativeIn.states(this.broadcasts, this.uid),
       apps: this.apps,
       watchers: this.watchers,
+      previews: this.previews,
       clockOffset: this.clockOffset,
       failed: [...this.failed],
       connecting: [...this.peers.entries()]
@@ -430,6 +437,43 @@ export class LiveRoom {
     await set(this.watchingRef, Object.keys(value).length ? value : null);
   }
 
+  // Renova a prévia de uma live própria: uma foto pequena do que está sendo transmitido.
+  private async publishPreview(kind: StreamKind) {
+    const live = this.locals.get(kind);
+    if (!live || !this.joined || this.replaced || live.paused) return;
+    const track = live.stream.getVideoTracks()[0];
+    const data = track ? await snapshotOf(track).catch(() => null) : null;
+    if (!data || this.locals.get(kind) !== live || !this.joined) return;
+    await onDisconnect(this.path(`previews/${this.uid}`)).remove();
+    await set(this.path(`previews/${this.uid}/${kind}`), data);
+  }
+
+  // A interface pede as prévias só enquanto vai mostrá-las: ninguém baixa foto que não vai ver.
+  watchPreviews(on: boolean) {
+    if (on === Boolean(this.previewsOff) || (on && !this.joined)) return;
+    if (!on) {
+      this.previewsOff?.();
+      this.previewsOff = null;
+      this.previews = {};
+      this.emit();
+      return;
+    }
+    this.previewsOff = onValue(
+      this.path('previews'),
+      (snap) => {
+        const next: Record<string, string> = {};
+        for (const [uid, kinds] of Object.entries((snap.val() as Record<string, Record<string, unknown>>) || {}))
+          for (const kind of STREAM_KINDS) {
+            const value = kinds?.[kind];
+            if (validPreview(value)) next[liveKey(uid, kind)] = value;
+          }
+        this.previews = next;
+        this.emit();
+      },
+      () => {},
+    );
+  }
+
   private onWatching(raw: Record<string, Record<string, Record<string, unknown>>> | null) {
     const next: Record<string, string[]> = {};
     for (const [viewer, lives] of Object.entries(raw || {}))
@@ -457,7 +501,15 @@ export class LiveRoom {
     const watchdog = setInterval(() => this.checkMissing(), 2000);
     const adapt = setInterval(() => void this.adaptQuality(), 3000);
     const relay = setInterval(() => void this.reportRelayUsage(), 60000);
-    this.unsubs.push(() => clearInterval(watchdog), () => clearInterval(adapt), () => clearInterval(relay));
+    const previews = setInterval(() => {
+      for (const kind of this.locals.keys()) void this.publishPreview(kind).catch(() => {});
+    }, PREVIEW_EVERY_MS);
+    this.unsubs.push(
+      () => clearInterval(watchdog),
+      () => clearInterval(adapt),
+      () => clearInterval(relay),
+      () => clearInterval(previews),
+    );
     this.unsubs.push(
       onValue(ref(this.db, '.info/connected'), (snap) => {
         const connected = snap.val() === true;
@@ -1145,6 +1197,7 @@ export class LiveRoom {
     if (!isNativeLive(stream)) this.hardware = await hardwareH264();
     this.locals.set(kind, { stream, announced, bitrate, game: nativeGame(stream) || undefined, startedAt: Date.now() });
     this.watchEnded(stream, kind);
+    setTimeout(() => void this.publishPreview(kind).catch(() => {}), PREVIEW_FIRST_MS);
     try {
       await this.publishStream(kind);
     } catch (e) {
@@ -1175,6 +1228,7 @@ export class LiveRoom {
     live.game = nativeGame(stream) || undefined;
     live.paused = false;
     this.watchEnded(stream, kind);
+    setTimeout(() => void this.publishPreview(kind).catch(() => {}), PREVIEW_FIRST_MS);
     for (const peer of this.peers.values()) this.syncSenders(peer, kind);
     // Live nativa: a captura já trocou de fonte no motor; só a prévia antiga é fechada. O anúncio é
     // refeito porque a fonte nova pode ter (ou não ter) som.
@@ -1214,6 +1268,7 @@ export class LiveRoom {
       live.stream.getTracks().forEach((t) => t.stop());
       this.emit();
       await remove(this.path(`streams/${this.uid}/${k}`)).catch(() => {});
+      await remove(this.path(`previews/${this.uid}/${k}`)).catch(() => {});
     }
   }
 
@@ -1224,6 +1279,8 @@ export class LiveRoom {
     this.joined = false;
     this.unsubs.forEach((u) => u());
     this.unsubs = [];
+    this.previewsOff?.();
+    this.previewsOff = null;
     for (const id of [...this.peers.keys()]) this.closePeer(id);
     this.nativeIn.closeAll();
     await onDisconnect(this.streamsRef)
@@ -1233,6 +1290,9 @@ export class LiveRoom {
       .cancel()
       .catch(() => {});
     await onDisconnect(this.watchingRef)
+      .cancel()
+      .catch(() => {});
+    await onDisconnect(this.path(`previews/${this.uid}`))
       .cancel()
       .catch(() => {});
     if (!this.replaced) await remove(this.watchingRef).catch(() => {});

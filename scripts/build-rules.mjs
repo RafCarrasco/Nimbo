@@ -149,6 +149,28 @@ const rules = {
             },
           },
         },
+        // Prévia de cada live: uma foto pequena tirada por quem transmite (src/live/preview.ts).
+        previews: {
+          '.read': canRoom,
+          $uid: {
+            '.write': or(
+              and(canRoom, 'auth.uid === $uid', member('$uid')),
+              and(google, 'auth.uid === $uid', '!newData.exists()'),
+              and(adminOver(channelVisible('$room')), '!newData.exists()'),
+            ),
+            $kind: {
+              '.validate': and(
+                "($kind === 'screen' || $kind === 'camera')",
+                'newData.isString()',
+                'newData.val().length <= 14000',
+                or(
+                  "newData.val().beginsWith('data:image/webp;base64,')",
+                  "newData.val().beginsWith('data:image/jpeg;base64,')",
+                ),
+              ),
+            },
+          },
+        },
         signals: {
           $recipient: {
             // Cada pessoa lê apenas a própria caixa de sinalização WebRTC.
