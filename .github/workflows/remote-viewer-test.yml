@@ -1,0 +1,27 @@
+# Teste de rede descartável (ver .github/remote-viewer/viewer.mjs). Só existe nesta branch de teste
+# e só roda quando run.txt muda.
+name: Remote viewer test
+
+on:
+  push:
+    branches: [test/remote-viewer]
+    paths: ['.github/remote-viewer/run.txt']
+
+permissions:
+  contents: write
+
+jobs:
+  viewer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Viewer
+        working-directory: .github/remote-viewer
+        env:
+          REMOTE_TEST_KEY: ${{ secrets.REMOTE_TEST_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          npm init -y > /dev/null
+          npm install --no-save --no-audit --no-fund puppeteer-core@23 > /dev/null
+          node viewer.mjs
