@@ -386,6 +386,7 @@ function Community({ uid }: { uid: string }) {
             setVisible={setVisible}
             nameOf={nameOf}
             photoOf={(id) => data.avatars[id]}
+            onPreviews={live.previews}
             onRetry={live.retry}
             lead={sidebarToggle}
           />

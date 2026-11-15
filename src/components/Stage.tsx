@@ -47,6 +47,7 @@ export function Stage({
   setVisible,
   nameOf,
   photoOf,
+  onPreviews,
   onRetry,
   lead,
 }: {
@@ -57,6 +58,8 @@ export function Stage({
   setVisible: (update: (ids: string[]) => string[]) => void;
   nameOf: (id: string) => string;
   photoOf?: (id: string) => string | undefined;
+  // Liga e desliga a leitura das prévias (só enquanto os cartões estão na tela).
+  onPreviews?: (on: boolean) => void;
   onRetry: (id: string) => void;
   // Botão à esquerda do nome do canal (ocultar ou mostrar a barra lateral).
   lead?: ReactNode;
@@ -112,6 +115,13 @@ export function Stage({
     if (id === uid) return kind === 'camera' ? 'Sua câmera' : 'Sua tela';
     return nameOf(id);
   };
+
+  // Os cartões "Ao vivo agora" mostram a prévia de cada live: lida só enquanto eles estão na tela.
+  const cards = shown.length === 0 && active.length > 0;
+  useEffect(() => {
+    onPreviews?.(cards && live.joined);
+    return () => onPreviews?.(false);
+  }, [cards, live.joined, onPreviews]);
 
   // Quem está assistindo uma live (só gente que está no canal), com "Você" para a própria pessoa.
   const viewersOf = (key: string) =>
@@ -219,7 +229,7 @@ export function Stage({
         )}
       </header>
       <div className="stage-area" ref={area}>
-        {shown.length === 0 && active.length > 0 ? (
+        {cards ? (
           // Como no Discord: cada live do canal vira um cartão, com quem transmite, o que é, há quanto
           // tempo está no ar e quantos estão assistindo.
           <div className="live-cards">
@@ -237,6 +247,7 @@ export function Stage({
                     title={own ? 'Ver a sua prévia' : 'Assistir a live de ' + name}
                     onClick={() => toggle(key)}
                   >
+                    {live.previews?.[key] && <img className="live-card-preview" src={live.previews[key]} alt="" />}
                     <span className="live-card-head">
                       <Avatar photo={photoOf?.(id)} name={own ? nameOf(id) : name} />
                       <span className="live-card-text">

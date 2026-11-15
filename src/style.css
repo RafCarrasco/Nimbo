@@ -900,6 +900,40 @@ h2 {
   background: var(--surface-2);
   border-color: rgba(124, 108, 255, 0.55);
 }
+.live-card-preview {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--panel);
+}
+.live-peek {
+  position: fixed;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 276px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+.live-peek img {
+  display: block;
+  width: 100%;
+  border-radius: 6px;
+}
+.live-peek small {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .live-card-head {
   display: flex;
   align-items: center;

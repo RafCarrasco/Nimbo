@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ChevronDown,
   ChevronRight,
@@ -11,10 +11,35 @@ import {
   Video,
 } from 'lucide-react';
 import { Avatar } from './Avatar';
-import { categoryAllowed, channelAllowed, isStaff, type AccessLevel } from '../community';
+import { categoryAllowed, channelAllowed, isStaff, loadPreviews, type AccessLevel } from '../community';
+import { validPreview } from '../live/preview';
 import type { CommunityData, RoomPresence } from '../hooks/useCommunity';
 
 const COLLAPSE_KEY = 'nimbo.collapsed';
+
+// Prévia da live ao lado da barra, enquanto o mouse está em cima de quem transmite (como no Discord).
+// A foto é lida do banco só nessa hora.
+function LivePeek({ channelId, memberId, name, anchor }: { channelId: string; memberId: string; name: string; anchor: DOMRect }) {
+  const [images, setImages] = useState<string[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void loadPreviews(channelId, memberId).then((kinds) => {
+      if (alive) setImages(['screen', 'camera'].map((kind) => kinds[kind]).filter(validPreview));
+    });
+    return () => {
+      alive = false;
+    };
+  }, [channelId, memberId]);
+  if (!images?.length) return null;
+  return (
+    <div className="live-peek" style={{ left: anchor.right + 10, top: Math.max(8, Math.min(anchor.top - 8, innerHeight - 190 * images.length)) }}>
+      {images.map((src) => (
+        <img key={src.slice(-24)} src={src} alt="" />
+      ))}
+      <small>{name} · clique para assistir</small>
+    </div>
+  );
+}
 
 export function Sidebar({
   uid,
@@ -55,6 +80,15 @@ export function Sidebar({
       return {};
     }
   });
+  // Quem está com o mouse em cima (e ao vivo), para mostrar a prévia depois de um instante.
+  const [peek, setPeek] = useState<{ channelId: string; memberId: string; name: string; anchor: DOMRect } | null>(null);
+  const peekTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const hover = (target: typeof peek) => {
+    clearTimeout(peekTimer.current);
+    if (!target) setPeek(null);
+    else peekTimer.current = setTimeout(() => setPeek(target), 350);
+  };
+  useEffect(() => () => clearTimeout(peekTimer.current), []);
   const toggle = (id: string) =>
     setCollapsed((old) => {
       const next = { ...old, [id]: !old[id] };
@@ -209,7 +243,21 @@ export function Sidebar({
                                   className={'participant' + (stream ? ' is-live' : '')}
                                   disabled={!stream || !allowed}
                                   title={stream ? 'Assistir' : undefined}
-                                  onClick={() => onWatch(id, memberId)}
+                                  onClick={() => {
+                                    hover(null);
+                                    onWatch(id, memberId);
+                                  }}
+                                  onMouseEnter={(e) =>
+                                    stream &&
+                                    allowed &&
+                                    hover({
+                                      channelId: id,
+                                      memberId,
+                                      name: profileName || 'Participante',
+                                      anchor: e.currentTarget.getBoundingClientRect(),
+                                    })
+                                  }
+                                  onMouseLeave={() => hover(null)}
                                 >
                                   <Avatar photo={data.avatars[memberId]} name={name} small />
                                   <span className="participant-name" style={{ color: colorOf(memberId) }}>
@@ -246,6 +294,7 @@ export function Sidebar({
         })}
       </div>
       {footer}
+      {peek && <LivePeek {...peek} />}
     </nav>
   );
 }
