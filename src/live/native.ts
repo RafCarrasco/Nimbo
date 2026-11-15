@@ -36,7 +36,10 @@ export function nativeOutdated(app: string | undefined) {
 export const nativeMedia = desktop?.media;
 
 // Prévia local de cada live nativa: é uma conexão de espectador com o próprio motor.
-const previews = new WeakMap<MediaStream, { pc: RTCPeerConnection; id: number; sound: boolean }>();
+const previews = new WeakMap<MediaStream, { pc: RTCPeerConnection; id: number; sound: boolean; game: string }>();
+// Nome do jogo transmitido (só quando a fonte escolhida é um jogo: título de janela qualquer pode
+// expor o que a pessoa não quis mostrar).
+export const nativeGame = (stream: MediaStream) => previews.get(stream)?.game || '';
 // A live nativa leva som? Vai no anúncio da live: quem assiste só pede áudio se houver.
 export const nativeSound = (stream: MediaStream) => Boolean(previews.get(stream)?.sound);
 // Quantas prévias estão abertas: uma troca de fonte que falha não pode derrubar a live que já está no ar.
@@ -100,7 +103,8 @@ export async function captureScreenNative(quality: NativeQuality, audio: AudioMo
     if (!answer.ok) throw new Error(answer.error);
     await pc.setRemoteDescription(JSON.parse(answer.value.answer) as RTCSessionDescriptionInit);
     const stream = new MediaStream([await track]);
-    previews.set(stream, { pc, id: answer.value.id, sound: Boolean(sound) });
+    const game = chosen?.game ? (chosen.title || '').trim().slice(0, 48) : '';
+    previews.set(stream, { pc, id: answer.value.id, sound: Boolean(sound), game });
     activePreviews++;
     followCapture(stream, chosen?.title || 'Tela', Boolean(watched) && source !== null && 'monitor' in source, Boolean(chosen?.game));
     return stream;

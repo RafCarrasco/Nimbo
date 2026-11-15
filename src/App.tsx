@@ -95,6 +95,11 @@ function Community({ uid }: { uid: string }) {
     autoOpen.current.until = 0;
     setVisible((ids) => [...new Set([...ids, ...keys])].slice(0, 4));
   }, [keysOf]);
+  // A plateia de cada live: avisa ao canal o que está aberto no palco (só lives que estão no ar).
+  const { watch } = live;
+  useEffect(() => {
+    watch(snapshot.joined ? visible.filter((key) => keysOf().includes(key)) : []);
+  }, [watch, snapshot.joined, visible, keysOf]);
   const [adminOpen, setAdminOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   // Barra lateral escondida (no computador), para a live ocupar a janela inteira. Fica guardado.
@@ -353,6 +358,7 @@ function Community({ uid }: { uid: string }) {
             visible={visible}
             setVisible={setVisible}
             nameOf={nameOf}
+            photoOf={(id) => data.avatars[id]}
             onRetry={live.retry}
             lead={sidebarToggle}
           />

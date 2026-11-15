@@ -9,6 +9,10 @@ O mesmo React deve renderizar os canais e perfis no Electron e no navegador.
 - `community/channels/{channelId}`: metadados dos canais gerenciáveis.
 - `community/roles/{uid}`: owner/admin/member. Apenas owner concede admin.
 - `rooms/{channelId}`: presença de sessão, ofertas, ICE e lives WebRTC.
+  - `streams/{uid}/{screen|camera}`: a live anunciada. `startedAt` é na hora do servidor (o tempo no ar sai
+    certo mesmo com o relógio de alguém errado); `game` é o nome do jogo, só quando a fonte é um jogo.
+  - `watching/{quem assiste}/{quem transmite}/{screen|camera}`: a plateia de cada live. Cada pessoa escreve só
+    a própria e ela some quando a conexão cai.
 - `community/access/{channelId}/{uid}`: futura lista de acesso por canal.
 - Canais padrão: geral e competitivo.
 
