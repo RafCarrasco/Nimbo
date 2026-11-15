@@ -12,6 +12,9 @@ const id = fs.readFileSync(new URL('./run.txt', import.meta.url), 'utf8').trim()
 // Modo "revq": fora os servidores STUN, o que sai por UDP morre depois de poucos saltos nos
 // primeiros segundos: abre a passagem deste lado sem chegar ao roteador do outro lado.
 const quiet = fs.readFileSync(new URL('./run.txt', import.meta.url), 'utf8').trim().startsWith('revq');
+// Modo "revh": a oferta chega sem endereços; eles vêm depois, num arquivo à parte. Até lá este lado
+// não tem para onde mandar testes de caminho, então quem ofereceu manda primeiro.
+const hold = fs.readFileSync(new URL('./run.txt', import.meta.url), 'utf8').trim().startsWith('revh');
 const out = execSync("ip route show default | awk '{print $5; exit}'").toString().trim();
 const rule = `-o ${out} -p udp -m multiport ! --dports 53,3478,19302 -j TTL --ttl-set ${process.env.QUIET_TTL || 3}`;
 if (quiet) execSync(`sudo iptables -t mangle -A POSTROUTING ${rule}`);
@@ -85,7 +88,26 @@ try {
     body: JSON.stringify({ message: `test: answers ${id}`, branch, content: Buffer.from(seal(JSON.stringify(answers))).toString('base64') }),
   });
   if (!put.ok) throw new Error(`não deu para publicar as respostas: ${put.status}`);
-  console.log(quiet ? 'respostas publicadas; este lado fica quieto por 9 s' : 'respostas publicadas; este lado já está mandando testes de caminho');
+  console.log(quiet ? 'respostas publicadas; este lado fica quieto por 9 s' : hold ? 'respostas publicadas; este lado ainda não tem os endereços do outro' : 'respostas publicadas; este lado já está mandando testes de caminho');
+  if (hold) {
+    let ices = null;
+    for (let i = 0; i < 60 && !ices; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const got = await fetch(`${base}/ice-${id}.enc?ref=${branch}`, { headers, cache: 'no-store' });
+      if (got.ok) ices = JSON.parse(open(Buffer.from((await got.json()).content, 'base64').toString('utf8')));
+    }
+    if (!ices) throw new Error('os endereços do lado local não chegaram');
+    const added = await page.evaluate(async (all) => {
+      let n = 0;
+      for (const [name, list] of Object.entries(all))
+        for (const c of list) {
+          await window.pcs[name].pc.addIceCandidate(c).then(() => n++, () => {});
+        }
+      for (const name of Object.keys(all)) window.pcs[name].states.push('enderecos do outro lado aplicados');
+      return n;
+    }, ices);
+    console.log('endereços do lado local aplicados:', added);
+  }
   if (quiet)
     setTimeout(() => {
       execSync(`sudo iptables -t mangle -D POSTROUTING ${rule}`);
