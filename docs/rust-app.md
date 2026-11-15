@@ -329,6 +329,10 @@ tela de 144 Hz de verdade (o teste de unidade cobre 72 a 240 Hz, e a conta dá 6
 - **Quem assiste** (site, celular, app antigo ou novo): ao ver `native: true`, abre uma conexão só de
   recepção direto com o motor. As regras do banco não mudam: oferta e resposta usam o caminho de
   sinalização que já existe, com um campo `native`.
+- **Som, o padrão**: no app, só o som do jogo ou programa escolhido ("Jogo ou janela"); ao transmitir a tela
+  inteira, o som do computador. Era "Computador" até 15/11/2026, quando a voz de quem estava na chamada com quem
+  transmitia entrou na live e a pessoa passou a se ouvir. Quem estava no padrão antigo é trocado uma vez ao abrir
+  (`src/live/audioDefault.ts`).
 - **Som**: o motor captura o som do computador (menos o do próprio Nimbo) ou só o do programa escolhido, codifica
   em Opus uma vez e manda na mesma conexão do vídeo. O anúncio da live leva `sound: true`, e só então quem assiste
   pede áudio.

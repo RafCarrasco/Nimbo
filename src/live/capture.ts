@@ -1,5 +1,6 @@
 import { desktop, desktopAudioTrack, watchGameFor } from '../desktop';
 import { captureScreenNative, nativeMedia } from './native';
+import { defaultAudio, migrateAudio } from './audioDefault';
 
 export type StreamKind = 'screen' | 'camera';
 export type CaptureSurface = 'monitor' | 'window';
@@ -15,13 +16,24 @@ export const DEFAULT_CAPTURE: CaptureSettings = {
   surface: 'monitor',
   quality: 1080,
   frameRate: 60,
-  audio: 'system',
+  // No app: só o som do jogo ou programa escolhido. No navegador: o som do computador (audioDefault.ts).
+  audio: defaultAudio(Boolean(nativeMedia)),
 };
 
 const SETTINGS_KEY = 'nimbo.capture';
+// Marca que este aparelho já passou para o padrão novo de som (ver audioDefault.ts).
+const AUDIO_DEFAULT_KEY = 'nimbo.capture.audioDefault';
 export function loadCaptureSettings(): CaptureSettings {
   try {
-    return { ...DEFAULT_CAPTURE, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
+    const settings: CaptureSettings = { ...DEFAULT_CAPTURE, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
+    const migrated = localStorage.getItem(AUDIO_DEFAULT_KEY) === '2';
+    const audio = migrateAudio(settings.audio, Boolean(nativeMedia), migrated);
+    if (!migrated) localStorage.setItem(AUDIO_DEFAULT_KEY, '2');
+    if (audio !== settings.audio) {
+      settings.audio = audio;
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    }
+    return settings;
   } catch {
     return DEFAULT_CAPTURE;
   }
