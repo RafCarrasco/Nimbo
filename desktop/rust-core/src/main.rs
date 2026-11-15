@@ -4,6 +4,8 @@
 //!   no site) e imprime cada mudança dos caminhos, uma linha de JSON por vez.
 //! - `nimbo-core sidebar <conta> [segundos]`: imprime a barra lateral que essa conta enxerga (categorias,
 //!   canais e quem está em cada um), para comparar com o site.
+//! - `nimbo-core probe`: abre a conexão com o banco de verdade, sem conta: confere o caminho de rede
+//!   (TLS, boas-vindas, troca de máquina) e que as regras recusam quem não entrou. Não lê nem grava nada.
 //! - `nimbo-core selftest`: confere o protocolo contra o emulador (ver `selftest.rs`).
 
 mod selftest;
@@ -19,8 +21,9 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("watch") if args.len() >= 3 => watch(&args[1], &args[2..]),
         Some("sidebar") if args.len() >= 2 => sidebar(&args[1], args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3)),
+        Some("probe") => probe(),
         Some("selftest") => selftest::run(),
-        _ => Err("uso: nimbo-core watch <conta> <caminho>... | nimbo-core sidebar <conta> [segundos] | nimbo-core selftest".into()),
+        _ => Err("uso: nimbo-core watch <conta> <caminho>... | nimbo-core sidebar <conta> [segundos] | nimbo-core probe | nimbo-core selftest".into()),
     };
     if let Err(e) = result {
         eprintln!("{e}");
@@ -91,4 +94,41 @@ fn sidebar(name: &str, seconds: u64) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Conexão com o banco de verdade, sem login: tem de conectar e ter a leitura recusada pelas regras.
+fn probe() -> Result<(), Box<dyn std::error::Error>> {
+    use nimbo_core::rtdb::Status;
+    use std::sync::mpsc::channel;
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let db = Db::connect(&Project::production());
+    let (tx, status) = channel();
+    db.on_status(move |s| drop(tx.send(s.clone())));
+    loop {
+        match status.recv_timeout(Duration::from_secs(20)) {
+            Ok(Status::Connected(true)) => break,
+            Ok(_) => {}
+            Err(_) => return Err("não conectou ao banco de verdade em 20 s".into()),
+        }
+    }
+    let connected = started.elapsed();
+    let (tx, events) = channel();
+    db.listen("community/turn", move |event| drop(tx.send(event.clone())));
+    let answer = events.recv_timeout(Duration::from_secs(10)).map_err(|_| "o servidor não respondeu à leitura")?;
+    let offset = db.server_now_ms() - std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+    println!(
+        "{}",
+        serde_json::json!({
+            "conectou_em_ms": connected.as_millis() as u64,
+            "leitura_sem_login": match &answer { Event::Denied(reason) => format!("recusada ({reason})"), Event::Value(_) => "ENTREGUE (não deveria)".into() },
+            "relogio_do_servidor_menos_o_local_ms": offset,
+        })
+    );
+    db.close();
+    match answer {
+        Event::Denied(_) => Ok(()),
+        Event::Value(_) => Err("as regras deixaram ler sem login".into()),
+    }
 }
