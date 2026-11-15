@@ -28,6 +28,9 @@ jobs:
           mode=$(cut -d' ' -f1 run.txt)
           if [ "$mode" = "sym" ]; then
             # Porta de saída sorteada a cada destino: o que um NAT simétrico faz.
-            sudo iptables -t nat -A POSTROUTING -p udp -j MASQUERADE --random-fully
+            # Só na placa que sai para a internet e sem tocar no DNS: aplicada a tudo, a regra
+            # quebrou a resolução de nomes do próprio servidor e o teste travou.
+            out=$(ip route show default | awk '{print $5; exit}')
+            sudo iptables -t nat -A POSTROUTING -o "$out" -p udp ! --dport 53 -j MASQUERADE --random-fully
           fi
           if [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
