@@ -2,15 +2,56 @@
 <meta charset="utf-8" />
 <title>Nimbo Rust: teste de envio</title>
 <body style="margin:0;background:#111;color:#ddd;font:14px system-ui">
+  <!-- muted: esta página nunca toca o som da live. O som é recebido e decodificado do mesmo jeito,
+       então as estatísticas de áudio valem. -->
   <video id="v" autoplay muted playsinline style="width:100vw;max-height:90vh;background:#000"></video>
-  <pre id="s" style="margin:8px">conectando...</pre>
+  <pre id="s" style="margin:8px;white-space:pre-wrap">conectando...</pre>
   <script>
     window.nimboStats = { estado: 'iniciando' };
     (async () => {
       const pc = new RTCPeerConnection();
       pc.addTransceiver('video', { direction: 'recvonly' });
-      pc.ontrack = (e) => (document.getElementById('v').srcObject = new MediaStream([e.track]));
-      await pc.setLocalDescription();
+      // Com ?semaudio a página pede só o vídeo, como um espectador antigo.
+      if (!new URLSearchParams(location.search).has('semaudio'))
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      // Vídeo e som no mesmo elemento: o navegador toca os dois juntos. `streams` guarda o
+      // identificador de stream de cada faixa; tem de ser um só para haver sincronia.
+      const media = new MediaStream();
+      const streams = new Set();
+      document.getElementById('v').srcObject = media;
+      // Medidor do som recebido, por canal [esquerdo, direito]: lê as amostras sem ligar nada às
+      // caixas de som. Com o elemento mudo, o nível das estatísticas do navegador é sempre zero.
+      let meter = null;
+      const listen = (track) => {
+        const ctx = new AudioContext();
+        const split = ctx.createChannelSplitter(2);
+        ctx.createMediaStreamSource(new MediaStream([track])).connect(split);
+        const taps = [0, 1].map((channel) => {
+          const tap = ctx.createAnalyser();
+          tap.fftSize = 2048;
+          split.connect(tap, channel);
+          return tap;
+        });
+        const samples = new Float32Array(2048);
+        meter = { agora: [0, 0], maximo: [0, 0] };
+        setInterval(() => {
+          taps.forEach((tap, channel) => {
+            tap.getFloatTimeDomainData(samples);
+            const peak = samples.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+            meter.agora[channel] = Math.max(meter.agora[channel], peak);
+            meter.maximo[channel] = Math.max(meter.maximo[channel], peak);
+          });
+        }, 40);
+      };
+      pc.ontrack = (e) => {
+        media.addTrack(e.track);
+        e.streams.forEach((s) => streams.add(s.id));
+        if (e.track.kind === 'audio') listen(e.track);
+      };
+      const offer = await pc.createOffer();
+      // Sem stereo=1 no próprio pedido o Chrome mistura o Opus recebido em mono.
+      offer.sdp = offer.sdp.replace(/useinbandfec=1/g, 'useinbandfec=1;stereo=1');
+      await pc.setLocalDescription(offer);
       await new Promise((r) =>
         pc.iceGatheringState === 'complete'
           ? r()
@@ -30,10 +71,13 @@
       await pc.setRemoteDescription(await res.json());
       setInterval(async () => {
         let o = { estado: pc.connectionState };
-        (await pc.getStats()).forEach((r) => {
-          if (r.type === 'inbound-rtp' && r.kind === 'video')
+        const stats = await pc.getStats();
+        stats.forEach((r) => {
+          if (r.type !== 'inbound-rtp') return;
+          const codec = stats.get(r.codecId) || {};
+          if (r.kind === 'video')
             o = {
-              estado: pc.connectionState,
+              ...o,
               quadros: r.framesDecoded,
               fps: r.framesPerSecond,
               tamanho: r.frameWidth + 'x' + r.frameHeight,
@@ -41,7 +85,28 @@
               kb: Math.round(r.bytesReceived / 1024),
               perdidos: r.packetsLost,
             };
+          if (r.kind === 'audio')
+            o.audio = {
+              codec: codec.mimeType,
+              canais: codec.channels,
+              fmtp: codec.sdpFmtpLine,
+              pacotes: r.packetsReceived,
+              bytes: r.bytesReceived,
+              perdidos: r.packetsLost,
+              // Amostras decodificadas, e quantas delas o navegador inventou por falta de pacote.
+              amostras: r.totalSamplesReceived,
+              disfarcadas: r.concealedSamples,
+              // Do navegador; ficam em zero enquanto o elemento estiver mudo.
+              nivel: r.audioLevel,
+              energia: r.totalAudioEnergy,
+              // Do medidor acima: pico (0 a 1) de cada canal no último segundo e desde o início.
+              pico: meter && meter.agora.map((v) => +v.toFixed(6)),
+              picoMaximo: meter && meter.maximo.map((v) => +v.toFixed(6)),
+              // Um só identificador: o navegador sincroniza o som com o vídeo.
+              mesmoStream: streams.size === 1,
+            };
         });
+        if (meter) meter.agora = [0, 0];
         window.nimboStats = o;
         document.getElementById('s').textContent = JSON.stringify(o);
       }, 1000);

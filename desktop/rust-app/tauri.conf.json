@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Nimbo Beta",
+  "mainBinaryName": "nimbo-beta",
+  "identifier": "app.nimbo.rust",
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["../icon.ico"],
+    "publisher": "Nimbo",
+    "shortDescription": "Nimbo Beta",
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper" },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "../icon.ico",
+        "languages": ["PortugueseBR"],
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "TROQUE-PELA-CHAVE-PUBLICA-ANTES-DO-PRIMEIRO-RELEASE (desktop/rust-app/README.md)",
+      "endpoints": ["https://github.com/RafCarrasco/Nimbo/releases/download/rust-beta/latest-beta.json"],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "quiet"
+      }
+    }
+  }
+}

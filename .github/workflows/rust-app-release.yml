@@ -1,0 +1,76 @@
+name: Nimbo Beta installer (Rust app)
+# Gera o instalador do app em Rust ("Nimbo Beta") e o manifesto de atualização e os deixa como
+# artefatos deste workflow. Não cria Release nem tag e não publica nada: quem publica é o dono,
+# à mão, no Release fixo `rust-beta` (passo a passo em desktop/rust-app/README.md).
+# Só roda quando alguém clica em "Run workflow".
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: rust-app-release
+  cancel-in-progress: false
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: desktop/rust-app
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Antes de compilar: sem as duas chaves o instalador sairia sem assinatura de atualização.
+      - name: Conferir os secrets de assinatura
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $missing = @('TAURI_SIGNING_PRIVATE_KEY', 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD') |
+            Where-Object { -not [Environment]::GetEnvironmentVariable($_) }
+          if ($missing) {
+            Write-Host "::error::Faltam os secrets do repositório: $($missing -join ', '). Crie a chave de atualização e cadastre os dois em Settings > Secrets and variables > Actions (desktop/rust-app/README.md)."
+            exit 1
+          }
+      # O libopus do motor de mídia é compilado pelo CMake (desktop/.cargo/config.toml pede o
+      # gerador do Visual Studio 2022). A imagem do GitHub costuma trazer o CMake no PATH; se não
+      # trouxer, usa o que vem com o Visual Studio. Sem nenhum dos dois, para aqui com aviso claro.
+      - name: Conferir o CMake
+        run: |
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+            $studio = if (Test-Path $vswhere) { & $vswhere -latest -products * -property installationPath }
+            $bin = if ($studio) { Join-Path $studio 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin' }
+            if (-not $bin -or -not (Test-Path (Join-Path $bin 'cmake.exe'))) {
+              Write-Host '::error::CMake não encontrado nesta imagem. O motor de mídia (libopus) precisa dele para compilar.'
+              exit 1
+            }
+            Add-Content $env:GITHUB_PATH $bin
+            $env:PATH = "$bin;$env:PATH"
+          }
+          cmake --version
+      # rust-toolchain.toml fixa a versão; isto só instala o que ele pede.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/rust-app
+      # Mesma versão usada para validar o instalador e a atualização (README.md).
+      - name: Instalar o tauri-cli
+        run: cargo install tauri-cli --version "2.12.4" --locked
+      - run: cargo test --locked --release
+      - name: Instalador e manifesto
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/pack.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nimbo-beta-installer
+          path: |
+            desktop/rust-app/release/Nimbo-Beta-Setup.exe
+            desktop/rust-app/release/Nimbo-Beta-Setup.exe.sig
+            desktop/rust-app/release/latest-beta.json
+          if-no-files-found: error
+          retention-days: 14

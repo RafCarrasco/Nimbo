@@ -1,5 +1,24 @@
 // Ponte com o app Nimbo para Windows (desktop/preload.cjs). No navegador `desktop` é undefined.
-type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+export type Result<T> = { ok: true; value: T } | { ok: false; error: string };
+
+// Uma tela ou janela que o app em Rust consegue transmitir (seletor em components/SourcePicker.tsx).
+export type NativeSource = {
+  // Opaco; não muda enquanto o seletor está aberto.
+  id: string;
+  kind: 'screen' | 'window';
+  // "Tela 1" ou o título da janela.
+  title: string;
+  // Nome do executável sem extensão; vazio para telas.
+  app: string;
+  minimized: boolean;
+  fullscreen: boolean;
+  // Parece um jogo: aparece primeiro na lista.
+  game: boolean;
+  // O que entregar ao media.start.
+  source: { monitor: number } | { window: number };
+  // Processo dono da janela, para o áudio do jogo.
+  pid?: number;
+};
 
 type DesktopBridge = {
   version: number;
@@ -22,18 +41,34 @@ type DesktopBridge = {
   onGameEnded?(id: string, onEnded: () => void): () => void;
   // Só no app em Rust: o motor nativo captura, codifica uma vez e envia para todos (live/native.ts).
   engine?: 'rust';
+  // Versão do app em Rust (o user agent dele não informa).
+  appVersion?: string;
   media?: {
     // source nulo = tela principal. Chamar de novo troca a fonte sem derrubar quem assiste.
     start(
       source: { monitor: number } | { window: number } | null,
       quality: { fps: number; bitrate: number; maxHeight: number },
+      // audio: "system" = tudo menos o próprio Nimbo; { app: pid } = só aquele programa; sem o campo, sem som.
+      // watch: processo do jogo, para saber quando ele sai da frente ou fecha (ver state).
+      options?: { audio?: 'system' | { app: number }; watch?: number },
     ): Promise<Result<null>>;
+    // Live pausada: quem assiste vê uma tela escura no lugar da captura.
+    pause?(paused: boolean): Promise<Result<null>>;
+    // capturing: a fonte ainda existe. foreground: o jogo vigiado está na frente (null = não se sabe
+    // ou não há jogo vigiado). ended: o processo do jogo terminou.
+    state?(): Promise<Result<{ capturing: boolean; foreground: boolean | null; ended: boolean }>>;
     // Oferta WebRTC de um espectador (JSON) → identificador da conexão e resposta (JSON).
     accept(offer: string): Promise<Result<{ id: number; answer: string }>>;
     close(id: number): Promise<void>;
     stop(): Promise<void>;
+    // Seletor do que transmitir. Sem `sources` (app mais antigo) a live usa a tela principal.
+    sources?(): Promise<Result<NativeSource[]>>;
+    // Imagens em data URL, pedidas uma a uma. Miniatura nula = não deu para capturar (minimizada etc.).
+    thumbnail?(id: string): Promise<Result<string | null>>;
+    icon?(id: string): Promise<Result<string | null>>;
   };
 };
+export type NativeMedia = NonNullable<DesktopBridge['media']>;
 
 export const desktop = (window as { nimboDesktop?: DesktopBridge }).nimboDesktop;
 
@@ -138,6 +173,20 @@ export type GameWatch = {
 const gameWatches = new WeakMap<MediaStream, GameWatch>();
 export const gameWatchOf = (stream: MediaStream) => gameWatches.get(stream);
 
+// Liga a vigia à live: o resto do app a encontra por gameWatchOf, e ela para junto com o vídeo.
+export function attachGameWatch(stream: MediaStream, watch: GameWatch) {
+  gameWatches.set(stream, watch);
+  const video = stream.getVideoTracks()[0];
+  if (video) {
+    const stop = video.stop.bind(video);
+    video.stop = () => {
+      stop();
+      watch.stop();
+    };
+    video.addEventListener('ended', watch.stop);
+  }
+}
+
 export async function watchGameFor(stream: MediaStream) {
   if (!desktop?.startGameWatch || !desktop.onGameState) return;
   const started = await desktop.startGameWatch();
@@ -178,14 +227,5 @@ export async function watchGameFor(stream: MediaStream) {
       void desktop?.stopGameWatch?.(id);
     },
   };
-  gameWatches.set(stream, watch);
-  const video = stream.getVideoTracks()[0];
-  if (video) {
-    const stop = video.stop.bind(video);
-    video.stop = () => {
-      stop();
-      watch.stop();
-    };
-    video.addEventListener('ended', watch.stop);
-  }
+  attachGameWatch(stream, watch);
 }

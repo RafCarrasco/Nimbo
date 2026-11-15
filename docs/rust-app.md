@@ -47,6 +47,8 @@ banda, mesma cena, 1920x1080 a 8 Mbps:
 - A taxa de bits muda com a live no ar (pedido de 8 para 2 Mbps: a média caiu de 6,4 para 3,9 Mbps em 4 s).
 - Os 48 quadros/s são o limite da cena de teste. O número do Electron inclui desenhar a cena de teste.
 - Não medido: uso da GPU, máquinas Intel/AMD, rede real com perda.
+- Em 14/11, com som e as correções da revisão: 5 espectadores em 1920x1080 a ~40 quadros/s, som sem perda,
+  6% a 14% de um núcleo. A banda alvo ficou em 8 Mbps depois de 12 s de tela parada (antes caía para 1,3 Mbps).
 
 Conclusões:
 
@@ -102,20 +104,43 @@ o Rust assume justamente a captura e o envio.
 
 ## Etapas
 
-O Electron continua sendo o app distribuído até a última etapa. Estado em 12/11/2026:
+O Electron continua sendo o app distribuído até a última etapa. Estado em 14/11/2026:
 
 | # | Entrega | Estado |
 |---|---|---|
 | 1 | Captura nativa de tela/janela | **Feito** (`desktop/rust-media`) |
-| 2 | Codificação H.264 pela placa, uma só | **Feito**: direto na GPU, 0,25 ms por quadro |
+| 2 | Codificação H.264 pela placa, uma só | **Feito**: direto na GPU; o quadro sai ~3 ms depois de entregue |
 | 3 | Envio WebRTC em Rust | **Feito**: 1080p, com controle de banda |
 | 4 | Vários espectadores com 1 codificador | **Feito**: 8 abas em 1080p, nenhum pacote perdido |
-| 5a | Sinalização: o site conecta quem assiste ao motor de quem transmite | **Feito e testado no emulador** (`src/live/native.ts`): a segunda conta assistiu 1920x1080 a 48 quadros/s |
-| 5b | Janela do app (Tauri) com a interface do site e a ponte | Em andamento (`desktop/rust-app`) |
-| 6a | Áudio do jogo capturado em Rust | **Feito** (`desktop/rust-audio`): mesmo formato do programa atual; falta ligar no envio (Opus) |
-| 6b | Lista de janelas, tela cheia e vigia do jogo | **Feito** (`desktop/rust-native`): saída idêntica à do programa atual em 148 janelas |
-| 6c | Seletor de tela (miniaturas e ícones), pausa no Alt+Tab, fim da live ao fechar o jogo, login | Em andamento |
-| 7 | Instalador, atualização automática, beta lado a lado e a troca | Não começou |
+| 5a | Sinalização: o site conecta quem assiste ao motor de quem transmite | **Feito** (`src/live/native.ts`), revisado e corrigido |
+| 5b | Janela do app (Tauri) com a interface do site e a ponte | **Feito** (`desktop/rust-app`): live de verdade testada no emulador |
+| 6a | Som do jogo, capturado e enviado junto com o vídeo | **Feito** (`desktop/rust-audio` + Opus no motor): quem assiste recebe a faixa de áudio |
+| 6b | Lista de janelas, tela cheia e vigia do jogo | **Feito** (`desktop/rust-native`) |
+| 6c | Seletor "o que transmitir", com miniaturas e ícones | **Feito** (`src/components/SourcePicker.tsx`) |
+| 6d | Pausa (tela escura para quem assiste) e fim da live quando o jogo ou a janela fecha | **Feito no motor e no app**; a pausa foi vista por quem assiste. Não testado com jogo de verdade |
+| 6e | Login pelo navegador | **Feito** com credenciais de teste; falta um login real do Google |
+| 7a | Instalador "Nimbo Beta" e atualização automática assinada | **Feito e testado localmente** (instalar, atualizar de uma versão para outra, relançar). Falta a chave real e o primeiro Release |
+| 7b | Beta com os amigos, lado a lado com o app atual | Não começou |
+| 7c | Troca: o app em Rust vira o Nimbo | Não começou |
+
+### O que falta antes do beta (7b)
+
+1. Criar a chave de atualização e cadastrar os dois segredos no GitHub (passo a passo em `desktop/rust-app/README.md`).
+2. Rodar o workflow "Nimbo Beta installer" pela primeira vez e publicar no Release fixo `rust-beta`.
+3. Publicar o site com a parte de lives nativas (sem ela, quem assiste não conecta no app em Rust).
+4. Testar com jogo de verdade: som, tela cheia, Alt+Tab, anticheat (CS2, Valorant).
+5. Testar com alguém em outra rede e com o servidor de retransmissão (TURN).
+6. Decidir a numeração: o beta está em 0.1.0 e as novidades do site usam a versão do Electron (0.4.x).
+
+### Defeitos conhecidos e otimizações pendentes
+
+- **CPU do envio subiu depois das correções**: com 5 espectadores e som, 6% a 14% de um núcleo (antes, sem som e
+  com o defeito do quadro atrasado, 0,3% a 3%). O motor consulta a saída do codificador a cada 0,5 ms; esperar pelo
+  aviso do próprio codificador resolve.
+- **Um espectador com rede ruim segura a qualidade de todos** (codificador único). Saída planejada: dois níveis.
+- **Sem retransmissão própria**: o motor não usa TURN; quem assiste usa o dele. Não testado fora da rede local.
+- **Cor da tela de pausa** chega um pouco diferente da cor do site (conversão de cor na placa).
+- **Só NVIDIA foi testado.** Intel, AMD e a reserva por software compilam, mas não rodaram.
 
 ## Como as peças se ligam
 
@@ -125,6 +150,11 @@ O Electron continua sendo o app distribuído até a última etapa. Estado em 12/
 - **Quem assiste** (site, celular, app antigo ou novo): ao ver `native: true`, abre uma conexão só de
   recepção direto com o motor. As regras do banco não mudam: oferta e resposta usam o caminho de
   sinalização que já existe, com um campo `native`.
+- **Som**: o motor captura o som do computador (menos o do próprio Nimbo) ou só o do programa escolhido, codifica
+  em Opus uma vez e manda na mesma conexão do vídeo. O anúncio da live leva `sound: true`, e só então quem assiste
+  pede áudio.
+- **Pausa e fim**: a página consulta o estado do app (`media.state`) uma ou duas vezes por segundo. Jogo em tela
+  cheia que sai da frente pausa a live (o motor manda uma tela escura); jogo que fecha encerra a live.
 - **Webcam** continua pelo navegador embutido, como hoje.
 
 ## Riscos
@@ -135,8 +165,9 @@ O Electron continua sendo o app distribuído até a última etapa. Estado em 12/
 - **Jogos em tela cheia exclusiva e anticheat.** O Windows Graphics Capture tem os mesmos limites
   do Chromium; não piora, mas também não resolve sozinho.
 - **Máquina sem codificador na placa.** Precisa de um codificador por software (OpenH264) de reserva.
-- **Troca de app.** Quem tem o Electron instalado precisa migrar. O instalador novo usa o mesmo
-  identificador para substituir o antigo sem pedir desinstalação.
+- **Troca de app.** O beta é instalado ao lado do app atual, com outro nome ("Nimbo Beta"), outro identificador e
+  outro canal de atualização (Release fixo `rust-beta`), para um nunca interferir no outro. Como migrar quem tem o
+  Electron, na troca final, ainda está por decidir.
 - **Um espectador com rede ruim segura a qualidade de todos**, porque o codificador é um só. Quem cai sem
   avisar deixa de contar depois de 2 s; rede ruim de verdade ainda afeta a todos. Saída planejada: dois níveis.
 - **AdGuard e filtros de rede locais** cortam conexões HTTP locais ao acaso (visto nesta máquina). O app
