@@ -8,6 +8,11 @@ export const CHANGELOG: Release[] = [
     date: '15/11/2026',
     items: [
       'Lives de tela pelo app agora saem a 60 quadros por segundo de verdade. Antes, numa tela de 144 Hz a live saía a 48, e numa de 75 Hz a 37: o app descartava quadros a mais.',
+      'Em cima de cada live: há quanto tempo está no ar, quem está assistindo e a resolução e os quadros que estão chegando.',
+      'Janela flutuante: tire a live para uma janelinha que fica por cima dos outros programas (botão ao lado da tela cheia). Duplo clique na live abre a tela cheia.',
+      'Prévia das lives: o palco mostra um cartão com a foto de cada live do canal, e parar o mouse em cima de quem está ao vivo mostra a prévia, mesmo antes de entrar no canal.',
+      'Aviso com o botão Assistir quando alguém começa uma live no canal em que você está.',
+      'Webcam e lives de quem transmite pelo site passam a conectar em redes com modem que barra conexão iniciada de fora: depois de uma falha, o Nimbo tenta de novo invertendo quem começa.',
     ],
   },
   {
