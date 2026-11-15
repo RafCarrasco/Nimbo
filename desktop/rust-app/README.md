@@ -54,6 +54,23 @@ Variáveis de ambiente, só para desenvolvimento e teste:
 | `NIMBO_SELFTEST_SCRIPT=<arquivo .js>` | Com a anterior, roda esse roteiro dentro da página no lugar da conferência. |
 | `NIMBO_UPDATE_URL` | Outro endereço do `latest.json`, para testar a atualização (https, ou http só em 127.0.0.1). |
 
+## Sem conexão
+
+A interface é o site dentro do WebView2, então sem internet (ou com o site fora do ar) a janela
+mostraria a página de erro do Edge. No lugar dela o app mostra uma tela própria, "Sem conexão com o
+Nimbo" (`src/offline.rs` e `src/offline.html`): ela confere a cada 5 segundos se o site voltou a
+responder e abre o Nimbo sozinha, ou na hora pelo botão "Tentar de novo". A mesma tela aparece, com
+outro texto, se a página travar e o processo dela for encerrado.
+
+A tela vem de um endereço interno do app (`http://nimbo-offline.localhost/`), que não é a origem do
+Nimbo: não recebe a ponte `nimboDesktop` nem os comandos do app.
+
+Para ver, abra o app apontando para um endereço que não responde:
+
+```powershell
+$env:NIMBO_URL = 'http://127.0.0.1:9/'; cargo run --release --manifest-path desktop/rust-app/Cargo.toml
+```
+
 ## Instalador
 
 ```powershell

@@ -205,6 +205,8 @@ mod tests {
             "https://golive-ad118.web.app:8443/",
             "https://golive-ad118.web.app.evil.invalid/",
             "https://sub.golive-ad118.web.app/",
+            // A tela sem conexão do próprio app (offline.rs) também não é o Nimbo.
+            "http://nimbo-offline.localhost/",
             "about:blank",
             "data:text/html,oi",
         ] {

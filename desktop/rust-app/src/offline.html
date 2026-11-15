@@ -1,0 +1,137 @@
+<!doctype html>
+<!-- Tela do app para quando o site não abre (ver offline.rs). O Rust troca o marcador do endereço. -->
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nimbo</title>
+    <style>
+      /* Mesmas cores do site (src/style.css) e da janela (main.rs). */
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        display: grid;
+        place-items: center;
+        background: #0b1020;
+        color: #e8edf7;
+        font: 14px/1.5 Inter, 'Segoe UI', system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        user-select: none;
+      }
+      main {
+        display: grid;
+        justify-items: center;
+        max-width: 420px;
+        padding: 32px;
+        text-align: center;
+      }
+      img {
+        width: 88px;
+        height: 88px;
+        margin-bottom: 22px;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 20px;
+        font-weight: 600;
+      }
+      p {
+        margin: 0;
+        color: #8d98b0;
+      }
+      button {
+        margin: 24px 0 14px;
+        padding: 10px 20px;
+        border: 0;
+        border-radius: 10px;
+        background: #7c6cff;
+        color: #fff;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #6857f2;
+      }
+      button:focus-visible {
+        outline: 2px solid #e8edf7;
+        outline-offset: 2px;
+      }
+      button:disabled {
+        cursor: default;
+        opacity: 0.45;
+      }
+      #status {
+        min-height: 1.5em;
+        font-size: 12.5px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img src="/icone.png" alt="" width="88" height="88" draggable="false" />
+      <h1 id="title">Sem conexão com o Nimbo</h1>
+      <p id="detail">Não deu para abrir o Nimbo. Confira a sua internet.</p>
+      <button id="retry" type="button">Tentar de novo</button>
+      <p id="status" role="status">O app tenta de novo sozinho a cada 5 segundos.</p>
+    </main>
+    <script>
+      (() => {
+        'use strict';
+        const APP_URL = __NIMBO_APP_URL__;
+        const RETRY_MS = 5000;
+        // Rede lenta ainda conta como resposta; sem nada nesse tempo, a tentativa falhou.
+        const PROBE_TIMEOUT_MS = 15000;
+
+        const retry = document.getElementById('retry');
+        const status = document.getElementById('status');
+        // O app também traz para cá quando a página trava e o processo dela é encerrado.
+        if (location.hash === '#falha') {
+          document.getElementById('title').textContent = 'O Nimbo parou de responder';
+          document.getElementById('detail').textContent = 'A tela travou e precisou ser fechada.';
+          status.textContent = 'O app abre de novo sozinho em instantes.';
+        }
+
+        let leaving = false;
+        // Volta para o Nimbo. Se ainda não der, o app mostra esta tela de novo.
+        const open = () => {
+          if (leaving) return;
+          leaving = true;
+          retry.disabled = true;
+          status.textContent = 'Abrindo o Nimbo…';
+          location.replace(APP_URL);
+        };
+        // Pergunta se o site responde sem sair desta tela: qualquer resposta do servidor serve.
+        const responds = () =>
+          fetch(APP_URL, {
+            mode: 'no-cors',
+            cache: 'no-store',
+            credentials: 'omit',
+            signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+          }).then(
+            () => true,
+            () => false,
+          );
+        let checking = false;
+        const check = async () => {
+          if (leaving || checking) return;
+          checking = true;
+          const up = await responds();
+          checking = false;
+          if (up) open();
+        };
+
+        retry.addEventListener('click', open);
+        // O Windows avisou que a rede voltou: não espera a próxima tentativa.
+        addEventListener('online', check);
+        setInterval(check, RETRY_MS);
+      })();
+    </script>
+  </body>
+</html>
