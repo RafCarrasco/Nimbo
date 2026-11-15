@@ -114,11 +114,11 @@ export function StreamSettingsModal({
       <div className="option-group">
         <span className="option-label">Áudio</span>
         <div className="segmented wide">
+          <button className={settings.audio === 'window' ? 'on' : ''} onClick={() => set('audio', 'window')}>
+            {desktop ? 'Jogo ou janela' : 'Só a janela'}
+          </button>
           <button className={settings.audio === 'system' ? 'on' : ''} onClick={() => set('audio', 'system')}>
             Computador
-          </button>
-          <button className={settings.audio === 'window' ? 'on' : ''} onClick={() => set('audio', 'window')}>
-            Só a janela
           </button>
           <button className={settings.audio === 'none' ? 'on' : ''} onClick={() => set('audio', 'none')}>
             Sem áudio
@@ -127,11 +127,11 @@ export function StreamSettingsModal({
         <small className="muted">
           {settings.audio === 'system'
             ? supportsOwnAudioRestriction()
-              ? 'O som das lives que você assiste no Nimbo não é reenviado. Vozes de outros apps (ex.: Discord) entram na live.'
+              ? 'Todo o som do computador vai para a live, inclusive as vozes de outros apps (ex.: Discord): quem está na chamada com você vai se ouvir. O som das lives que você assiste no Nimbo não é reenviado.'
               : 'Seu navegador pode reenviar o som das lives que você assiste. Use fones ou silencie as outras lives.'
             : settings.audio === 'window'
               ? desktop
-                ? 'Escolha um aplicativo no seletor: só o som dele vai para a live.'
+                ? 'Só o som do jogo ou programa escolhido vai para a live; as vozes do Discord ficam de fora. Ao transmitir a tela inteira, vai o som do computador. Se o jogo ficar sem som, use "Computador".'
                 : 'Envia apenas o som da janela escolhida, quando o navegador permite.'
               : 'Somente vídeo.'}
         </small>
