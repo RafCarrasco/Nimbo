@@ -339,6 +339,11 @@ describe('salas', () => {
     await assertFails(set(ref(member(), 'rooms/geral/members/admin'), { joinedAt: 5 }));
     await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 'agora' }));
     await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, host: true }));
+    // Versão do app na presença: texto curto, e só isso além do joinedAt.
+    await assertSucceeds(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, app: '0.5.1 (Rust)' }));
+    await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, app: 51 }));
+    await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, app: 'x'.repeat(33) }));
+    await assertFails(set(ref(member(), 'rooms/geral/members/member'), { app: '0.5.1' }));
   });
   test('sair é sempre permitido, mesmo após perder o acesso', async () => {
     await env.withSecurityRulesDisabled((ctx) =>

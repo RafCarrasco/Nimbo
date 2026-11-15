@@ -91,6 +91,8 @@ const rules = {
             ),
             '.validate': "newData.hasChildren(['joinedAt']) && newData.child('joinedAt').isNumber()",
             joinedAt: { '.validate': 'newData.isNumber()' },
+            // Versão do app de quem entrou ("0.5.1 (Rust)", "navegador"), para o diagnóstico das lives.
+            app: { '.validate': 'newData.isString() && newData.val().length <= 32' },
             ...noOtherFields,
           },
         },

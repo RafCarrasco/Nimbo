@@ -176,7 +176,74 @@ export function stereoOpus(sdp: string) {
   return out;
 }
 
+// Tipo de um endereço de rede, sem o endereço em si: o diagnóstico é colado em conversas.
+function addressKind(address: string) {
+  if (!address) return 'oculto';
+  if (address.endsWith('.local')) return 'nome-mdns';
+  if (address.includes(':')) return /^f[cd]/i.test(address) ? 'ipv6-local' : /^fe80/i.test(address) ? 'ipv6-enlace' : 'ipv6-global';
+  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address)) return 'ipv4-privado';
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address)) return 'ipv4-cgnat';
+  // 26.x é a faixa da rede virtual Radmin; 25.x, a da Hamachi.
+  if (/^2[56]\./.test(address)) return 'rede-virtual';
+  return 'ipv4-publico';
+}
+
+// "host/udp:ipv4-privado×2 srflx/udp:ipv4-publico": o que um lado ofereceu de caminho de rede.
+function candidateSummary(sdp: string | undefined) {
+  const count = new Map<string, number>();
+  // A oferta repete os mesmos endereços em cada mídia (vídeo e áudio): cada um conta uma vez.
+  const seen = new Set<string>();
+  for (const line of (sdp || '').split(/\r?\n/)) {
+    if (!line.startsWith('a=candidate')) continue;
+    const part = line.split(' ');
+    const id = `${part[2]} ${part[4]} ${part[5]} ${part[7]}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const name = `${part[7]}/${part[2]?.toLowerCase()}:${addressKind(part[4] || '')}`;
+    count.set(name, (count.get(name) || 0) + 1);
+  }
+  return [...count].map(([name, n]) => (n > 1 ? `${name}×${n}` : name)).join(' ') || 'nenhum';
+}
+
+// A porta pública deste lado muda conforme o destino? Com dois endereços públicos diferentes para o
+// mesmo soquete local, sim (NAT simétrico): conexão direta com outra rede difícil não fecha.
+function natKind(sdp: string | undefined) {
+  const mapped = new Map<string, Set<string>>();
+  for (const line of (sdp || '').split(/\r?\n/)) {
+    const part = line.split(' ');
+    if (!line.startsWith('a=candidate') || part[7] !== 'srflx' || part[2]?.toLowerCase() !== 'udp') continue;
+    const base = `${part[9]}:${part[11]}`;
+    mapped.set(base, (mapped.get(base) || new Set()).add(`${part[4]}:${part[5]}`));
+  }
+  if (!mapped.size) return 'sem endereço público';
+  return [...mapped.values()].some((set) => set.size > 1) ? 'porta muda por destino (simétrico)' : 'porta estável';
+}
+
+// O que aconteceu numa tentativa de assistir uma live nativa. A conexão que desiste é fechada e some
+// das estatísticas do navegador; o resumo fica guardado para o "Copiar diagnóstico".
+export type NativeAttempt = {
+  inicio: string;
+  tentativa: number;
+  // Caminhos de rede que este lado ofereceu e o tipo de NAT que eles revelam.
+  oferta: string;
+  nat: string;
+  // Quanto a resposta do app de quem transmite demorou; sem isto, ela não chegou.
+  respostaMs?: number;
+  resposta?: string;
+  estados: string[];
+  // Testes de caminho no fim da tentativa: pedidos enviados/respondidos e recebidos/respondidos.
+  pares?: string[];
+  rota?: string;
+};
+
+export type NativeDiagnostics = { peer: string; live: string; transmissor: string; estado: string; tentativas: NativeAttempt[] };
+
 type Incoming = {
+  attempt: NativeAttempt;
+  // Momento da oferta enviada, para medir a demora da resposta.
+  offered: number;
+  // A tentativa já está sendo encerrada (o resumo final é assíncrono).
+  ending: boolean;
   pc: RTCPeerConnection;
   uid: string;
   kind: StreamKind;
@@ -208,6 +275,8 @@ export class NativeReceiver {
   private conns = new Map<string, Incoming>();
   // Lives que já esgotaram as tentativas; só tenta de novo quando a live recomeça.
   private gaveUp = new Set<string>();
+  // Últimas tentativas de cada live, para o diagnóstico.
+  private history = new Map<string, NativeAttempt[]>();
 
   constructor(private deps: Deps) {}
 
@@ -246,7 +315,22 @@ export class NativeReceiver {
   ) {
     const pc = new RTCPeerConnection(this.deps.ice());
     const stream = new MediaStream();
-    const retry = () => {
+    const started = performance.now();
+    const attempt: NativeAttempt = { inicio: new Date().toISOString(), tentativa: tries + 1, oferta: '', nat: '', estados: [] };
+    const past = this.history.get(key) || [];
+    this.history.delete(key);
+    this.history.set(key, [...past, attempt].slice(-4));
+    // Só as lives mais recentes: o histórico não cresce com cada live que já passou pelo canal.
+    for (const old of [...this.history.keys()].slice(0, -6)) this.history.delete(old);
+    const note = (text: string) => {
+      if (attempt.estados.length < 30) attempt.estados.push(`${Math.round(performance.now() - started)}ms ${text}`);
+    };
+    const retry = async (why: string) => {
+      if (this.conns.get(key)?.pc !== pc || conn.ending) return;
+      conn.ending = true;
+      note(why);
+      // Antes de fechar: depois disso o navegador não conta mais como foram os testes de caminho.
+      await this.snapshot(conn);
       if (this.conns.get(key)?.pc !== pc) return;
       const failures = conn.tries + 1;
       this.close(key);
@@ -258,7 +342,17 @@ export class NativeReceiver {
       }
     };
     const nonce = crypto.randomUUID();
-    const conn: Incoming = { pc, ...live, stream, nonce, tries, timer: setTimeout(retry, CONNECT_MS) };
+    const conn: Incoming = {
+      pc,
+      ...live,
+      stream,
+      nonce,
+      tries,
+      attempt,
+      offered: 0,
+      ending: false,
+      timer: setTimeout(() => void retry('sem conexão no prazo'), CONNECT_MS),
+    };
     this.conns.set(key, conn);
     pc.addTransceiver('video', { direction: 'recvonly' });
     if (live.sound) pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -267,14 +361,17 @@ export class NativeReceiver {
       track.onunmute = () => this.deps.onChange();
       this.deps.onChange();
     };
+    pc.oniceconnectionstatechange = () => note(`ice ${pc.iceConnectionState}`);
     pc.onconnectionstatechange = () => {
+      note(`conexao ${pc.connectionState}`);
       clearTimeout(conn.lost);
       if (pc.connectionState === 'connected') {
         clearTimeout(conn.timer);
         // Conectou: falhas antigas não contam mais (três quedas espalhadas em horas não são desistência).
         conn.tries = 0;
-      } else if (pc.connectionState === 'failed') retry();
-      else if (pc.connectionState === 'disconnected') conn.lost = setTimeout(retry, LOST_MS);
+        void this.snapshot(conn);
+      } else if (pc.connectionState === 'failed') void retry('conexão falhou');
+      else if (pc.connectionState === 'disconnected') conn.lost = setTimeout(() => void retry('conexão caiu'), LOST_MS);
       this.deps.onChange();
     };
     void (async () => {
@@ -283,10 +380,14 @@ export class NativeReceiver {
       await pc.setLocalDescription({ type: 'offer', sdp: stereoOpus(offer.sdp || '') });
       await gathered(pc, 2000);
       if (this.conns.get(key)?.pc !== pc || !pc.localDescription) return;
+      attempt.oferta = candidateSummary(pc.localDescription.sdp);
+      attempt.nat = natKind(pc.localDescription.sdp);
       await this.deps.send(live.uid, { type: 'offer', sdp: pc.localDescription.toJSON(), native: live.kind, nonce });
+      conn.offered = performance.now();
+      note('oferta enviada');
     })().catch((e) => {
       console.warn('[nimbo] oferta para o app', e);
-      retry();
+      void retry(`oferta não enviada: ${String(e).slice(0, 80)}`);
     });
   }
 
@@ -295,7 +396,48 @@ export class NativeReceiver {
     const conn = this.conns.get(`${uid}:${kind}`);
     // Só vale a resposta à oferta desta conexão (ver nonce em NativeSignal).
     if (!conn || conn.nonce !== nonce || conn.pc.signalingState !== 'have-local-offer') return;
+    conn.attempt.respostaMs = Math.round(performance.now() - conn.offered);
+    conn.attempt.resposta = candidateSummary(sdp.sdp);
     await conn.pc.setRemoteDescription(sdp);
+  }
+
+  // Resumo dos testes de caminho de uma conexão: quais pares foram tentados e no que deram.
+  private async snapshot(conn: Incoming) {
+    const stats = await Promise.race([
+      conn.pc.getStats().catch(() => null),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+    ]);
+    if (!stats) return;
+    const byId = new Map<string, Record<string, unknown>>();
+    stats.forEach((r) => byId.set(r.id, r as Record<string, unknown>));
+    const pairs: string[] = [];
+    stats.forEach((r: Record<string, unknown>) => {
+      if (r.type !== 'candidate-pair') return;
+      const local = byId.get(r.localCandidateId as string) || {};
+      const remote = byId.get(r.remoteCandidateId as string) || {};
+      const side = (c: Record<string, unknown>) => `${c.candidateType}:${addressKind(String(c.address || c.ip || ''))}`;
+      const text =
+        `${side(local)} -> ${side(remote)} ${r.state}` +
+        ` pedidos ${r.requestsSent ?? '?'}/${r.responsesReceived ?? '?'} recebidos ${r.requestsReceived ?? '?'}/${r.responsesSent ?? '?'}`;
+      if (r.nominated && r.state === 'succeeded') conn.attempt.rota = `${side(local)} -> ${side(remote)}`;
+      if (pairs.length < 16) pairs.push(text);
+    });
+    conn.attempt.pares = pairs;
+  }
+
+  // Para o "Copiar diagnóstico": cada live nativa, com as últimas tentativas de conexão.
+  diagnostics(appOf: (uid: string) => string): NativeDiagnostics[] {
+    return [...this.history].map(([key, attempts]) => {
+      const [uid, kind] = key.split(':');
+      const conn = this.conns.get(key);
+      return {
+        peer: uid.slice(0, 5),
+        live: `${kind} pelo app`,
+        transmissor: appOf(uid),
+        estado: conn ? conn.pc.connectionState : 'sem conexão aberta',
+        tentativas: attempts,
+      };
+    });
   }
 
   // Vídeos recebidos, por participante e pelo id anunciado da live (como os do navegador).

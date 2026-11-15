@@ -21,9 +21,11 @@ import {
   nativeSound,
   releaseNativePreview,
   stopNative,
+  type NativeDiagnostics,
   type NativeSignal,
 } from './native';
 import type { StreamKind } from './capture';
+import { APP_LABEL } from '../lib/version';
 
 // Sinalização: rooms/{room}/signals/{destinatário}/{remetente}/{id}
 type Signal =
@@ -254,6 +256,8 @@ export class LiveRoom {
     onChange: () => this.emit(),
   });
   private nativeOut = new Map<string, number>();
+  // Versão do app de cada pessoa no canal, como ela mesma informou ao entrar.
+  private apps: Record<string, string> = {};
   // Ofertas da mesma pessoa para a mesma live são atendidas uma de cada vez.
   private nativeQueue = new Map<string, Promise<void>>();
 
@@ -339,7 +343,8 @@ export class LiveRoom {
     // isto quem assiste ficaria sem tentar de novo até a live recomeçar.
     if (reset) this.nativeIn.reset();
     await onDisconnect(this.memberRef).remove();
-    await set(this.memberRef, { joinedAt: serverTimestamp() });
+    // A versão do app vai junto: quando uma live não conecta, mostra quem ainda não atualizou.
+    await set(this.memberRef, { joinedAt: serverTimestamp(), app: APP_LABEL });
     this.sessionStart = Date.now();
     if (reset) this.nativeIn.sync(this.broadcasts, this.members, this.uid);
     for (const kind of this.locals.keys()) await this.publishStream(kind);
@@ -398,8 +403,9 @@ export class LiveRoom {
     );
   }
 
-  private onMembers(entries: Record<string, { joinedAt?: unknown }>) {
+  private onMembers(entries: Record<string, { joinedAt?: unknown; app?: unknown }>) {
     const ids = Object.keys(entries);
+    this.apps = Object.fromEntries(ids.map((id) => [id, typeof entries[id]?.app === 'string' ? (entries[id].app as string) : '']));
     for (const id of ids) {
       const session = entries[id]?.joinedAt;
       // Mesma conta numa sessão nova (recarregou a página): a conexão antiga não serve mais, porque a
@@ -822,8 +828,9 @@ export class LiveRoom {
   }
 
   // Para suporte: no console do navegador, rode nimboDebug().
-  async diagnostics(): Promise<PeerDiagnostics[]> {
-    return Promise.all(
+  async diagnostics(): Promise<Array<PeerDiagnostics | NativeDiagnostics>> {
+    const native = this.nativeIn.diagnostics((uid) => this.apps[uid] || 'não informado (site antigo)');
+    const peers = await Promise.all(
       [...this.peers.entries()].map(async ([id, { pc }]) => {
         const stats = await pc.getStats();
         const byId = new Map<string, Record<string, unknown>>();
@@ -875,6 +882,7 @@ export class LiveRoom {
         };
       }),
     );
+    return [...peers, ...native];
   }
 
   async startBroadcast(stream: MediaStream, kind: StreamKind, bitrate: number): Promise<void> {
