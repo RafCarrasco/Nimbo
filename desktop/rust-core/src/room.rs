@@ -54,11 +54,24 @@ pub struct RoomSnapshot {
     /// Versão do app de cada pessoa no canal, como ela mesma informou ao entrar.
     pub apps: BTreeMap<String, String>,
     pub broadcasts: Broadcasts,
+    /// Quantas vezes a presença foi refeita depois de uma queda da conexão. Quem cuida das lives
+    /// refaz as conexões quando este número muda: as ofertas feitas durante a queda se perderam.
+    pub reconnects: u64,
     pub issue: Option<Issue>,
+}
+
+/// Live desta conta anunciada no canal (para reanunciar quando a conexão volta).
+#[derive(Clone)]
+struct Local {
+    started_at: i64,
+    stream_id: String,
+    sound: bool,
 }
 
 struct State {
     snapshot: RoomSnapshot,
+    /// Lives próprias no ar, por tipo ("screen" ou "camera").
+    locals: BTreeMap<String, Local>,
     was_offline: bool,
     /// Outra sessão desta conta entrou no canal: esta sai sem mexer na presença, que agora é da outra.
     replaced: bool,
@@ -105,6 +118,7 @@ impl Room {
             sid: session_id(),
             state: Mutex::new(State {
                 snapshot: RoomSnapshot { room: room.to_owned(), online: db.is_connected(), ..RoomSnapshot::default() },
+                locals: BTreeMap::new(),
                 was_offline: false,
                 replaced: false,
                 listens: Vec::new(),
@@ -139,14 +153,17 @@ impl Room {
                 }
                 again
             };
-            // O servidor já tirou a presença durante a queda: registra de novo (fora desta thread,
-            // porque a gravação espera a resposta).
+            // O servidor já tirou a presença (e as lives) durante a queda: registra de novo (fora
+            // desta thread, porque a gravação espera a resposta) e reanuncia o que estava no ar.
             if again {
                 let retry = inner.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = retry.register_presence() {
+                    let done = retry.register_presence().and_then(|()| retry.republish());
+                    if let Err(e) = done {
                         retry.issue(format!("Não deu para voltar ao canal: {e}"), false);
                     }
+                    retry.state.lock().expect("estado da sala").snapshot.reconnects += 1;
+                    (retry.notify)();
                 });
             }
             (inner.notify)();
@@ -208,16 +225,58 @@ impl Room {
         self.inner.db.set_then(&path, message, done);
     }
 
+    /// Devolve a quem quer assistir a resposta do motor à oferta dele, com o mesmo `nonce` (vazio
+    /// quando a oferta veio sem). Não espera: `done` recebe o resultado, na thread da conexão.
+    pub fn send_native_answer(
+        &self,
+        to: &str,
+        kind: &str,
+        sdp: &str,
+        nonce: &str,
+        done: impl FnOnce(Result<(), DbError>) + Send + 'static,
+    ) {
+        let mut message = json!({ "type": "answer", "sdp": { "type": "answer", "sdp": sdp }, "native": kind });
+        if !nonce.is_empty() {
+            message["nonce"] = json!(nonce);
+        }
+        let path = self.inner.path(&format!("signals/{to}/{}/{}", self.inner.uid, push_id(self.inner.db.server_now_ms())));
+        self.inner.db.set_then(&path, message, done);
+    }
+
+    /// Anuncia no canal uma live desta conta enviada pelo motor do app (`native: true`): quem
+    /// assiste vê o anúncio e manda a oferta. `stream_id` identifica esta live (muda a cada começo);
+    /// `sound` diz se há som para pedir. Bloqueia até o servidor confirmar.
+    pub fn publish_stream(&self, kind: &str, stream_id: &str, sound: bool) -> Result<(), DbError> {
+        let local = Local { started_at: self.inner.db.server_now_ms(), stream_id: stream_id.to_owned(), sound };
+        self.inner.state.lock().expect("estado da sala").locals.insert(kind.to_owned(), local.clone());
+        let done = self.inner.publish(kind, &local);
+        if done.is_err() {
+            self.inner.state.lock().expect("estado da sala").locals.remove(kind);
+        }
+        done
+    }
+
+    /// Tira o anúncio de uma live desta conta. Bloqueia até o servidor confirmar.
+    pub fn unpublish_stream(&self, kind: &str) {
+        self.inner.state.lock().expect("estado da sala").locals.remove(kind);
+        let _ = self.inner.db.remove(&self.inner.path(&format!("streams/{}/{kind}", self.inner.uid)));
+    }
+
     /// Sai do canal. Bloqueia até o servidor confirmar: chame fora da thread que desenha.
     pub fn leave(&self) {
-        let (listens, replaced) = {
+        let (listens, replaced, locals) = {
             let mut state = self.inner.state.lock().expect("estado da sala");
             state.snapshot.joined = false;
-            (std::mem::take(&mut state.listens), state.replaced)
+            (std::mem::take(&mut state.listens), state.replaced, std::mem::take(&mut state.locals))
         };
         for id in listens {
             self.inner.db.unlisten(id);
         }
+        let streams = self.inner.path(&format!("streams/{}", self.inner.uid));
+        for kind in locals.keys() {
+            let _ = self.inner.db.remove(&format!("{streams}/{kind}"));
+        }
+        let _ = self.inner.db.on_disconnect_cancel(&streams);
         let member = self.inner.member();
         let _ = self.inner.db.on_disconnect_cancel(&member);
         // Trocada por outra sessão da mesma conta: o registro de presença agora é dela.
@@ -270,6 +329,23 @@ impl Inner {
         self.db.on_disconnect_remove(&member)?;
         // A versão do app vai junto: quando uma live não conecta, mostra quem ainda não atualizou.
         self.db.set(&member, json!({ "joinedAt": { ".sv": "timestamp" }, "app": self.app, "sid": self.sid }))
+    }
+
+    /// O pedido de "tire a live se a conexão cair" vai antes do anúncio, como na presença.
+    fn publish(&self, kind: &str, local: &Local) -> Result<(), DbError> {
+        let streams = self.path(&format!("streams/{}", self.uid));
+        self.db.on_disconnect_remove(&streams)?;
+        let mut live = json!({ "startedAt": local.started_at, "streamId": local.stream_id, "native": true });
+        if local.sound {
+            live["sound"] = json!(true);
+        }
+        self.db.set(&format!("{streams}/{kind}"), live)
+    }
+
+    /// Depois de uma queda: anuncia de novo as lives que estavam no ar.
+    fn republish(&self) -> Result<(), DbError> {
+        let locals = self.state.lock().expect("estado da sala").locals.clone();
+        locals.iter().try_for_each(|(kind, local)| self.publish(kind, local))
     }
 
     fn on_members(self: &Arc<Self>, entries: &Json) {

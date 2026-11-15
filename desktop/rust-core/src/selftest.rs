@@ -61,6 +61,18 @@ fn account(project: &Project, name: &str) -> Result<(Session, Db), AnyError> {
     Ok((session, db))
 }
 
+/// Espera uma condição ficar verdadeira, conferindo de 50 em 50 ms.
+fn wait_until(what: &str, mut pass: impl FnMut() -> bool) -> Result<(), AnyError> {
+    let deadline = Instant::now() + WAIT;
+    while !pass() {
+        if Instant::now() > deadline {
+            return Err(format!("não aconteceu: {what}").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 fn step(name: &str) {
     println!("ok  {name}");
 }
@@ -190,61 +202,75 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     other.close();
     step("sala: entrar, ser trocada por outra sessão da mesma conta e sair");
 
-    // Sinalização: B anuncia uma live nativa e A manda a oferta para assistir; a oferta chega na
-    // caixa de B, é entregue uma vez e apagada do banco.
+    // Sinalização de uma live nativa, dos dois lados: B anuncia a live, A manda a oferta, B responde
+    // com o mesmo código, e cada mensagem é entregue uma vez e apagada do banco.
     let room_a = Room::join(db_a, &a.uid, "competitivo", "teste (nativo)", || {})?;
     let room_b = Room::join(db_b, &b.uid, "competitivo", "teste (nativo)", || {})?;
-    let live = json!({ "startedAt": 1, "streamId": "tela-de-b", "native": true, "sound": true });
-    db_b.set(&format!("rooms/competitivo/streams/{}/screen", b.uid), live)?;
-    let until = Instant::now() + WAIT;
-    loop {
-        let seen = room_a.snapshot().broadcasts.get(&b.uid).and_then(|kinds| kinds.get("screen")).cloned();
-        if seen.is_some_and(|live| live.native && live.sound && live.stream_id == "tela-de-b") {
-            break;
-        }
-        if Instant::now() > until {
-            return Err("A não viu a live nativa de B".into());
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    room_b.publish_stream("screen", "tela-de-b", true)?;
+    let live_of_b = || room_a.snapshot().broadcasts.get(&b.uid).and_then(|kinds| kinds.get("screen")).cloned();
+    wait_until("A vê a live nativa de B", || {
+        live_of_b().is_some_and(|live| live.native && live.sound && live.stream_id == "tela-de-b")
+    })?;
+    let announced = db_a.get(&format!("rooms/competitivo/streams/{}/screen", b.uid))?;
+    if !announced["startedAt"].is_number() || announced["native"] != true {
+        return Err(format!("anúncio da live fora do formato do site: {announced}").into());
     }
     let (tx, sent) = channel();
     room_a.send_native_offer(&b.uid, "screen", "v=0 oferta de teste", "codigo-1", move |result| drop(tx.send(result)));
     sent.recv_timeout(WAIT)??;
-    let until = Instant::now() + WAIT;
-    let got = loop {
-        let got = room_b.take_signals();
-        if !got.is_empty() {
-            break got;
-        }
-        if Instant::now() > until {
-            return Err("a oferta não chegou na caixa de B".into());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let expected = Signal::Native {
+    let mut got = Vec::new();
+    wait_until("a oferta chega na caixa de B", || {
+        got = room_b.take_signals();
+        !got.is_empty()
+    })?;
+    let offer = Signal::Native {
         from: a.uid.clone(),
         kind: "screen".into(),
         answer: false,
         sdp: "v=0 oferta de teste".into(),
         nonce: "codigo-1".into(),
     };
-    if got != vec![expected] {
+    if got != vec![offer] {
         return Err(format!("sinal inesperado: {got:?}").into());
     }
-    let until = Instant::now() + WAIT;
-    while !db_b.get(&format!("rooms/competitivo/signals/{}", b.uid))?.is_null() {
-        if Instant::now() > until {
-            return Err("a mensagem entregue não foi apagada".into());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_until("a mensagem entregue é apagada", || {
+        db_b.get(&format!("rooms/competitivo/signals/{}", b.uid)).is_ok_and(|inbox| inbox.is_null())
+    })?;
     if !room_b.take_signals().is_empty() {
         return Err("a mesma mensagem foi entregue duas vezes".into());
     }
-    db_b.remove(&format!("rooms/competitivo/streams/{}", b.uid))?;
-    room_a.leave();
+    let (tx, sent) = channel();
+    room_b.send_native_answer(&a.uid, "screen", "v=0 resposta de teste", "codigo-1", move |result| drop(tx.send(result)));
+    sent.recv_timeout(WAIT)??;
+    wait_until("a resposta chega na caixa de A", || {
+        got = room_a.take_signals();
+        !got.is_empty()
+    })?;
+    let answer = Signal::Native {
+        from: b.uid.clone(),
+        kind: "screen".into(),
+        answer: true,
+        sdp: "v=0 resposta de teste".into(),
+        nonce: "codigo-1".into(),
+    };
+    if got != vec![answer] {
+        return Err(format!("resposta inesperada: {got:?}").into());
+    }
+    step("sinalização: live anunciada, oferta e resposta entregues uma vez e apagadas");
+
+    // Queda de quem transmite: o servidor tira a live, e ela é reanunciada quando a conexão volta.
+    db_b.debug_drop_connection();
+    wait_until("a live de B some na queda", || live_of_b().is_none())?;
+    wait_until("a live de B volta, reanunciada", || live_of_b().is_some_and(|live| live.stream_id == "tela-de-b"))?;
+    wait_until("B conta a reconexão", || room_b.snapshot().reconnects == 1)?;
+    room_b.unpublish_stream("screen");
+    wait_until("a live de B some ao ser retirada", || live_of_b().is_none())?;
+    room_b.publish_stream("screen", "tela-de-b-2", false)?;
+    wait_until("a live nova de B aparece, sem som", || live_of_b().is_some_and(|live| live.stream_id == "tela-de-b-2" && !live.sound))?;
     room_b.leave();
-    step("sinalização: live nativa anunciada, oferta entregue uma vez e apagada");
+    wait_until("sair do canal tira a live", || live_of_b().is_none())?;
+    room_a.leave();
+    step("live própria: reanunciada depois da queda, retirada a pedido e ao sair do canal");
 
     db_a.close();
     db_b.close();

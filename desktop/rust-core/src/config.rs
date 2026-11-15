@@ -28,15 +28,21 @@ impl Project {
         }
     }
 
-    /// Emuladores locais, nas portas de `firebase.json` (banco 9000, login 9099).
+    /// Emuladores locais, nas portas de `firebase.json` (banco 9000, login 9099). Outro par de
+    /// emuladores (para dois testes não dividirem o mesmo banco) entra por `NIMBO_EMULATOR_DB` e
+    /// `NIMBO_EMULATOR_AUTH`, no formato `host:porta`.
     pub fn emulator() -> Self {
+        let address = |name: &str, default: &str| {
+            std::env::var(name).ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| default.to_owned())
+        };
+        let (db, auth) = (address("NIMBO_EMULATOR_DB", "127.0.0.1:9000"), address("NIMBO_EMULATOR_AUTH", "127.0.0.1:9099"));
         Self {
             api_key: "demo-key".into(),
-            db_host: "127.0.0.1:9000".into(),
+            db_host: db,
             db_namespace: "demo-nimbo-default-rtdb".into(),
             db_secure: false,
-            identity_base: "http://127.0.0.1:9099/identitytoolkit.googleapis.com".into(),
-            token_base: "http://127.0.0.1:9099/securetoken.googleapis.com".into(),
+            identity_base: format!("http://{auth}/identitytoolkit.googleapis.com"),
+            token_base: format!("http://{auth}/securetoken.googleapis.com"),
             emulator: true,
         }
     }
