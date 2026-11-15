@@ -37,9 +37,12 @@ beforeEach(async () => {
   await env.withSecurityRulesDisabled(async (ctx) => {
     await set(ref(ctx.database(), '/'), {
       community: {
-        approved: { owner: true, admin: true, member: true, anon: true },
+        approved: { owner: true, admin: true, member: true, outro: true, anon: true },
         roles: { owner: 'owner', admin: 'admin', member: 'member' },
-        profiles: { member: { displayName: 'Membro', createdAt: 1, updatedAt: 1 } },
+        profiles: {
+          member: { displayName: 'Membro', createdAt: 1, updatedAt: 1 },
+          outro: { displayName: 'Outro', createdAt: 1, updatedAt: 1 },
+        },
         requests: { pending: { email: 'pending@example.com', createdAt: 1 } },
         categories: {
           vipcat: { name: 'VIP', createdAt: 1, createdBy: 'owner', order: 1 },
@@ -52,7 +55,8 @@ beforeEach(async () => {
           faculdade: { name: 'Faculdade', color: '#7c6cff', createdAt: 1 },
           trampo: { name: 'Trampo', color: '#3ecf8e', createdAt: 1 },
         },
-        memberRoles: { member: { faculdade: true } },
+        memberRoles: { member: { faculdade: true }, outro: { trampo: true } },
+        roleMembers: { faculdade: { member: true }, trampo: { outro: true } },
         categoryRoles: { grupoA: ['faculdade'], grupoB: ['trampo'] },
         channels: {
           staff: {
@@ -251,9 +255,9 @@ describe('fotos de perfil', () => {
     await assertFails(set(ref(pending(), 'community/avatars/pending'), webp));
     await assertSucceeds(remove(ref(member(), 'community/avatars/member')));
   });
-  test('membros aprovados veem as fotos; pendentes não', async () => {
-    await assertSucceeds(get(ref(member(), 'community/avatars')));
-    await assertFails(get(ref(pending(), 'community/avatars')));
+  test('membros aprovados veem a foto de uma pessoa; pendentes não', async () => {
+    await assertSucceeds(get(ref(member(), 'community/avatars/admin')));
+    await assertFails(get(ref(pending(), 'community/avatars/admin')));
   });
   test('proprietário pode apagar a foto de alguém, mas não trocar', async () => {
     await env.withSecurityRulesDisabled((ctx) => set(ref(ctx.database(), 'community/avatars/member'), webp));
@@ -455,10 +459,101 @@ describe('cargos personalizados (grupos)', () => {
     );
     await assertSucceeds(get(ref(member(), 'community/categories/grupoB')));
   });
-  test('administradores e o proprietário veem tudo', async () => {
+  test('só o proprietário vê tudo; administrador segue os cargos', async () => {
+    await assertFails(get(ref(admin(), 'community/categories/grupoB')));
+    await assertFails(get(ref(admin(), 'community/channels/canalB')));
+    await assertFails(get(ref(admin(), 'rooms/canalB/members')));
+    await assertFails(set(ref(admin(), 'rooms/canalB/members/admin'), { joinedAt: 1 }));
+    await assertSucceeds(get(ref(owner(), 'community/channels/canalA')));
+    await assertSucceeds(get(ref(owner(), 'rooms/canalB/members')));
+    // Com o cargo, o administrador entra como qualquer pessoa do grupo.
+    await assertSucceeds(set(ref(owner(), 'community/memberRoles/admin/trampo'), true));
     await assertSucceeds(get(ref(admin(), 'community/categories/grupoB')));
     await assertSucceeds(get(ref(admin(), 'rooms/canalB/members')));
-    await assertSucceeds(get(ref(owner(), 'community/channels/canalA')));
+  });
+  test('administrador não mexe no que não enxerga', async () => {
+    const channel = {
+      name: 'Xis',
+      description: '',
+      categoryId: 'grupoB',
+      createdBy: 'admin',
+      createdAt: 1,
+      visibility: 'public',
+      enabled: true,
+    };
+    await assertFails(set(ref(admin(), 'community/channels/canalB'), channel));
+    await assertFails(update(ref(admin(), 'community/channels/canalB'), { name: 'Hackeado' }));
+    await assertFails(update(ref(admin(), 'community'), { 'channels/canalB': null, 'channelIds/canalB': null }));
+    await assertFails(remove(ref(admin(), 'community/channelIds/canalB')));
+    await assertFails(remove(ref(admin(), 'community/categoryIds/grupoB')));
+    await assertFails(update(ref(admin(), 'community/categories/grupoB'), { name: 'Hackeado' }));
+    await assertFails(set(ref(admin(), 'community/channelAccess/canalB'), 'admin'));
+    await assertFails(set(ref(admin(), 'community/categoryAccess/grupoB'), 'admin'));
+    await env.withSecurityRulesDisabled((ctx) =>
+      set(ref(ctx.database(), 'rooms/canalB/members/outro'), { joinedAt: 1 }),
+    );
+    await assertFails(remove(ref(admin(), 'rooms/canalB/members/outro')));
+    // O que ele enxerga (ou cria) continua com ele; o proprietário mexe em tudo.
+    await assertSucceeds(update(ref(admin(), 'community/channels/staff'), { name: 'Equipe' }));
+    await assertSucceeds(
+      update(ref(admin(), 'community'), {
+        'channels/novo': { ...channel, categoryId: 'lives' },
+        'channelIds/novo': true,
+      }),
+    );
+    await assertSucceeds(update(ref(admin(), 'community'), { 'channels/novo': null, 'channelIds/novo': null }));
+    await assertSucceeds(update(ref(owner(), 'community/channels/canalB'), { name: 'B2' }));
+    await assertSucceeds(remove(ref(owner(), 'rooms/canalB/members/outro')));
+  });
+  test('um grupo não enxerga quem é do outro nem o nome dele', async () => {
+    // Cargos das pessoas: cada um lê só os próprios.
+    await assertSucceeds(get(ref(member(), 'community/memberRoles/member')));
+    await assertFails(get(ref(member(), 'community/memberRoles/outro')));
+    await assertFails(get(ref(member(), 'community/memberRoles')));
+    await assertFails(get(ref(admin(), 'community/memberRoles')));
+    await assertSucceeds(get(ref(owner(), 'community/memberRoles')));
+    // Colegas do próprio grupo, sim; do outro, não.
+    await assertSucceeds(get(ref(member(), 'community/roleMembers/faculdade')));
+    await assertFails(get(ref(member(), 'community/roleMembers/trampo')));
+    await assertFails(get(ref(member(), 'community/roleMembers')));
+    await assertFails(get(ref(admin(), 'community/roleMembers/faculdade')));
+    await assertSucceeds(get(ref(owner(), 'community/roleMembers')));
+    // Nome e cor do cargo: só de quem tem.
+    await assertSucceeds(get(ref(member(), 'community/roleDefs/faculdade')));
+    await assertFails(get(ref(member(), 'community/roleDefs/trampo')));
+    await assertFails(get(ref(member(), 'community/roleDefs')));
+    await assertFails(get(ref(admin(), 'community/roleDefs')));
+    await assertSucceeds(get(ref(owner(), 'community/roleDefs')));
+  });
+  test('só o proprietário lista a comunidade; os demais leem uma pessoa por vez', async () => {
+    for (const path of ['profiles', 'avatars', 'roles', 'netAdmins']) {
+      await assertFails(get(ref(member(), 'community/' + path)));
+      await assertFails(get(ref(admin(), 'community/' + path)));
+      await assertSucceeds(get(ref(owner(), 'community/' + path)));
+    }
+    await assertSucceeds(get(ref(member(), 'community/profiles/outro')));
+    await assertSucceeds(get(ref(member(), 'community/avatars/outro')));
+    await assertFails(get(ref(pending(), 'community/profiles/outro')));
+    // Nível e permissão de rede: só os próprios.
+    await assertSucceeds(get(ref(member(), 'community/roles/member')));
+    await assertFails(get(ref(member(), 'community/roles/admin')));
+    await assertSucceeds(get(ref(member(), 'community/netAdmins/member')));
+    await assertFails(get(ref(member(), 'community/netAdmins/admin')));
+  });
+  test('o índice cargo → pessoas é só do proprietário', async () => {
+    await assertFails(set(ref(member(), 'community/roleMembers/trampo/member'), true));
+    await assertFails(set(ref(admin(), 'community/roleMembers/trampo/admin'), true));
+    await assertFails(set(ref(owner(), 'community/roleMembers/trampo/member'), 'sim'));
+    await assertSucceeds(
+      update(ref(owner(), 'community'), {
+        'memberRoles/member/trampo': true,
+        'roleMembers/trampo/member': true,
+      }),
+    );
+    await assertSucceeds(get(ref(member(), 'community/roleMembers/trampo')));
+    await assertSucceeds(
+      update(ref(owner(), 'community'), { 'roleDefs/trampo': null, 'roleMembers/trampo': null }),
+    );
   });
   test('somente o proprietário cria e atribui cargos', async () => {
     const role = { name: 'Novo', color: '#ff0000', createdAt: 1 };

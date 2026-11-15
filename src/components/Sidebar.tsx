@@ -47,6 +47,7 @@ export function Sidebar({
 }) {
   const role = data.roles[uid] || 'member';
   const staff = isStaff(role);
+  const owner = role === 'owner';
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
     try {
       return JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '{}');
@@ -66,14 +67,16 @@ export function Sidebar({
     });
 
   const categories = Object.entries(data.categories).sort((a, b) => a[1].order - b[1].order);
-  // Texto do cadeado (só a equipe vê itens restritos; os demais nem recebem esses dados).
-  const restrictedLabel = (level?: AccessLevel, roleIds?: string[]) =>
-    [
+  // Texto do cadeado. O proprietário vê todos os cargos; os demais só conhecem o nome dos que têm.
+  const restrictedLabel = (level?: AccessLevel, roleIds?: string[]) => {
+    const names = (roleIds || []).map((r) => data.roleDefs[r]?.name || (owner ? 'removido' : '')).filter(Boolean);
+    return [
       level === 'owner' ? 'Somente proprietário' : level === 'admin' ? 'Somente administradores' : '',
-      roleIds?.length ? 'Cargos: ' + roleIds.map((r) => data.roleDefs[r]?.name || 'removido').join(', ') : '',
+      names.length ? 'Cargos: ' + names.join(', ') : roleIds?.length ? 'Restrito por cargo' : '',
     ]
       .filter(Boolean)
       .join(' · ');
+  };
   // Cor do primeiro cargo da pessoa, como no Discord.
   const colorOf = (memberId: string) => {
     const first = Object.keys(data.memberRoles[memberId] || {}).find((r) => data.roleDefs[r]);
@@ -101,8 +104,11 @@ export function Sidebar({
           const channels = Object.entries(data.channels).filter(
             ([, c]) => c.enabled && (c.categoryId || 'lives') === categoryId,
           );
-          const visibleChannels = channels.filter(([id]) => staff || channelAllowed(id, uid, data));
-          if (!staff && (!visibleChannels.length || !categoryAllowed(categoryId, uid, data))) return null;
+          // Só o proprietário vê o que está trancado para ele mesmo. Administrador vê a categoria
+          // vazia (para criar canais nela), desde que tenha acesso a ela.
+          const visibleChannels = channels.filter(([id]) => owner || channelAllowed(id, uid, data));
+          if (!owner && (!categoryAllowed(categoryId, uid, data) || (!staff && !visibleChannels.length)))
+            return null;
           const isCollapsed = collapsed[categoryId];
           const categoryRestriction = restrictedLabel(
             data.categoryAccess[categoryId],
@@ -146,7 +152,11 @@ export function Sidebar({
                   const allowed = channelAllowed(id, uid, data);
                   const here = (allowed && presence[id]) || { members: [], streams: {} };
                   const streams = here.streams;
-                  const members = here.members.filter((m) => m === uid || data.profiles[m] || staff);
+                  // Sem perfil: sessão abandonada, que só a equipe vê (para remover). Enquanto o
+                  // perfil ainda está sendo buscado, a pessoa não aparece como abandonada.
+                  const members = here.members.filter(
+                    (m) => m === uid || data.profiles[m] || (staff && !data.resolving[m]),
+                  );
                   const liveCount = members.filter((m) => streams[m]).length;
                   const restriction = restrictedLabel(data.channelAccess[id], data.channelRoles[id]);
                   return (

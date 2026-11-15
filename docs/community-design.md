@@ -12,6 +12,25 @@ O mesmo React deve renderizar os canais e perfis no Electron e no navegador.
 - `community/access/{channelId}/{uid}`: futura lista de acesso por canal.
 - Canais padrão: geral e competitivo.
 
+## Quem vê o quê (níveis e cargos)
+Vale o que está em `scripts/build-rules.mjs` (gera `database.rules.json`); a interface só espelha.
+
+- **Nível** (`community/roles/{uid}`): `owner`, `admin` ou `member`. Só o proprietário vê tudo.
+  Administrador cria e organiza categorias e canais **que enxerga** e remove sessões abandonadas
+  desses canais; não aprova pessoas, não mexe em cargos e não entra em grupo do qual não faz parte.
+- **Cargos** (grupos de amigos): `community/roleDefs/{id}` (nome e cor), `community/memberRoles/{uid}/{id}`
+  (o que as regras consultam) e `community/roleMembers/{id}/{uid}` (o mesmo dado ao contrário, gravado
+  junto por `setMemberRole`). Uma categoria ou canal pode exigir até 5 cargos
+  (`categoryRoles`, `channelRoles`): só quem tem um deles lê os metadados e a sala. Sem cargo marcado,
+  vale só o nível mínimo (`categoryAccess`, `channelAccess`).
+- **Um grupo não enumera o outro.** Só o proprietário lê as listas inteiras de `profiles`, `avatars`,
+  `roles`, `netAdmins`, `roleDefs`, `memberRoles` e `roleMembers`. Os demais leem: o próprio nível e os
+  próprios cargos; nome e cor só dos cargos que têm; os colegas só desses cargos; e perfil e foto de uma
+  pessoa por vez, pelo id (o id só aparece para quem divide um canal ou um grupo com ela). No site isso
+  é `useCommunity` (lista para o proprietário, item a item para os demais) e `usePeople`.
+- Continuam legíveis por qualquer membro aprovado, por conterem só ids: `categoryIds`, `channelIds`,
+  `categoryRoles`, `channelRoles`, `categoryAccess`, `channelAccess`.
+
 ## Segurança e rollout
 Esta branch prepara UI e serviços. **Não publique regras permissivas nem ofereça administração em produção sem testes de regras**. A autenticação anônima atual não é um sistema de identidade seguro para administrar usuários, pois IDs podem mudar quando o usuário limpa dados locais. Antes de liberar controles administrativos, implementar login durável (Google/email), provisionamento seguro de owner e regras testadas no emulator. O acesso de pessoas e canais restritos deve ser validado no banco, nunca só pela interface.
 

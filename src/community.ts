@@ -108,6 +108,14 @@ export const SYSTEM_CHANNELS: Record<string, Channel> = {
 };
 export const watchChannels = (cb: (channels: Record<string, Channel>) => void) =>
   watchIndexed('community/channelIds', 'community/channels', SYSTEM_CHANNELS, cb);
+// Listas inteiras (perfis, fotos, níveis, cargos): só o proprietário lê. Os demais usam watchOne,
+// um item por vez; o que o servidor recusa chega como null.
+export const watchOne = <T>(path: string, cb: (value: T | null) => void) =>
+  onValue(
+    ref(db, path),
+    (s) => cb(s.exists() ? (s.val() as T) : null),
+    () => cb(null),
+  );
 export const watchProfiles = (cb: (profiles: Record<string, Profile>) => void) =>
   onValue(ref(db, 'community/profiles'), (s) => cb(s.val() || {}));
 // Servidor de retransmissão (TURN): endereços separados por vírgula, usuário, senha e validade.
@@ -276,8 +284,30 @@ export async function createRole(name: string, color: string) {
 }
 export const updateRole = (id: string, fields: Partial<Pick<RoleDef, 'name' | 'color'>>) =>
   update(ref(db, 'community/roleDefs/' + id), fields);
+// O cargo de alguém fica em dois lugares, gravados juntos: memberRoles (o que as regras consultam) e
+// roleMembers (cargo → pessoas, que os colegas do mesmo grupo leem).
 export const setMemberRole = (uid: string, roleId: string, on: boolean) =>
-  set(ref(db, `community/memberRoles/${uid}/${roleId}`), on ? true : null);
+  update(ref(db, 'community'), {
+    [`memberRoles/${uid}/${roleId}`]: on ? true : null,
+    [`roleMembers/${roleId}/${uid}`]: on ? true : null,
+  });
+export const watchRoleMembers = (cb: (v: Record<string, Record<string, true>>) => void) =>
+  onValue(ref(db, 'community/roleMembers'), (s) => cb(s.val() || {}));
+// Acerta roleMembers quando ele sai do lugar (cargo dado por uma versão antiga do app ou direto no
+// console do Firebase). Só o proprietário consegue gravar.
+export async function repairRoleMembers(
+  memberRoles: Record<string, Record<string, true>>,
+  roleMembers: Record<string, Record<string, true>>,
+) {
+  const changes: Record<string, true | null> = {};
+  for (const [uid, roles] of Object.entries(memberRoles))
+    for (const roleId of Object.keys(roles))
+      if (!roleMembers[roleId]?.[uid]) changes[`roleMembers/${roleId}/${uid}`] = true;
+  for (const [roleId, members] of Object.entries(roleMembers))
+    for (const uid of Object.keys(members))
+      if (!memberRoles[uid]?.[roleId]) changes[`roleMembers/${roleId}/${uid}`] = null;
+  if (Object.keys(changes).length) await update(ref(db, 'community'), changes);
+}
 export const setCategoryRoles = (id: string, roleIds: string[]) =>
   set(ref(db, 'community/categoryRoles/' + id), roleIds.length ? roleIds.slice(0, ROLE_SLOTS) : null);
 export const setChannelRoles = (id: string, roleIds: string[]) =>
@@ -289,7 +319,7 @@ export async function deleteRole(
   categoryRoles: RoleLists,
   channelRoles: RoleLists,
 ) {
-  const changes: Record<string, unknown> = { [`roleDefs/${id}`]: null };
+  const changes: Record<string, unknown> = { [`roleDefs/${id}`]: null, [`roleMembers/${id}`]: null };
   for (const [uid, roles] of Object.entries(memberRoles))
     if (roles[id]) changes[`memberRoles/${uid}/${id}`] = null;
   const lists: Array<[string, RoleLists]> = [
@@ -314,8 +344,9 @@ export type AccessData = {
   channelRoles: RoleLists;
   categoryRoles: RoleLists;
 };
+// Só o proprietário passa por cima dos cargos; administrador segue os grupos como todo mundo.
 function rolesOk(required: string[] | undefined, uid: string, data: AccessData) {
-  if (!required?.length || isStaff(data.roles[uid])) return true;
+  if (!required?.length || data.roles[uid] === 'owner') return true;
   return required.some((roleId) => data.memberRoles[uid]?.[roleId]);
 }
 
@@ -335,6 +366,13 @@ export function channelAllowed(channelId: string, uid: string, data: AccessData)
     rolesOk(data.channelRoles[channelId], uid, data) &&
     categoryAllowed(channel.categoryId || DEFAULT_CATEGORY_ID, uid, data)
   );
+}
+// Nomes dos canais que uma pessoa enxerga, para o proprietário conferir os grupos de relance.
+export function visibleChannelNames(memberId: string, data: AccessData) {
+  return Object.entries(data.channels)
+    .filter(([id]) => channelAllowed(id, memberId, data))
+    .map(([, channel]) => channel.name)
+    .sort((a, b) => a.localeCompare(b));
 }
 
 export type AccessRequest = { email: string; createdAt: number };

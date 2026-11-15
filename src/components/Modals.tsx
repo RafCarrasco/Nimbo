@@ -246,8 +246,8 @@ export function PermissionModal({
         )}
       </div>
       <small className="muted">
-        Administradores veem tudo. Canais seguem a categoria e podem ser ainda mais restritos. O acesso é
-        verificado pelo servidor.
+        Só o proprietário vê tudo: administrador também precisa do cargo. Canais seguem a categoria e podem
+        ser ainda mais restritos. O acesso é verificado pelo servidor.
       </small>
     </Modal>
   );

@@ -13,7 +13,7 @@ import {
   setChannelRoles,
 } from './community';
 import { useAuth } from './hooks/useAuth';
-import { useCommunity, useRoomsPresence } from './hooks/useCommunity';
+import { useCommunity, usePeople, useRoomsPresence } from './hooks/useCommunity';
 import { Menu, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useLiveRoom } from './hooks/useLiveRoom';
 import { useRoomSounds } from './hooks/useRoomSounds';
@@ -59,12 +59,12 @@ export default function App() {
 }
 
 function Community({ uid }: { uid: string }) {
-  const data = useCommunity(uid);
+  const community = useCommunity(uid);
   const toast = useToast();
   const dialogs = useDialogs();
-  const role = data.roles[uid] || 'member';
+  const role = community.roles[uid] || 'member';
   const staff = isStaff(role);
-  const nickname = data.profiles[uid]?.displayName || '';
+  const nickname = community.profiles[uid]?.displayName || '';
 
   const live = useLiveRoom(uid, {
     onIssue: (message) => toast.info(message),
@@ -131,10 +131,29 @@ function Community({ uid }: { uid: string }) {
   const [capture, setCapture] = useState(loadCaptureSettings);
 
   const allowedChannels = useMemo(
-    () => Object.keys(data.channels).filter((id) => channelAllowed(id, uid, data)),
-    [data, uid],
+    () => Object.keys(community.channels).filter((id) => channelAllowed(id, uid, community)),
+    [community, uid],
   );
-  const presence = useRoomsPresence(data.loaded ? allowedChannels : []);
+  const presence = useRoomsPresence(community.loaded ? allowedChannels : []);
+  // Só o proprietário recebe a lista de perfis. Os demais buscam, um a um, quem aparece nos canais
+  // que enxergam: é o que impede um grupo de listar o outro.
+  const seen = useMemo(
+    () => [...new Set(Object.values(presence).flatMap((p) => [...p.members, ...Object.keys(p.streams)]))],
+    [presence],
+  );
+  const people = usePeople(seen, community.loaded && !community.owner);
+  const data = useMemo(
+    () =>
+      community.owner
+        ? community
+        : {
+            ...community,
+            profiles: { ...people.profiles, ...community.profiles },
+            avatars: { ...people.avatars, ...community.avatars },
+            resolving: people.resolving,
+          },
+    [community, people],
+  );
   const nameOf = useCallback(
     (id: string) => data.profiles[id]?.displayName || 'Participante',
     [data.profiles],

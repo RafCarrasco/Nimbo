@@ -24,14 +24,15 @@ const levelOk = (node) =>
 
 // Cargos personalizados (grupos de amigos). Uma categoria ou canal pode exigir até ROLE_SLOTS cargos,
 // guardados em posições fixas ("0".."4") porque as regras não conseguem percorrer listas.
-// Sem nenhum cargo marcado, vale só o nível (member/admin/owner). Administradores ignoram cargos.
+// Sem nenhum cargo marcado, vale só o nível (member/admin/owner). Só o proprietário ignora cargos:
+// administrador organiza o que enxerga, mas não entra em grupo do qual não faz parte.
 const ROLE_SLOTS = 5;
 const slots = Array.from({ length: ROLE_SLOTS }, (_, i) => String(i));
 const hasRole = (roleId) => `root.child('community/memberRoles').child(auth.uid).child(${roleId}).exists()`;
 const rolesOk = (node) =>
   or(
     `!${node}.exists()`,
-    isAdmin,
+    isOwner,
     ...slots.map((i) => and(`${node}.child('${i}').exists()`, hasRole(`${node}.child('${i}').val()`))),
   );
 const categoryVisible = (id) =>
@@ -62,11 +63,13 @@ const canRoom = and(approved, channelExists, channelVisible('$room'));
 
 const member = (uidExpr) => `root.child('rooms').child($room).child('members').child(${uidExpr}).exists()`;
 const accessLevel = "newData.val() === 'member' || newData.val() === 'admin' || newData.val() === 'owner'";
+// Administrador só mexe no que enxerga: sem isso, daria para apagar ou renomear às cegas o canal de
+// um grupo alheio. Criar algo novo (ainda sem dados) é livre.
+const adminOver = (visible) => and(approvedAdmin, or(isOwner, visible));
 // Somente o proprietário pode criar, remover ou alterar uma restrição "somente proprietário".
-const accessWrite = and(
-  approvedAdmin,
-  or(isOwner, and("data.val() !== 'owner'", "newData.val() !== 'owner'")),
-);
+const accessWrite = (visible) =>
+  and(adminOver(visible), or(isOwner, and("data.val() !== 'owner'", "newData.val() !== 'owner'")));
+const own = (uidVar) => and(approved, `auth.uid === ${uidVar}`);
 const noOtherFields = { $other: { '.validate': false } };
 const str = (field, min, max) =>
   and(
@@ -83,11 +86,11 @@ const rules = {
           '.read': canRoom,
           $uid: {
             // Entrar exige acesso ao canal; sair (ou o onDisconnect) é sempre permitido ao próprio usuário.
-            // Administradores podem remover sessões abandonadas.
+            // Administradores podem remover sessões abandonadas dos canais que enxergam.
             '.write': or(
               and(canRoom, 'auth.uid === $uid'),
               and(google, 'auth.uid === $uid', '!newData.exists()'),
-              and(approvedAdmin, '!newData.exists()'),
+              and(adminOver(channelVisible('$room')), '!newData.exists()'),
             ),
             '.validate': "newData.hasChildren(['joinedAt']) && newData.child('joinedAt').isNumber()",
             joinedAt: { '.validate': 'newData.isNumber()' },
@@ -104,7 +107,7 @@ const rules = {
             '.write': or(
               and(canRoom, 'auth.uid === $uid', member('$uid')),
               and(google, 'auth.uid === $uid', '!newData.exists()'),
-              and(approvedAdmin, '!newData.exists()'),
+              and(adminOver(channelVisible('$room')), '!newData.exists()'),
             ),
             // Cada pessoa pode ter uma live de tela e uma de câmera ao mesmo tempo.
             '.validate': 'newData.hasChildren()',
@@ -184,17 +187,22 @@ const rules = {
           ...noOtherFields,
         },
       },
+      // Só o proprietário lista a comunidade inteira (níveis, perfis, fotos, grupos). Os demais leem o
+      // próprio nível e, de perfis e fotos, uma pessoa por vez pelo id: o id só aparece para quem
+      // divide um canal ou um grupo com ela, então um grupo não enumera o outro.
       roles: {
-        '.read': approved,
+        '.read': approvedOwner,
         $uid: {
+          '.read': own('$uid'),
           // O proprietário não pode rebaixar a si mesmo.
           '.write': and(approvedOwner, or('$uid !== auth.uid', "newData.val() === 'owner'")),
           '.validate': "newData.val() === 'admin' || newData.val() === 'member' || newData.val() === 'owner'",
         },
       },
       profiles: {
-        '.read': approved,
+        '.read': approvedOwner,
         $uid: {
+          '.read': approved,
           '.write': and(approved, 'auth.uid === $uid', 'newData.exists()'),
           '.validate': and(
             "newData.hasChildren(['displayName','createdAt','updatedAt'])",
@@ -213,8 +221,8 @@ const rules = {
       // para montar a conexão).
       // Quem pode configurar a rede além do proprietário (o proprietário escolhe).
       netAdmins: {
-        '.read': approved,
-        $uid: { '.write': approvedOwner, '.validate': 'newData.val() === true' },
+        '.read': approvedOwner,
+        $uid: { '.read': own('$uid'), '.write': approvedOwner, '.validate': 'newData.val() === true' },
       },
       // Uso do servidor de retransmissão por mês ("2026-11"), em bytes, somado pelos apps. Só cresce,
       // e cada envio soma no máximo 5 GB: é a base da trava de gasto mensal.
@@ -255,8 +263,9 @@ const rules = {
       // pelo app para 128x128) ou a foto da própria conta Google. Cada um troca só a própria; o
       // proprietário pode apagar a de qualquer pessoa (moderação). Apagar não passa pelo .validate.
       avatars: {
-        '.read': approved,
+        '.read': approvedOwner,
         $uid: {
+          '.read': approved,
           '.write': or(and(approved, 'auth.uid === $uid'), and(approvedOwner, '!newData.exists()')),
           '.validate': and(
             'newData.isString()',
@@ -278,16 +287,16 @@ const rules = {
       // Categorias e canais sem acesso são recusados pelo servidor e nem aparecem.
       categoryIds: {
         '.read': approved,
-        $id: { '.write': approvedAdmin, '.validate': 'newData.isNumber()' },
+        $id: { '.write': adminOver(or('!data.exists()', categoryVisible('$id'))), '.validate': 'newData.isNumber()' },
       },
       channelIds: {
         '.read': approved,
-        $id: { '.write': approvedAdmin, '.validate': 'newData.val() === true' },
+        $id: { '.write': adminOver(or('!data.exists()', channelVisible('$id'))), '.validate': 'newData.val() === true' },
       },
       categories: {
         $id: {
           '.read': and(approved, categoryVisible('$id')),
-          '.write': and(approvedAdmin, `$id !== '${DEFAULT_CATEGORY}'`),
+          '.write': and(adminOver(or('!data.exists()', categoryVisible('$id'))), `$id !== '${DEFAULT_CATEGORY}'`),
           '.validate': and(
             "newData.hasChildren(['name','createdAt','createdBy','order'])",
             str('name', 2, 32),
@@ -300,7 +309,10 @@ const rules = {
       channels: {
         $channel: {
           '.read': and(approved, channelVisible('$channel')),
-          '.write': and(approvedAdmin, ...SYSTEM_CHANNELS.map((id) => `$channel !== '${id}'`)),
+          '.write': and(
+            adminOver(or('!data.exists()', channelVisible('$channel'))),
+            ...SYSTEM_CHANNELS.map((id) => `$channel !== '${id}'`),
+          ),
           '.validate': and(
             "newData.hasChildren(['name','description','createdBy','createdAt','visibility','enabled'])",
             str('name', 2, 32),
@@ -314,15 +326,18 @@ const rules = {
       },
       categoryAccess: {
         '.read': approved,
-        $id: { '.write': accessWrite, '.validate': accessLevel },
+        $id: { '.write': accessWrite(categoryVisible('$id')), '.validate': accessLevel },
       },
       channelAccess: {
         '.read': approved,
-        $id: { '.write': accessWrite, '.validate': accessLevel },
+        $id: { '.write': accessWrite(channelVisible('$id')), '.validate': accessLevel },
       },
+      // Nome e cor de um cargo: só quem tem o cargo (e o proprietário) lê. Quem é de um grupo não
+      // descobre o nome dos outros grupos.
       roleDefs: {
-        '.read': approved,
+        '.read': approvedOwner,
         $roleId: {
+          '.read': and(approved, hasRole('$roleId')),
           '.write': approvedOwner,
           '.validate': and(
             "newData.hasChildren(['name','color','createdAt'])",
@@ -337,11 +352,23 @@ const rules = {
           ...noOtherFields,
         },
       },
+      // Cargos de cada pessoa: é o que as regras consultam. Cada um lê só os próprios.
       memberRoles: {
-        '.read': approved,
+        '.read': approvedOwner,
         $uid: {
+          '.read': own('$uid'),
           '.write': approvedOwner,
           $roleId: { '.validate': 'newData.val() === true' },
+        },
+      },
+      // O mesmo dado ao contrário (cargo → pessoas), gravado junto pelo proprietário: quem tem o cargo
+      // vê os colegas daquele grupo (a cor do nome), e só daquele.
+      roleMembers: {
+        '.read': approvedOwner,
+        $roleId: {
+          '.read': and(approved, hasRole('$roleId')),
+          '.write': approvedOwner,
+          $uid: { '.validate': 'newData.val() === true' },
         },
       },
       ...Object.fromEntries(
