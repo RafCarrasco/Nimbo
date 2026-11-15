@@ -13,6 +13,9 @@ use nimbo_media::engine::{AudioSource, Engine, Quality, Source};
 
 use crate::AnyError;
 
+/// De quantos em quantos segundos o servidor de teste escreve os números do motor.
+const STATS_EVERY: u64 = 2;
+
 pub fn run(port: u16, audio: Option<AudioSource>) -> Result<(), AnyError> {
     let engine = Arc::new(Engine::new());
     engine.set_audio(audio)?;
@@ -28,17 +31,18 @@ pub fn run(port: u16, audio: Option<AudioSource>) -> Result<(), AnyError> {
     std::thread::spawn(move || {
         let (mut last_cpu, mut last_frames, mut last_audio) = (crate::process_cpu(), 0, 0);
         loop {
-            std::thread::sleep(Duration::from_secs(5));
+            std::thread::sleep(Duration::from_secs(STATS_EVERY));
             let (now_cpu, s) = (crate::process_cpu(), stats.stats());
             println!(
-                "{{\"espectadores\":{},\"codificador\":\"{}\",\"alvo_mbps\":{:.1},\"quadros_codificados_por_s\":{:.1},\"audio\":{},\"pacotes_de_audio_por_s\":{:.1},\"cpu_um_nucleo_pct\":{:.1}}}",
+                "{{\"espectadores\":{},\"codificador\":\"{}\",\"alvo_mbps\":{:.1},\"produzido_mbps\":{:.1},\"quadros_codificados_por_s\":{:.1},\"audio\":{},\"pacotes_de_audio_por_s\":{:.1},\"cpu_um_nucleo_pct\":{:.1}}}",
                 s.viewers,
                 s.encoder,
                 f64::from(s.target_bitrate) / 1e6,
-                (s.frames_encoded - last_frames) as f64 / 5.0,
+                f64::from(s.produced_bitrate) / 1e6,
+                (s.frames_encoded - last_frames) as f64 / STATS_EVERY as f64,
                 s.audio,
-                (s.audio_packets - last_audio) as f64 / 5.0,
-                now_cpu.saturating_sub(last_cpu).as_secs_f64() / 5.0 * 100.0,
+                (s.audio_packets - last_audio) as f64 / STATS_EVERY as f64,
+                now_cpu.saturating_sub(last_cpu).as_secs_f64() / STATS_EVERY as f64 * 100.0,
             );
             (last_cpu, last_frames, last_audio) = (now_cpu, s.frames_encoded, s.audio_packets);
         }

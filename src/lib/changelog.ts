@@ -4,6 +4,15 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.5',
+    date: '15/11/2026',
+    items: [
+      'Quem assiste com internet mais fraca agora vê a live em resolução menor, em vez de imagem parada: o app de quem transmite baixa para 720p, 540p ou 360p quando a rede aperta e volta a subir quando melhora.',
+      'A qualidade para de subir e descer toda hora em rede instável: o app mede quanto realmente chega a quem assiste e segura a taxa abaixo disso.',
+      'A mesma conta aberta em dois lugares (app e navegador, ou dois aparelhos) não derruba mais a live: a sessão antiga sai do canal e avisa.',
+    ],
+  },
+  {
     version: '0.5.4',
     date: '15/11/2026',
     items: [
