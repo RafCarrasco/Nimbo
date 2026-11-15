@@ -162,6 +162,32 @@ cifrada pela branch `test/remote-viewer`):
 - O app antigo ganhava uma regra de entrada no firewall (o Windows perguntava na primeira vez); o novo não tem.
   Não mudou o resultado nos testes acima.
 
+### Quem manda o primeiro pacote (corrigido na 0.5.2)
+
+A 0.5.1 não resolveu o caso que a motivou. A causa de verdade, medida em 15/11/2026 na rede do dono (dois
+roteadores em série em casa: o dele e o modem da operadora) contra o servidor de teste:
+
+| Quem manda primeiro | Resultado |
+| --- | --- |
+| O lado de fora (como o motor fazia ao aceitar a oferta) | 0 pacotes passam, nos dois sentidos, mesmo depois de o lado de dentro mandar: a conversa fica morta |
+| O lado de dentro | 90 de 90 |
+| O lado de dentro, só com pacotes de vida curta (TTL 3 ou 4) que morrem no provedor | 90 de 90, e o lado de fora não é alcançado antes da hora |
+| Idem com TTL 2 | 0: não atravessa os dois roteadores de casa |
+
+No app antigo quem assistia testava os caminhos primeiro; no motor, quem transmite respondia à oferta e já saía
+testando, então o pacote dele chegava ao roteador de quem assiste antes do primeiro pacote de quem assiste. A
+versão do app, a regra de firewall e o Radmin (desligado na máquina dele desde 11/10) não tinham relação.
+
+Correção (`Quiet` em `desktop/rust-media/src/engine.rs`): até o espectador mandar o primeiro pacote, ou 1,5 s,
+o que sai do motor leva 4 saltos de vida e vai no máximo um pacote a cada 300 ms por destino. Isso abre a
+passagem nos roteadores de quem transmite sem alcançar o roteador de quem assiste. Conferido com o motor de
+verdade e silêncio de 8 s (`NIMBO_QUIET_MS=8000`): o espectador remoto mandou primeiro e a conexão fechou em
+0,4 s, com vídeo. Na rede local o pacote chega direto e o silêncio acaba na hora.
+
+Limites: as lives pelo navegador embutido (webcam) e quem assiste pelo site não passam pelo motor e continuam
+dependendo de quem testa primeiro; e é quem transmite que precisa estar na 0.5.2. O relógio da máquina do dono
+estava 111 s adiantado: testes com horário combinado entre máquinas precisam medir essa diferença antes.
+
 O "Copiar diagnóstico" de uma live nativa agora traz, por tentativa: os caminhos que cada lado ofereceu (só o tipo
 de endereço), se a resposta do app de quem transmite chegou e em quanto tempo, o tipo de NAT de quem assiste, os
 testes de caminho e a versão do app de quem transmite (gravada na presença do canal).

@@ -15,6 +15,7 @@ serde_json = "1"
 nimbo-audio = { path = "../rust-audio" }
 opus = "0.4"
 if-addrs = "0.15"
+socket2 = "0.6"
 
 [profile.release]
 opt-level = 3

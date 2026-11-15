@@ -4,6 +4,14 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.2',
+    date: '15/11/2026',
+    items: [
+      'Lives que ficavam em "conectando" para sempre entre casas diferentes agora conectam: alguns roteadores barravam a conversa porque o app de quem transmite falava primeiro.',
+      'Vale para quem transmite: é quem está transmitindo que precisa estar na 0.5.2.',
+    ],
+  },
+  {
     version: '0.5.1',
     date: '14/11/2026',
     items: [
