@@ -4,6 +4,15 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.3',
+    date: '15/11/2026',
+    items: [
+      'Botão para ocultar a barra da esquerda e deixar a live com a janela inteira (ao lado do nome do canal).',
+      'Quando uma live não conecta porque o app de quem transmite está desatualizado, o aviso diz isso e o que fazer.',
+      'O app procura atualização a cada 30 minutos (antes, a cada 6 horas) e avisa quando você está numa versão antiga.',
+    ],
+  },
+  {
     version: '0.5.2',
     date: '15/11/2026',
     items: [

@@ -14,7 +14,7 @@ import {
 } from './community';
 import { useAuth } from './hooks/useAuth';
 import { useCommunity, useRoomsPresence } from './hooks/useCommunity';
-import { Menu } from 'lucide-react';
+import { Menu, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useLiveRoom } from './hooks/useLiveRoom';
 import { useRoomSounds } from './hooks/useRoomSounds';
 import { loadCaptureSettings, saveCaptureSettings, type StreamKind } from './live/capture';
@@ -97,6 +97,34 @@ function Community({ uid }: { uid: string }) {
   }, [keysOf]);
   const [adminOpen, setAdminOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Barra lateral escondida (no computador), para a live ocupar a janela inteira. Fica guardado.
+  const [sidebarHidden, setSidebarHidden] = useState(() => {
+    try {
+      return localStorage.getItem('nimbo.sidebarHidden') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSidebar = () =>
+    setSidebarHidden((hidden) => {
+      try {
+        localStorage.setItem('nimbo.sidebarHidden', hidden ? '' : '1');
+      } catch {
+        // Sem armazenamento: vale só até recarregar.
+      }
+      return !hidden;
+    });
+  const sidebarToggle = (
+    <button
+      className="icon-button sidebar-toggle"
+      aria-label={sidebarHidden ? 'Mostrar barra lateral' : 'Ocultar barra lateral'}
+      title={sidebarHidden ? 'Mostrar barra lateral' : 'Ocultar barra lateral'}
+      aria-pressed={sidebarHidden}
+      onClick={toggleSidebar}
+    >
+      {sidebarHidden ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+    </button>
+  );
   const [permission, setPermission] = useState<{ kind: 'category' | 'channel'; id: string } | null>(null);
   const [showStreamSettings, setShowStreamSettings] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
@@ -225,7 +253,7 @@ function Community({ uid }: { uid: string }) {
     : '';
 
   return (
-    <div className={'app' + (menuOpen ? ' menu-open' : '')}>
+    <div className={'app' + (menuOpen ? ' menu-open' : '') + (sidebarHidden ? ' sidebar-hidden' : '')}>
       <UpdateBanner live={Object.keys(snapshot.local).length > 0} />
       {/* No celular a barra lateral vira um menu que abre por cima. */}
       <button className="menu-backdrop" aria-label="Fechar menu" onClick={() => setMenuOpen(false)} />
@@ -307,9 +335,11 @@ function Community({ uid }: { uid: string }) {
             setVisible={setVisible}
             nameOf={nameOf}
             onRetry={live.retry}
+            lead={sidebarToggle}
           />
         ) : (
           <div className="home">
+            {sidebarHidden && <div className="home-lead">{sidebarToggle}</div>}
             <img src="/nimbo-icon-256.png" alt="" />
             <h1>Olá, {nickname}</h1>
             <p className="muted">Escolha um canal na barra lateral para assistir às lives ou transmitir.</p>

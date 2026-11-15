@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { LayoutGrid, RectangleHorizontal, Users, Video } from 'lucide-react';
 import { LiveTile, type TileState } from './LiveTile';
 import { liveKey, parseLiveKey, type LiveSnapshot } from '../live/room';
 import type { StreamKind } from '../live/capture';
+import { nativeOutdated } from '../live/native';
 import { fitGrid, GAP } from '../lib/layout';
 
 function useSize<T extends HTMLElement>() {
@@ -44,6 +45,7 @@ export function Stage({
   setVisible,
   nameOf,
   onRetry,
+  lead,
 }: {
   uid: string;
   channelName: string;
@@ -52,6 +54,8 @@ export function Stage({
   setVisible: (update: (ids: string[]) => string[]) => void;
   nameOf: (id: string) => string;
   onRetry: (id: string) => void;
+  // Botão à esquerda do nome do canal (ocultar ou mostrar a barra lateral).
+  lead?: ReactNode;
 }) {
   const [layout, setLayout] = useState<'grid' | 'focus'>('grid');
   const [focused, setFocused] = useState('');
@@ -123,6 +127,11 @@ export function Stage({
           ? 'playing'
           : 'connecting';
     const pref = audio[key] || { volume: 100, muted: false };
+    // Live do app numa versão anterior à correção de rede: diz o que fazer em vez de só "não conectou".
+    const old = native && native !== 'playing' ? nativeOutdated(live.apps?.[id]) : '';
+    const hint = old
+      ? `O Nimbo de ${nameOf(id)} está na versão ${old}, que não conecta com algumas redes. Peça para fechar e abrir o app: a atualização aparece em seguida.`
+      : undefined;
     return (
       <LiveTile
         key={key}
@@ -131,6 +140,7 @@ export function Stage({
         own={own}
         camera={kind === 'camera'}
         state={state}
+        hint={hint}
         volume={pref.volume}
         muted={pref.muted}
         onVolume={(volume) => setPref(key, { volume })}
@@ -148,6 +158,7 @@ export function Stage({
   return (
     <section className="stage">
       <header className="stage-head">
+        {lead}
         <div className="stage-title">
           <h1>{channelName}</h1>
           <span className="muted">

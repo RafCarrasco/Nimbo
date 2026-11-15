@@ -1,6 +1,6 @@
 //! Atualização automática do app instalado, no contrato que o site já usava com o app antigo
 //! em Electron (`watchUpdate`, `installUpdate` e `onUpdateProgress` de `src/desktop.ts`):
-//! confere ao abrir e a cada 6 horas, baixa em segundo plano, avisa a página e instala quando ela
+//! confere ao abrir e a cada 30 minutos, baixa em segundo plano, avisa a página e instala quando ela
 //! pede (fechando e reabrindo o app) ou, sem reabrir, quando a pessoa fecha o app.
 //!
 //! O canal é o `latest.json` do Release mais recente do repositório (o endereço fica em
@@ -33,8 +33,10 @@ use crate::bridge::{FromApp, Reply};
 
 /// Outro servidor de atualização, só para teste (o app em Electron tem a mesma variável).
 const UPDATE_URL_ENV: &str = "NIMBO_UPDATE_URL";
-/// Mesmo intervalo do app em Electron.
-const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// Era de 6 horas, como no app em Electron. Em 15/11/2026 uma correção ficou parada porque quem
+/// transmitia estava com o app aberto havia horas e não soube da versão nova; conferir custa um
+/// arquivo pequeno, então vale conferir bem mais vezes.
+const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
 /// Depois de uma falha, tenta de novo logo (rede que caiu, filtro local que cortou a conexão) e
 /// vai espaçando; na quarta falha seguida volta ao intervalo normal.
 const RETRY_AFTER: [Duration; 3] = [
@@ -303,7 +305,7 @@ pub async fn install_update(_caller: FromApp, app: AppHandle) -> Reply<bool> {
     Reply::ok(true)
 }
 
-/// Começa a conferir, numa thread própria: ao abrir e depois a cada 6 horas.
+/// Começa a conferir, numa thread própria: ao abrir e depois a cada 30 minutos.
 fn start(app: AppHandle) {
     let updates = app.state::<Updates>();
     if let Some(reason) = disabled_reason(&app) {
@@ -475,14 +477,14 @@ mod tests {
     }
 
     #[test]
-    fn retries_soon_after_a_failure_then_goes_back_to_six_hours() {
+    fn retries_soon_after_a_failure_then_goes_back_to_the_usual_interval() {
         assert_eq!(next_check(0), CHECK_EVERY);
         assert_eq!(next_check(1), Duration::from_secs(30));
         assert_eq!(next_check(2), Duration::from_secs(120));
         assert_eq!(next_check(3), Duration::from_secs(600));
         assert_eq!(next_check(4), CHECK_EVERY);
         assert_eq!(next_check(usize::MAX), CHECK_EVERY);
-        assert_eq!(CHECK_EVERY, Duration::from_secs(21_600));
+        assert_eq!(CHECK_EVERY, Duration::from_secs(1_800));
     }
 
     #[test]
