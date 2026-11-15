@@ -4,6 +4,14 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.1',
+    date: '14/11/2026',
+    items: [
+      'Lives entre casas diferentes voltam a conectar: o app novo procurava menos caminhos de rede que o antigo e alguns amigos deixaram de se ver.',
+      'A live agora tenta todas as redes do computador: IPv6, rede de jogo (Radmin, Hamachi) e segunda placa.',
+    ],
+  },
+  {
     version: '0.5.0',
     date: '14/11/2026',
     items: [

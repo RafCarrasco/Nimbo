@@ -129,7 +129,8 @@ struct Encoded {
 enum Msg {
     Frame(Arc<Encoded>),
     Audio(Arc<audio::Packet>),
-    Packet(Vec<u8>, SocketAddr),
+    /// Pacote da rede: conteúdo, de onde veio e por qual endereço local entrou.
+    Packet(Vec<u8>, SocketAddr, SocketAddr),
     Tick,
     Close,
 }
@@ -862,14 +863,21 @@ impl Engine {
             .enable_bwe(Some(Bitrate::bps(u64::from(ceiling) / 2)))
             .build(Instant::now());
 
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        let local = SocketAddr::new(local_ip(), socket.local_addr()?.port());
-        rtc.add_local_candidate(Candidate::host(local, "udp")?);
-        if let Some(public) = public_address(&socket)
-            && public != local
-            && let Ok(candidate) = Candidate::server_reflexive(public, local, "udp")
-        {
-            rtc.add_local_candidate(candidate);
+        // Um soquete por endereço local. Com um só soquete "em qualquer endereço" não dá para saber por
+        // qual placa um pacote entrou, e o WebRTC precisa disso para casar com o caminho certo.
+        let sockets = bind_all()?;
+        let default = local_ip();
+        for (local, socket) in &sockets {
+            rtc.add_local_candidate(Candidate::host(*local, "udp")?);
+            // O endereço público só existe para a placa que sai para a internet por IPv4; no IPv6
+            // global o endereço da placa já é o que o mundo vê.
+            if local.ip() == default
+                && let Some(public) = public_address(socket)
+                && public != *local
+                && let Ok(candidate) = Candidate::server_reflexive(public, *local, "udp")
+            {
+                rtc.add_local_candidate(candidate);
+            }
         }
         let answer = serde_json::to_vec(&rtc.sdp_api().accept_offer(offer)?)?;
 
@@ -881,53 +889,18 @@ impl Engine {
             .unwrap()
             .insert(id, sender.clone());
 
-        // Uma thread só escuta a rede e acorda a conexão: nada fica girando à toa.
-        let reader = socket.try_clone()?;
-        reader.set_read_timeout(Some(Duration::from_secs(1)))?;
-        std::thread::spawn(move || {
-            // 64 KB: um pacote maior que o buffer daria erro no Windows em vez de ser só ignorado.
-            let mut buf = vec![0u8; 65_536];
-            loop {
-                match reader.recv_from(&mut buf) {
-                    Ok((n, source)) => {
-                        if sender.send(Msg::Packet(buf[..n].to_vec(), source)).is_err() {
-                            return;
-                        }
-                    }
-                    // ConnectionReset em UDP no Windows é só um aviso ICMP de porta fechada.
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            ErrorKind::WouldBlock
-                                | ErrorKind::TimedOut
-                                | ErrorKind::ConnectionReset
-                        ) =>
-                    {
-                        // O aviso de porta fechada volta na hora e sem parar: espera um pouco para
-                        // não girar à toa. Depois acorda a conexão para ela notar que acabou.
-                        if e.kind() == ErrorKind::ConnectionReset {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        if sender.send(Msg::Tick).is_err() {
-                            return;
-                        }
-                    }
-                    // Qualquer outro erro de leitura também não é motivo para ficar surdo: espera e
-                    // segue. A thread só acaba quando a conexão do espectador acaba.
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(50));
-                        if sender.send(Msg::Tick).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
+        // Uma thread por soquete só escuta a rede e acorda a conexão: nada fica girando à toa.
+        for (local, socket) in &sockets {
+            let reader = socket.try_clone()?;
+            reader.set_read_timeout(Some(Duration::from_secs(1)))?;
+            let (sender, local) = (sender.clone(), *local);
+            std::thread::spawn(move || listen(&reader, local, &sender));
+        }
 
         let shared = self.shared.clone();
         std::thread::spawn(move || {
             shared.viewers.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = viewer(rtc, &socket, local, &shared, &inbox, id) {
+            if let Err(e) = viewer(rtc, &sockets, &shared, &inbox, id) {
                 eprintln!("espectador {id}: {e}");
             }
             shared.subscribers.lock().unwrap().remove(&id);
@@ -981,10 +954,97 @@ impl Drop for Engine {
 ///
 /// Vídeo e som vão com o instante (`Instant`) em que foram capturados: é com ele que o WebRTC diz
 /// ao navegador como alinhar os dois.
+/// Escuta um soquete e entrega cada pacote à conexão do espectador, dizendo por qual endereço
+/// local ele entrou. Só termina quando a conexão termina.
+fn listen(reader: &UdpSocket, local: SocketAddr, sender: &Sender<Msg>) {
+    // 64 KB: um pacote maior que o buffer daria erro no Windows em vez de ser só ignorado.
+    let mut buf = vec![0u8; 65_536];
+    loop {
+        match reader.recv_from(&mut buf) {
+            Ok((n, source)) => {
+                if sender
+                    .send(Msg::Packet(buf[..n].to_vec(), source, local))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                // ConnectionReset em UDP no Windows é só um aviso ICMP de porta fechada, e volta na
+                // hora e sem parar: espera um pouco para não girar à toa. Qualquer outro erro de
+                // leitura também não é motivo para ficar surdo. Depois acorda a conexão, para ela
+                // notar se acabou.
+                if !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if sender.send(Msg::Tick).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Quantos endereços locais oferecer, no máximo, de cada família (placas virtuais e endereços
+/// IPv6 temporários às vezes vêm às dezenas). Um limite por família para uma não tirar a vez da outra.
+const MAX_IPV4: usize = 6;
+const MAX_IPV6: usize = 4;
+
+/// Endereços locais por onde um espectador pode chegar: todas as placas de rede, IPv4 e IPv6.
+/// É o que conecta duas pessoas atrás de operadoras com CGNAT (pelo IPv6) ou numa rede virtual de
+/// jogo; só a rota padrão em IPv4 não basta para elas.
+fn local_addresses() -> Vec<IpAddr> {
+    let listed = if_addrs::get_if_addrs()
+        .map(|list| list.into_iter().map(|interface| interface.ip()).collect())
+        .unwrap_or_default();
+    choose_addresses(listed, local_ip())
+}
+
+/// Dos endereços das placas, quais oferecer e em que ordem: a rota padrão primeiro, depois os
+/// outros IPv4, depois IPv6.
+fn choose_addresses(mut found: Vec<IpAddr>, default: IpAddr) -> Vec<IpAddr> {
+    let usable = |ip: &IpAddr| match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        // fe80::/10 só vale dentro do mesmo enlace e exige indicar a placa: fica de fora.
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    };
+    found.push(default);
+    found.retain(usable);
+    found.sort_by_key(|ip| (*ip != default, ip.is_ipv6(), *ip));
+    found.dedup();
+    let (mut v4, mut v6) = (0, 0);
+    found.retain(|ip| {
+        let count = if ip.is_ipv6() { &mut v6 } else { &mut v4 };
+        *count += 1;
+        *count <= if ip.is_ipv6() { MAX_IPV6 } else { MAX_IPV4 }
+    });
+    found
+}
+
+/// Abre um soquete em cada endereço local. Um endereço que não aceita (placa caindo) é pulado.
+fn bind_all() -> Result<Vec<(SocketAddr, UdpSocket)>, AnyError> {
+    let mut sockets = Vec::new();
+    for ip in local_addresses() {
+        if let Ok(socket) = UdpSocket::bind(SocketAddr::new(ip, 0))
+            && let Ok(local) = socket.local_addr()
+        {
+            sockets.push((local, socket));
+        }
+    }
+    if sockets.is_empty() {
+        // Sem nenhuma placa listada: o jeito antigo, um soquete só na rota padrão.
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        let local = SocketAddr::new(local_ip(), socket.local_addr()?.port());
+        sockets.push((local, socket));
+    }
+    Ok(sockets)
+}
+
 fn viewer(
     mut rtc: Rtc,
-    socket: &UdpSocket,
-    local: SocketAddr,
+    sockets: &[(SocketAddr, UdpSocket)],
     shared: &Shared,
     inbox: &Receiver<Msg>,
     id: u64,
@@ -1000,7 +1060,14 @@ fn viewer(
             Output::Timeout(at) => at,
             Output::Transmit(packet) => {
                 // Falha de envio (rede do computador piscou) não encerra: o WebRTC reenvia o que importa.
-                let _ = socket.send_to(&packet.contents, packet.destination);
+                // Sai pelo mesmo endereço local que o WebRTC escolheu para este caminho.
+                let socket = sockets
+                    .iter()
+                    .find(|(local, _)| *local == packet.source)
+                    .or(sockets.first());
+                if let Some((_, socket)) = socket {
+                    let _ = socket.send_to(&packet.contents, packet.destination);
+                }
                 continue;
             }
             Output::Event(event) => {
@@ -1115,7 +1182,7 @@ fn viewer(
                     }
                 }
             }
-            Some(Msg::Packet(data, source)) => {
+            Some(Msg::Packet(data, source, local)) => {
                 if let Some(entry) = shared.estimates.lock().unwrap().get_mut(&id) {
                     entry.1 = Instant::now();
                 }
@@ -1148,6 +1215,45 @@ mod tests {
     use str0m::media::Direction;
 
     use super::*;
+
+    #[test]
+    fn offers_every_network_card_with_the_default_route_first() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let default = ip("192.168.0.10");
+        let listed = vec![
+            ip("127.0.0.1"),
+            ip("fe80::1"),
+            ip("fd00::5"),
+            ip("26.10.20.30"),
+            ip("169.254.3.4"),
+            ip("192.168.0.10"),
+            ip("::1"),
+            ip("2804:14c::9"),
+            ip("26.10.20.30"),
+        ];
+        assert_eq!(
+            choose_addresses(listed, default),
+            vec![
+                ip("192.168.0.10"),
+                ip("26.10.20.30"),
+                ip("2804:14c::9"),
+                ip("fd00::5")
+            ]
+        );
+        // Sem lista de placas, sobra a rota padrão; e só de volta local não se oferece nada.
+        assert_eq!(choose_addresses(Vec::new(), default), vec![default]);
+        assert!(choose_addresses(Vec::new(), ip("127.0.0.1")).is_empty());
+    }
+
+    #[test]
+    fn many_addresses_of_one_family_do_not_crowd_out_the_other() {
+        let mut listed: Vec<IpAddr> = (1..=20u8).map(|n| IpAddr::from([10, 0, 0, n])).collect();
+        listed.extend((1..=20u16).map(|n| IpAddr::from([0x2804, 0, 0, 0, 0, 0, 0, n])));
+        let chosen = choose_addresses(listed, IpAddr::from([10, 0, 0, 7]));
+        assert_eq!(chosen[0], IpAddr::from([10, 0, 0, 7]));
+        assert_eq!(chosen.iter().filter(|ip| ip.is_ipv4()).count(), MAX_IPV4);
+        assert_eq!(chosen.iter().filter(|ip| ip.is_ipv6()).count(), MAX_IPV6);
+    }
 
     #[test]
     fn same_stream_gives_every_media_the_same_stream_id() {
