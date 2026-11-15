@@ -18,7 +18,7 @@ import { Menu, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useLiveRoom } from './hooks/useLiveRoom';
 import { useRoomSounds } from './hooks/useRoomSounds';
 import { loadCaptureSettings, saveCaptureSettings, type StreamKind } from './live/capture';
-import { liveKey } from './live/room';
+import { liveKey, parseLiveKey } from './live/room';
 import { signOutAccount } from './session';
 import { CaptureCancelled } from './lib/errors';
 import { LoadingScreen, LoginScreen, NicknameScreen, PendingScreen } from './components/AuthScreens';
@@ -95,6 +95,11 @@ function Community({ uid }: { uid: string }) {
     autoOpen.current.until = 0;
     setVisible((ids) => [...new Set([...ids, ...keys])].slice(0, 4));
   }, [keysOf]);
+  // A plateia de cada live: avisa ao canal o que está aberto no palco (só lives que estão no ar).
+  const { watch } = live;
+  useEffect(() => {
+    watch(snapshot.joined ? visible.filter((key) => keysOf().includes(key)) : []);
+  }, [watch, snapshot.joined, visible, keysOf]);
   const [adminOpen, setAdminOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   // Barra lateral escondida (no computador), para a live ocupar a janela inteira. Fica guardado.
@@ -158,6 +163,33 @@ function Community({ uid }: { uid: string }) {
     (id: string) => data.profiles[id]?.displayName || 'Participante',
     [data.profiles],
   );
+
+  // Live que começa com você já no canal não abre sozinha: um aviso com o botão Assistir.
+  const announced = useRef<{ room: string; lives: Set<string>; since: number } | null>(null);
+  useEffect(() => {
+    if (!snapshot.joined) {
+      announced.current = null;
+      return;
+    }
+    const lives = new Set(keysOf());
+    const before = announced.current;
+    if (!before || before.room !== snapshot.room) {
+      announced.current = { room: snapshot.room, lives, since: Date.now() };
+      return;
+    }
+    announced.current = { ...before, lives };
+    // Logo depois de entrar, as lives que já estavam no ar chegam aos poucos (e abrem sozinhas).
+    if (Date.now() - before.since < 4000) return;
+    for (const key of lives) {
+      if (before.lives.has(key)) continue;
+      const { uid: id, kind } = parseLiveKey(key);
+      const name = nameOf(id);
+      toast.show(kind === 'camera' ? `${name} ligou a webcam` : `${name} começou uma live`, 'info', {
+        label: 'Assistir',
+        run: () => setVisible((ids) => [...new Set([...ids, key])]),
+      });
+    }
+  }, [snapshot.joined, snapshot.room, keysOf, nameOf, toast]);
 
   const join = useCallback(
     async (channelId: string, watch?: string) => {
@@ -353,6 +385,7 @@ function Community({ uid }: { uid: string }) {
             visible={visible}
             setVisible={setVisible}
             nameOf={nameOf}
+            photoOf={(id) => data.avatars[id]}
             onRetry={live.retry}
             lead={sidebarToggle}
           />

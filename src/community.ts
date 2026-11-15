@@ -411,6 +411,7 @@ export const revokeMember = (uid: string, roles: Record<string, true> = {}) =>
 // Limpa uma sessão abandonada (ex.: navegador fechado antes do onDisconnect ser registrado).
 export async function removeRoomSession(roomId: string, uid: string) {
   await remove(ref(db, `rooms/${roomId}/streams/${uid}`));
+  await remove(ref(db, `rooms/${roomId}/watching/${uid}`)).catch(() => {});
   await remove(ref(db, `rooms/${roomId}/members/${uid}`));
 }
 

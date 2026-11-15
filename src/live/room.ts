@@ -18,6 +18,7 @@ import {
   isNativeLive,
   nativeMedia,
   NativeReceiver,
+  nativeGame,
   nativeSound,
   releaseNativePreview,
   stopNative,
@@ -55,7 +56,8 @@ type Signal =
 // negociação; é como quem assiste sabe qual stream recebido é a tela e qual é a câmera.
 // native: a live é enviada pelo motor do app; quem assiste abre uma conexão própria (native.ts).
 // sound: a live nativa leva som (quem assiste só pede áudio nesse caso).
-export type Broadcast = { startedAt: number; streamId: string; native?: boolean; sound?: boolean };
+// game: nome do jogo transmitido. startedAt: na hora do servidor (ver clockOffset em LiveSnapshot).
+export type Broadcast = { startedAt: number; streamId: string; native?: boolean; sound?: boolean; game?: string };
 export type Broadcasts = Record<string, Partial<Record<StreamKind, Broadcast>>>;
 export const STREAM_KINDS: StreamKind[] = ['screen', 'camera'];
 
@@ -97,6 +99,11 @@ export type LiveSnapshot = {
   native?: Record<string, 'playing' | 'connecting' | 'failed'>;
   // Versão do app de cada pessoa no canal, como ela informou ao entrar ("0.5.2 (Rust)", "navegador").
   apps?: Record<string, string>;
+  // Quem está assistindo cada live ("uid:tipo" → pessoas), como cada uma informou.
+  watchers?: Record<string, string[]>;
+  // Relógio do servidor menos o deste aparelho, em ms. As lives guardam o início na hora do servidor,
+  // para o tempo no ar sair certo mesmo com o relógio de alguém errado.
+  clockOffset?: number;
 };
 
 export type PeerDiagnostics = {
@@ -150,6 +157,8 @@ type LocalLive = {
   stream: MediaStream;
   announced: MediaStream;
   bitrate: number;
+  // Nome do jogo, quando a fonte é um jogo (só as lives do app sabem).
+  game?: string;
   startedAt: number;
   // Jogo fora da frente: quem assiste recebe a tela de pausa no lugar do vídeo.
   paused?: boolean;
@@ -298,6 +307,10 @@ export class LiveRoom {
   private apps: Record<string, string> = {};
   // Ofertas da mesma pessoa para a mesma live são atendidas uma de cada vez.
   private nativeQueue = new Map<string, Promise<void>>();
+  // Plateia: o que esta sessão está assistindo (avisado aos outros) e o que cada um assiste.
+  private watching: string[] = [];
+  private watchers: Record<string, string[]> = {};
+  private clockOffset = 0;
   // Procura de caminho com cada pessoa: quantas rodadas já começaram desde a última conexão que deu
   // certo, e quem mandou primeiro nas que falharam (ver iceOrder.ts).
   private iceAttempts: Record<string, number> = {};
@@ -321,6 +334,9 @@ export class LiveRoom {
   private get streamsRef() {
     return this.path(`streams/${this.uid}`);
   }
+  private get watchingRef() {
+    return this.path(`watching/${this.uid}`);
+  }
 
   snapshot(): LiveSnapshot {
     return {
@@ -333,6 +349,8 @@ export class LiveRoom {
       remote: this.allRemote(),
       native: this.nativeIn.states(this.broadcasts, this.uid),
       apps: this.apps,
+      watchers: this.watchers,
+      clockOffset: this.clockOffset,
       failed: [...this.failed],
       connecting: [...this.peers.entries()]
         .filter(([, p]) => p.pc.connectionState !== 'connected' && p.pc.connectionState !== 'failed')
@@ -391,6 +409,34 @@ export class LiveRoom {
     this.sessionStart = Date.now();
     if (reset) this.nativeIn.sync(this.broadcasts, this.members, this.uid);
     for (const kind of this.locals.keys()) await this.publishStream(kind);
+    await this.publishWatching().catch(() => {});
+  }
+
+  // Quais lives esta sessão está assistindo, para quem transmite (e os demais) verem a plateia.
+  setWatching(keys: string[]) {
+    const next = [...new Set(keys)].filter((key) => parseLiveKey(key).uid !== this.uid).sort();
+    if (next.join('|') === this.watching.join('|')) return;
+    this.watching = next;
+    if (this.joined && !this.replaced) void this.publishWatching().catch(() => {});
+  }
+
+  private async publishWatching() {
+    const value: Record<string, Partial<Record<StreamKind, true>>> = {};
+    for (const key of this.watching) {
+      const { uid, kind } = parseLiveKey(key);
+      (value[uid] ??= {})[kind] = true;
+    }
+    await onDisconnect(this.watchingRef).remove();
+    await set(this.watchingRef, Object.keys(value).length ? value : null);
+  }
+
+  private onWatching(raw: Record<string, Record<string, Record<string, unknown>>> | null) {
+    const next: Record<string, string[]> = {};
+    for (const [viewer, lives] of Object.entries(raw || {}))
+      for (const [uid, kinds] of Object.entries(lives || {}))
+        for (const kind of STREAM_KINDS) if (kinds?.[kind]) (next[liveKey(uid, kind)] ??= []).push(viewer);
+    this.watchers = next;
+    this.emit();
   }
 
   private async publishStream(kind: StreamKind) {
@@ -398,8 +444,10 @@ export class LiveRoom {
     if (!live) return;
     await onDisconnect(this.streamsRef).remove();
     await set(this.path(`streams/${this.uid}/${kind}`), {
-      startedAt: live.startedAt,
+      // Na hora do servidor: quem assiste calcula o tempo no ar sem depender do relógio de ninguém.
+      startedAt: Math.round(live.startedAt + this.clockOffset),
       streamId: live.announced.id,
+      ...(live.game ? { game: live.game } : {}),
       ...(isNativeLive(live.stream) ? { native: true, ...(nativeSound(live.stream) ? { sound: true } : {}) } : {}),
     });
   }
@@ -436,6 +484,19 @@ export class LiveRoom {
         (snap) => this.onBroadcasts(snap.val() || {}),
         () => {},
       ),
+    );
+    this.unsubs.push(
+      onValue(
+        this.path('watching'),
+        (snap) => this.onWatching(snap.val()),
+        () => {},
+      ),
+    );
+    this.unsubs.push(
+      onValue(ref(this.db, '.info/serverTimeOffset'), (snap) => {
+        this.clockOffset = Number(snap.val()) || 0;
+        this.emit();
+      }),
     );
     this.unsubs.push(
       onValue(
@@ -1082,7 +1143,7 @@ export class LiveRoom {
     // Com a captura já ativa, descobre se dá para codificar pela placa de vídeo (ver hwcodec.ts).
     // A resposta fica guardada: só a primeira live da semana espera o teste (até ~4 s).
     if (!isNativeLive(stream)) this.hardware = await hardwareH264();
-    this.locals.set(kind, { stream, announced, bitrate, startedAt: Date.now() });
+    this.locals.set(kind, { stream, announced, bitrate, game: nativeGame(stream) || undefined, startedAt: Date.now() });
     this.watchEnded(stream, kind);
     try {
       await this.publishStream(kind);
@@ -1111,6 +1172,7 @@ export class LiveRoom {
     const old = live.stream;
     live.stream = stream;
     live.bitrate = bitrate;
+    live.game = nativeGame(stream) || undefined;
     live.paused = false;
     this.watchEnded(stream, kind);
     for (const peer of this.peers.values()) this.syncSenders(peer, kind);
@@ -1170,6 +1232,10 @@ export class LiveRoom {
     await onDisconnect(this.memberRef)
       .cancel()
       .catch(() => {});
+    await onDisconnect(this.watchingRef)
+      .cancel()
+      .catch(() => {});
+    if (!this.replaced) await remove(this.watchingRef).catch(() => {});
     // Trocada por outra sessão da mesma conta: o registro de presença agora é dela.
     if (!this.replaced) await remove(this.memberRef).catch(() => {});
     this.emit();

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { LayoutGrid, RectangleHorizontal, Users, Video } from 'lucide-react';
+import { LayoutGrid, MonitorPlay, RectangleHorizontal, Users, Video } from 'lucide-react';
+import { Avatar } from './Avatar';
+import { Elapsed, Viewers } from './LiveMeta';
 import { LiveTile, type TileState } from './LiveTile';
 import { liveKey, parseLiveKey, type LiveSnapshot } from '../live/room';
 import type { StreamKind } from '../live/capture';
@@ -44,6 +46,7 @@ export function Stage({
   visible,
   setVisible,
   nameOf,
+  photoOf,
   onRetry,
   lead,
 }: {
@@ -53,6 +56,7 @@ export function Stage({
   visible: string[];
   setVisible: (update: (ids: string[]) => string[]) => void;
   nameOf: (id: string) => string;
+  photoOf?: (id: string) => string | undefined;
   onRetry: (id: string) => void;
   // Botão à esquerda do nome do canal (ocultar ou mostrar a barra lateral).
   lead?: ReactNode;
@@ -109,6 +113,12 @@ export function Stage({
     return nameOf(id);
   };
 
+  // Quem está assistindo uma live (só gente que está no canal), com "Você" para a própria pessoa.
+  const viewersOf = (key: string) =>
+    (live.watchers?.[key] || [])
+      .filter((id) => live.members.includes(id))
+      .map((id) => (id === uid ? 'Você' : nameOf(id)));
+
   const tileFor = (key: string, compact = false) => {
     const { uid: id, kind } = parseLiveKey(key);
     const own = id === uid;
@@ -151,6 +161,10 @@ export function Stage({
         onRetry={() => onRetry(id)}
         compact={compact}
         style={compact ? undefined : { width: fit.width, height: fit.height }}
+        startedAt={live.broadcasts[id]?.[kind]?.startedAt}
+        clockOffset={live.clockOffset}
+        viewers={viewersOf(key)}
+        game={live.broadcasts[id]?.[kind]?.game}
       />
     );
   };
@@ -205,7 +219,47 @@ export function Stage({
         )}
       </header>
       <div className="stage-area" ref={area}>
-        {shown.length === 0 ? (
+        {shown.length === 0 && active.length > 0 ? (
+          // Como no Discord: cada live do canal vira um cartão, com quem transmite, o que é, há quanto
+          // tempo está no ar e quantos estão assistindo.
+          <div className="live-cards">
+            <strong className="live-cards-title">Ao vivo agora</strong>
+            <div className="live-cards-grid">
+              {active.map((key) => {
+                const { uid: id, kind } = parseLiveKey(key);
+                const own = id === uid;
+                const broadcast = live.broadcasts[id]?.[kind];
+                const name = own ? 'Você' : nameOf(id);
+                return (
+                  <button
+                    key={key}
+                    className="live-card"
+                    title={own ? 'Ver a sua prévia' : 'Assistir a live de ' + name}
+                    onClick={() => toggle(key)}
+                  >
+                    <span className="live-card-head">
+                      <Avatar photo={photoOf?.(id)} name={own ? nameOf(id) : name} />
+                      <span className="live-card-text">
+                        <strong>{name}</strong>
+                        <small>
+                          {kind === 'camera' ? <Video size={12} aria-hidden /> : <MonitorPlay size={12} aria-hidden />}
+                          {kind === 'camera' ? 'Webcam' : broadcast?.game || 'Tela'}
+                        </small>
+                      </span>
+                    </span>
+                    <span className="live-card-meta">
+                      <span className="live-badge">AO VIVO</span>
+                      <Elapsed startedAt={broadcast?.startedAt} clockOffset={live.clockOffset} />
+                      <Viewers names={viewersOf(key)} />
+                      <span className="live-card-action">{own ? 'Ver prévia' : 'Assistir'}</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <span className="muted">Dá para assistir várias ao mesmo tempo, pelos nomes acima ou pela barra lateral.</span>
+          </div>
+        ) : shown.length === 0 ? (
           <div className="stage-empty">
             <img src="/nimbo-icon-256.png" alt="" />
             <strong>{active.length ? 'Escolha uma live para assistir' : 'Ninguém ao vivo por aqui'}</strong>
