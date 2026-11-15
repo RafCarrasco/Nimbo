@@ -7,6 +7,10 @@
 //! A sala lê a caixa, entrega o que chegou a quem cuida das lives (`take_signals`) e apaga cada
 //! mensagem depois de entregue. Por enquanto só as lives nativas (as do motor do app) são atendidas;
 //! as mensagens das lives de navegador são descartadas (ver N10 em `docs/rust-app.md`).
+//!
+//! Live própria: `publish_stream` anuncia no canal a live que o motor está enviando (`native: true`),
+//! no formato que o site e o app atual leem; ela some sozinha se a conexão cair e é reanunciada quando
+//! a conexão volta.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};

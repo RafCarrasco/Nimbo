@@ -136,8 +136,9 @@ impl Lives {
     }
 
     /// A cada quadro da interface: acerta o que está no palco, as conexões de quem assiste e
-    /// entrega a sinalização que chegou.
-    fn update(&mut self, room: &Room, snapshot: &RoomSnapshot, uid: &str, watch_all: bool) {
+    /// entrega a sinalização que chegou. Devolve um aviso para a pessoa, se houver.
+    fn update(&mut self, room: &Room, snapshot: &RoomSnapshot, uid: &str, watch_all: bool) -> Option<&'static str> {
+        let mut notice = None;
         // A conexão com o banco caiu e voltou: as ofertas feitas durante a queda se perderam.
         if snapshot.reconnects != self.reconnects {
             self.reconnects = snapshot.reconnects;
@@ -146,6 +147,11 @@ impl Lives {
         // A transmissão acabou sozinha (não começou, ou foi encerrada): não fica um ladrilho morto.
         if self.broadcasting.as_ref().is_some_and(|live| live.state() == BroadcastState::Stopped) {
             self.broadcasting = None;
+        }
+        // A janela (ou o jogo) que estava sendo transmitida fechou: a live acaba, como no site.
+        if self.broadcasting.as_ref().is_some_and(|live| live.state() == BroadcastState::Live && !live.stats().capturing) {
+            self.broadcasting = None;
+            notice = Some("A janela que você estava transmitindo fechou. A live foi encerrada.");
         }
         let others = Self::keys_of(snapshot, uid, None);
         if let Some((until, member)) = &self.auto_open {
@@ -181,6 +187,7 @@ impl Lives {
                 live.offer(&from, &sdp, &nonce);
             }
         }
+        notice
     }
 }
 
@@ -618,7 +625,9 @@ impl Nimbo {
                 let audio = args.sound.then(|| AudioSource::Exclude(std::process::id()));
                 Self::start_broadcast(lives, handle, &data.uid, Capture { source: Source::Window(window), audio }, &ctx);
             }
-            lives.update(handle, snapshot, &data.uid, args.watch_all);
+            if let Some(message) = lives.update(handle, snapshot, &data.uid, args.watch_all) {
+                *notice = message.to_owned();
+            }
             for key in lives.shown.iter().filter(|key| parse_key(key).0 != data.uid) {
                 if let Some(frame) = lives.watching.frame(key)
                     && videos.upload(&ctx, key, &frame)

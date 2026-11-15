@@ -301,23 +301,30 @@ Peças novas:
   - `auth.rs`: login pela API REST do Firebase (credencial do Google → token; renovação).
   - `community.rs`: o mesmo que `useCommunity`/`usePeople`/`useRoomsPresence` do site (proprietário lê as
     listas; os demais, item a item) e as contas de quem vê o quê.
-  - `room.rs`: entrar e sair de um canal (presença, queda e volta, troca de sessão da mesma conta).
+  - `room.rs`: entrar e sair de um canal (presença, queda e volta, troca de sessão da mesma conta) e a
+    sinalização das lives nativas, igual à do site: caixa de entrada, oferta de quem assiste, resposta de
+    quem transmite, anúncio da própria live (reanunciada quando a conexão volta).
   - Binário `nimbo-core`: `selftest` (confere tudo contra o emulador), `sidebar <conta>` (a barra lateral em
     texto) e `watch <conta> <caminho>`.
 - `desktop/rust-ui` (`nimbo-native`): a janela, em egui 0.37 + wgpu. Cores e medidas copiadas de
   `src/style.css`, fonte Segoe UI lida do Windows, ícones lucide (os mesmos do site).
-- `desktop/rust-media`, módulo `viewer`: o player (receber, decodificar, tocar). Em andamento.
+  - `live.rs`: quem assiste (uma conexão do player por live no palco, com as mesmas tentativas e prazos do
+    `NativeReceiver` do site) e quem transmite (o motor responde a oferta de cada pessoa).
+  - `stage.rs` e `video.rs`: o palco (etiquetas das lives, ladrilhos em grade) e o desenho do vídeo. Os
+    dois planos do quadro (NV12) sobem para a placa e viram cor no desenho, num shader.
+  - `picker.rs`: "O que você quer compartilhar?", com a lista de telas e janelas de `desktop/rust-native`.
+- `desktop/rust-media`, módulo `viewer`: o player (receber, decodificar pela placa, tocar o som).
 
 | # | Entrega | Estado |
 |---|---|---|
-| N1 | Cliente do banco e login no miolo | **Feito**: `nimbo-core selftest`, 11 passos contra o emulador com as regras de verdade |
+| N1 | Cliente do banco e login no miolo | **Feito**: `nimbo-core selftest`, 13 passos contra o emulador com as regras de verdade |
 | N2 | Modelo da comunidade (níveis, cargos, quem vê o quê, presença) | **Feito**: conferido com 5 contas (proprietário, administrador, um membro de cada grupo, conta sem aprovação) |
 | N3 | Janela: entrada, espera de aprovação, barra lateral, tela inicial | **Feito**, só com contas de teste do emulador; comparado com o site na mesma conta |
 | N4 | Entrar e sair de canal | **Feito**: aparece para os outros com a versão do app, some ao fechar, e a sessão antiga sai quando a mesma conta entra em outro lugar |
-| N5 | Player: receber, decodificar e tocar a live | Em andamento |
-| N6 | Sinalização das lives no miolo (`native.ts` e o resto de `room.ts`) | **Parte feita**: lives anunciadas, caixa de entrada (entrega uma vez e apaga) e envio da oferta para lives nativas. Falta ligar ao player e atender as lives de navegador |
-| N7 | Assistir dentro do app nativo (palco, várias lives, tela cheia) | Falta |
-| N8 | Transmitir tela pelo motor, com o seletor | Falta |
+| N5 | Player: receber, decodificar e tocar a live | **Feito** (`nimbo_media::viewer`). Contra o servidor de teste do motor, na mesma máquina: 48 q/s recebidos, decodificados e desenhados, sem perda; 0,17 ms por quadro sem cópia e 1,55 ms com a cópia para a memória; 3,3% e 7,3% de um núcleo; 71 e 92 MB. Não testado com perda de rede, fora da rede local, nem em placa Intel/AMD |
+| N6 | Sinalização das lives no miolo (`native.ts` e o resto de `room.ts`) | **Feito para lives nativas** (as do motor), nos dois sentidos, no formato do site: anúncio da live, oferta com código, resposta com o mesmo código, cada mensagem entregue uma vez e apagada, live reanunciada depois de uma queda. Conferido no `selftest` e entre dois apps nativos. **Não testado contra o site nem contra o app atual.** Falta atender as lives de navegador (N10) |
+| N7 | Assistir dentro do app nativo (palco, várias lives, tela cheia) | **Feito o essencial**: as lives nativas abrem no palco (sozinhas ao entrar, pelo nome na barra ou pela etiqueta do topo), uma ou várias em grade, com som; "conectando", "não conectou" e "Tentar de novo". Falta: volume por live e silenciar, tela cheia, destaque de uma live, diagnóstico, servidor de retransmissão (TURN) |
+| N8 | Transmitir tela pelo motor, com o seletor | **Feito o essencial**: botão "Tela" abre a lista de telas e janelas (sem miniaturas), o motor captura e responde a cada pessoa que pede para assistir, "Encerrar" e sair do canal acabam com a live, e ela acaba sozinha se a janela fecha. O clique no seletor não foi testado (os testes começam a live por argumento). Falta: prévia da própria live, qualidade e som à escolha, trocar de fonte sem encerrar, pausa quando o jogo sai da frente |
 | N9 | Login de verdade do Google e sessão guardada entre aberturas | **Feito no emulador**: o app abre a página `/desktop-login` no navegador (mesmo módulo do app atual), recebe a credencial, e ao reabrir entra sozinho com a sessão guardada (cifrada pelo Windows, DPAPI). Falta um login real do Google (`--production`), que só o dono pode fazer |
 | N10 | Webcam (enviar) e lives vindas de navegador (receber) | Falta |
 | N11 | Apelido, perfil e foto; administração (no app ou só pelo site) | Falta |
@@ -336,6 +343,51 @@ A memória ficou menor que a do app atual, mas longe de "leve": quase tudo é da
 wgpu), não da interface. Fica para otimizar depois que o player entrar, porque é ele que decide como a placa
 é usada. Ainda não mede nada de vídeo.
 
+### Live nativa de ponta a ponta (medido em 15/11/2026)
+
+Dois `nimbo-native` no mesmo canal do emulador, na mesma máquina (i5-14600KF + RTX 5070), compilados em modo
+otimizado: um transmite uma janela de teste com movimento (1920x1032, fora da tela), o outro assiste com o
+som em volume zero. A janela de teste desenha a 75 quadros por segundo, mas o motor mandou 37,5: com o teto
+de 60, ele descarta o quadro que chega cedo demais e, numa tela de 75 Hz, isso é um quadro sim, um não (numa
+de 144 Hz dá os 48 das medições anteriores). É do motor, vale também para o app atual, e não foi mexido aqui.
+
+| Medida (46 s, uma live) | Quem assiste | Quem transmite |
+|---|---|---|
+| Quadros por segundo | 37,5 recebidos, 37,5 decodificados, 37,5 desenhados | 37,5 codificados (placa NVIDIA) |
+| Descartados, pacotes faltando | 0 e 0 (11 descartados só quando entra com a live já no ar, até o primeiro quadro completo) | - |
+| Decodificar, com a cópia para a memória | 1,58 ms por quadro | - |
+| Do primeiro pacote ao quadro pronto | 1,79 ms | - |
+| Taxa | 5,3 Mbps recebidos | 5,0 Mbps produzidos (alvo de 8) |
+| Som | 1000 ms de som por segundo entregues à saída, nenhuma falha | capturado e enviado |
+| CPU (um núcleo), média e faixa | 12,5% (7,8% a 16,4%) | 6,3% (2,3% a 9,4%) |
+| Memória em uso / privada | 215 a 262 MB / 433 a 451 MB | 213 a 249 MB / 469 a 484 MB |
+
+- **Para onde vai a CPU de quem assiste**: o player gasta perto de 3% (decodificador 1,5%, rede 1,4%, som
+  0,1%). O resto, uns 9%, é a interface redesenhando a janela inteira a cada quadro do vídeo. É o próximo
+  lugar a otimizar; desenhar direto da textura do decodificador (sem a cópia de 3 MB por quadro) é o outro.
+- **Conversão de cor na CPU** (`--cpu-video`, a reserva para quando a janela não está no wgpu): 31,0% de um
+  núcleo (25,8% a 34,4%), com os mesmos 37,5 quadros desenhados. Por isso o caminho normal é o shader.
+- **Duas lives ao mesmo tempo** (dois players no mesmo processo, 56 s): 37,5 quadros por segundo desenhados
+  em cada uma, 18,0% de um núcleo (13,3% a 23,4%).
+- **Comparação com o navegador**: não foi refeita aqui. Na bancada do player, um Chromium assistindo à
+  mesma live gastou 8% a 10% de um núcleo e 563 MB; o app nativo inteiro gasta mais CPU que isso hoje (12,5%)
+  e menos da metade da memória.
+
+Situações conferidas (pelos números de `--stats` de quem assiste, a cada 2 s):
+
+- quem assiste já está no canal e a live começa: o ladrilho aparece e toca em até 2 s;
+- quem assiste entra com a live já no ar: abre sozinha, como no site;
+- quem transmite fecha o app: o ladrilho some em até 2 s; quando a live recomeça, volta sozinho;
+- a janela transmitida fecha: a live acaba dos dois lados;
+- sair do canal ou clicar em "Encerrar" tira a live (no `selftest` do miolo).
+
+Não testado: **o site ou o app atual assistindo a uma live do app nativo, e o app nativo assistindo a uma
+live do app atual** (a sinalização segue o formato do site à risca, mas nenhum navegador entrou no teste);
+duas máquinas, internet, NAT e perda de rede; "Tentar de novo" e a desistência depois de 3 tentativas (não
+houve falha de conexão para exercitar); som audível; o clique no seletor; monitor inteiro como fonte; mais de
+duas lives; janela visível na tela (os testes abrem fora dela); queda da conexão com o banco durante a live
+(só no `selftest` do miolo).
+
 Como rodar (emuladores; `--production` fala com o Firebase de verdade e ainda está em validação):
 
 ```
@@ -344,10 +396,18 @@ cargo run --manifest-path desktop/rust-core/Cargo.toml -- selftest
 cargo run --manifest-path desktop/rust-core/Cargo.toml -- probe
 cargo run --manifest-path desktop/rust-ui/Cargo.toml -- --dev-user owner [--join <canal>] [--screenshot foto.png]
 cargo run --manifest-path desktop/rust-ui/Cargo.toml          # login pelo navegador, com `npm run dev:local` no ar
+# live sem clicar (sempre com --mute nos testes: nenhum som audível):
+cargo run --release --manifest-path desktop/rust-ui/Cargo.toml -- --dev-user a --join geral --broadcast <janela> --sound --stats
+cargo run --release --manifest-path desktop/rust-ui/Cargo.toml -- --dev-user b --join geral --watch-all --mute --stats
 ```
 
-`--dev-user nome` entra na mesma conta que `?devUser=nome` no site. O que ainda não existe no nativo aparece
-desligado ou com aviso na própria tela (assistir, transmitir, perfil, administração).
+`--broadcast` recebe o identificador da janela no Windows; `--position x,y` abre a janela do app onde for
+pedido (os testes usam fora da tela); `--stats` imprime os números a cada 2 s; `--cpu-video` troca o desenho
+pela conversão na CPU. Outro par de emuladores (para dois testes não dividirem o banco) entra por
+`NIMBO_EMULATOR_DB` e `NIMBO_EMULATOR_AUTH` (`host:porta`).
+
+`--dev-user nome` entra na mesma conta que `?devUser=nome` no site. O que ainda não existe no nativo não faz
+nada ao clicar (perfil, administração, criar canal).
 
 Banco de verdade: `nimbo-core probe` abre a conexão sem conta nenhuma (não lê nem grava nada). Em 15/11/2026
 conectou em 0,5 s e a leitura sem login foi recusada pelas regras, como deve ser; o relógio do servidor estava
