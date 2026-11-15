@@ -1284,6 +1284,17 @@ fn set_hops(socket: &UdpSocket, hops: u32) -> bool {
     }
 }
 
+/// Com `NIMBO_TRACE=1`, escreve no stderr o que acontece com cada espectador (testes de rede).
+fn trace(id: u64, start: Instant, what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("NIMBO_TRACE").is_some()) {
+        eprintln!(
+            "[espectador {id}] +{} ms {what}",
+            start.elapsed().as_millis()
+        );
+    }
+}
+
 fn viewer(
     mut rtc: Rtc,
     sockets: &[(SocketAddr, UdpSocket)],
@@ -1323,10 +1334,15 @@ fn viewer(
                 match event {
                     // Rede que oscila costuma voltar em segundos: só desiste depois de LOST.
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                        trace(id, start, "ice: Disconnected");
                         lost.get_or_insert_with(Instant::now);
                     }
-                    Event::IceConnectionStateChange(_) => lost = None,
+                    Event::IceConnectionStateChange(state) => {
+                        trace(id, start, &format!("ice: {state:?}"));
+                        lost = None;
+                    }
                     Event::Connected => {
+                        trace(id, start, "conectado");
                         connected = true;
                         shared.keyframe.store(true, Ordering::Relaxed);
                         let target = u64::from(shared.target.load(Ordering::Relaxed));
@@ -1369,6 +1385,15 @@ fn viewer(
             || (!connected && start.elapsed() > Duration::from_secs(15))
             || lost.is_some_and(|since| since.elapsed() > LOST)
         {
+            trace(
+                id,
+                start,
+                &format!(
+                    "encerrado: vivo={} conectado={connected} semRede={:?}",
+                    rtc.is_alive(),
+                    lost.map(|since| since.elapsed())
+                ),
+            );
             return Ok(());
         }
         // O controle de banda dita o ritmo de envio pacote a pacote; atrasar muito esses avisos faz a

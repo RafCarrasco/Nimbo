@@ -16,7 +16,13 @@ use crate::AnyError;
 pub fn run(port: u16, audio: Option<AudioSource>) -> Result<(), AnyError> {
     let engine = Arc::new(Engine::new());
     engine.set_audio(audio)?;
-    engine.start(Source::PrimaryMonitor, Quality::default())?;
+    // `NIMBO_SERVE_WINDOW=<hwnd>`: captura essa janela em vez da tela principal (testes de rede
+    // com uma janela de teste, sem transmitir a tela de quem está usando o computador).
+    let source = std::env::var("NIMBO_SERVE_WINDOW")
+        .ok()
+        .and_then(|text| text.parse::<isize>().ok())
+        .map_or(Source::PrimaryMonitor, Source::Window);
+    engine.start(source, Quality::default())?;
 
     let stats = engine.clone();
     std::thread::spawn(move || {
