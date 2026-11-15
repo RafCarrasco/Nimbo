@@ -1055,13 +1055,15 @@ fn viewer(
         {
             return Ok(());
         }
-        // O controle de banda dita o ritmo de envio pacote a pacote; atrasar esses avisos faz a banda
-        // estimada despencar (testado com janelas de 4 ms), então a espera segue exatamente o pedido.
+        // O controle de banda dita o ritmo de envio pacote a pacote; atrasar muito esses avisos faz a
+        // banda estimada despencar (testado com janelas de 4 ms). Mas espera menor que 1 ms não dorme de
+        // verdade no Windows: vira um laço girando, com rajadas de 30% de um núcleo. O piso de 1 ms
+        // mantém o ritmo (o Chrome agrupa em 5 ms) sem girar.
         let wait = timeout.saturating_duration_since(Instant::now());
         let message = if wait.is_zero() {
             None
         } else {
-            inbox.recv_timeout(wait).ok()
+            inbox.recv_timeout(wait.max(Duration::from_millis(1))).ok()
         };
         match message {
             Some(Msg::Frame(frame)) => {

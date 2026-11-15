@@ -436,15 +436,18 @@ impl HwEncoder {
         self.wants -= 1;
         self.inflight += 1;
         self.accepted = Instant::now();
-        // Espera a saída deste quadro em vez de colhê-la só quando o próximo chegar.
+        // Espera a saída deste quadro em vez de colhê-la só quando o próximo chegar. A placa leva ~3 ms:
+        // dorme a maior parte disso de uma vez e só então consulta, para não acordar a cada 0,5 ms.
         let before = out.len();
         let deadline = Instant::now() + OUTPUT_WAIT;
+        let mut nap = Duration::from_micros(2_200);
         loop {
+            std::thread::sleep(nap);
+            nap = Duration::from_micros(700);
             self.drain(out)?;
             if out.len() > before || Instant::now() >= deadline {
                 break;
             }
-            std::thread::sleep(Duration::from_micros(500));
         }
         Ok(true)
     }
