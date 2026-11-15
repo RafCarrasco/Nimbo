@@ -13,6 +13,9 @@
             "app": {
               ".validate": "newData.isString() && newData.val().length <= 32"
             },
+            "sid": {
+              ".validate": "newData.isString() && newData.val().length <= 24"
+            },
             "$other": {
               ".validate": false
             }

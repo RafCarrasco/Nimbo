@@ -250,6 +250,12 @@ export class LiveRoom {
   // Quando esta sessão entrou no canal (ou reconectou): nos primeiros 30 s a live presa é
   // percebida mais cedo, porque é aí que a conexão com quem transmite está sendo refeita.
   private sessionStart = 0;
+  // Identifica esta sessão na presença do canal. A sinalização é por conta (uma caixa de entrada e
+  // uma vaga em cada transmissor), então a mesma conta em dois lugares disputa as mesmas mensagens:
+  // medido em 15/11/2026, app e navegador juntos derrubavam a live um do outro a cada ~20 s.
+  private sid = crypto.randomUUID().slice(0, 12);
+  // Outra sessão desta conta entrou no canal: esta sai sem mexer na presença, que agora é da outra.
+  private replaced = false;
   // Lives nativas que chegam (lado de quem assiste) e conexões abertas no motor para quem nos
   // assiste (lado de quem transmite), por "participante:tipo".
   private nativeIn = new NativeReceiver({
@@ -347,7 +353,7 @@ export class LiveRoom {
     if (reset) this.nativeIn.reset();
     await onDisconnect(this.memberRef).remove();
     // A versão do app vai junto: quando uma live não conecta, mostra quem ainda não atualizou.
-    await set(this.memberRef, { joinedAt: serverTimestamp(), app: APP_LABEL });
+    await set(this.memberRef, { joinedAt: serverTimestamp(), app: APP_LABEL, sid: this.sid });
     this.sessionStart = Date.now();
     if (reset) this.nativeIn.sync(this.broadcasts, this.members, this.uid);
     for (const kind of this.locals.keys()) await this.publishStream(kind);
@@ -406,7 +412,15 @@ export class LiveRoom {
     );
   }
 
-  private onMembers(entries: Record<string, { joinedAt?: unknown; app?: unknown }>) {
+  private onMembers(entries: Record<string, { joinedAt?: unknown; app?: unknown; sid?: unknown }>) {
+    // A presença desta conta foi escrita por outra sessão (outra aba, o navegador, outro aparelho):
+    // a mais nova fica com o canal. Sem registro nenhum é só uma queda de rede, que se refaz sozinha.
+    const mine = entries[this.uid];
+    if (this.joined && !this.replaced && mine && mine.sid !== this.sid) {
+      this.replaced = true;
+      this.onIssue('Você entrou neste canal em outro lugar (outra aba, navegador ou aparelho). Esta sessão saiu do canal.', true);
+      return;
+    }
     const ids = Object.keys(entries);
     this.apps = Object.fromEntries(ids.map((id) => [id, typeof entries[id]?.app === 'string' ? (entries[id].app as string) : '']));
     for (const id of ids) {
@@ -987,7 +1001,8 @@ export class LiveRoom {
     await onDisconnect(this.memberRef)
       .cancel()
       .catch(() => {});
-    await remove(this.memberRef).catch(() => {});
+    // Trocada por outra sessão da mesma conta: o registro de presença agora é dela.
+    if (!this.replaced) await remove(this.memberRef).catch(() => {});
     this.emit();
     this.closed = true;
   }

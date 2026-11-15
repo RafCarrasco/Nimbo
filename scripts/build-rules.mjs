@@ -93,6 +93,8 @@ const rules = {
             joinedAt: { '.validate': 'newData.isNumber()' },
             // Versão do app de quem entrou ("0.5.1 (Rust)", "navegador"), para o diagnóstico das lives.
             app: { '.validate': 'newData.isString() && newData.val().length <= 32' },
+            // Qual sessão desta conta está no canal: a mais nova fica, a antiga percebe e sai.
+            sid: { '.validate': 'newData.isString() && newData.val().length <= 24' },
             ...noOtherFields,
           },
         },
