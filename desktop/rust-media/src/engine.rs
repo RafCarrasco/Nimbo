@@ -65,6 +65,102 @@ const MAX_VIEWERS: usize = 48;
 /// Rede que some por este tempo encerra a conexão do espectador (ele refaz do lado dele).
 const LOST: Duration = Duration::from_secs(10);
 const SOFTWARE_BITRATE: u32 = 4_000_000;
+
+/// Um degrau da escada de qualidade: altura máxima da imagem, teto de quadros por segundo e a taxa
+/// abaixo da qual o motor desce para o degrau seguinte.
+struct Step {
+    height: u32,
+    fps: u32,
+    floor: u32,
+}
+
+/// Escada de qualidade. Medido em 15/11/2026 com o espectador limitado a 3 Mbps: o controle de banda
+/// pedia 0,8 Mbps, mas o codificador da placa não comprime 1080p com movimento abaixo de ~4 Mbps;
+/// continuava mandando 4 Mbps, 40% se perdia e quem assistia ficava sem imagem. Imagem menor precisa
+/// de bem menos bits, então a taxa pedida passa a caber.
+const LADDER: [Step; 5] = [
+    Step {
+        height: u32::MAX,
+        fps: u32::MAX,
+        floor: 4_000_000,
+    },
+    Step {
+        height: 720,
+        fps: u32::MAX,
+        floor: 2_800_000,
+    },
+    Step {
+        height: 720,
+        fps: 30,
+        floor: 1_700_000,
+    },
+    Step {
+        height: 540,
+        fps: 30,
+        floor: 1_000_000,
+    },
+    Step {
+        height: 360,
+        fps: 30,
+        floor: 0,
+    },
+];
+/// Para descer, a taxa pedida precisa ficar apertada por este número de medições seguidas (uma por
+/// segundo): uma oscilação curta da estimativa não muda a resolução.
+const STEP_DOWN_AFTER: u8 = 2;
+/// Para subir, a taxa pedida precisa passar com folga do piso do degrau de cima por mais tempo:
+/// subir e descer toda hora troca a resolução na tela de quem assiste.
+const STEP_UP_AFTER: u8 = 6;
+/// Subida que não se sustentou (desceu de novo em menos de `BOUNCE`) dobra a espera da próxima, até
+/// este teto. Medido com 3 Mbps de banda: sem isto a live subia para 720p e caía a cada ~12 s, com
+/// travadas de 1 a 4 s em cada volta.
+const STEP_UP_MAX: u8 = 60;
+const BOUNCE: Duration = Duration::from_secs(25);
+/// Perda a partir da qual o motor conclui que está mandando mais do que o caminho aguenta. Perda
+/// pequena e constante (3% medidos) é ruído da rede e se resolve com reenvio, sem baixar a taxa.
+const HEAVY_LOSS: f32 = 0.10;
+/// Por quanto tempo a taxa fica presa abaixo do que foi entregue; dobra a cada recaída, até o teto.
+const LIMIT_HOLD: Duration = Duration::from_secs(30);
+const LIMIT_HOLD_MAX: Duration = Duration::from_secs(240);
+
+/// Teto da taxa depois de uma perda alta: uma folga abaixo do que de fato chegou a quem assiste
+/// (o que foi enviado a ele, com reenvios, menos a fração perdida).
+fn delivered_limit(sent: u64, loss: f32) -> u32 {
+    let delivered = sent as f64 * f64::from(1.0 - loss.clamp(0.0, 1.0));
+    ((delivered * 0.85) as u64).clamp(u64::from(MIN_BITRATE), u64::from(u32::MAX)) as u32
+}
+
+/// Degrau mantido por este tempo depois de subir: a espera volta ao normal.
+const SETTLED: Duration = Duration::from_secs(90);
+
+/// O degrau que a taxa pedida comporta: o primeiro cujo piso ela alcança.
+fn fitting_step(wanted: u32) -> usize {
+    LADDER
+        .iter()
+        .position(|rung| wanted >= rung.floor)
+        .unwrap_or(LADDER.len() - 1)
+}
+
+/// O degrau em que o motor deve ficar. `fit`: o degrau que a taxa pedida comporta. `over`: o
+/// codificador produz bem mais do que o pedido (não comprime tanto nesta resolução).
+fn next_step(
+    step: usize,
+    fit: usize,
+    over: bool,
+    tight_for: u8,
+    roomy_for: u8,
+    up_after: u8,
+) -> usize {
+    let last = LADDER.len() - 1;
+    if tight_for >= STEP_DOWN_AFTER && step < last {
+        // Desce direto para onde a taxa cabe; se o problema é só o codificador, um degrau.
+        fit.max(step + 1).min(last)
+    } else if roomy_for >= up_after && step > 0 && !over {
+        step - 1
+    } else {
+        step
+    }
+}
 /// Servidores STUN: os mesmos do site, para descobrir o endereço público.
 const STUN_SERVERS: [&str; 2] = ["stun.cloudflare.com:3478", "stun.l.google.com:19302"];
 
@@ -112,6 +208,8 @@ pub struct Stats {
     pub viewers: usize,
     pub encoder: String,
     pub target_bitrate: u32,
+    /// Quanto o codificador produziu de verdade no último segundo medido, em bits por segundo.
+    pub produced_bitrate: u32,
     pub frames_encoded: usize,
     /// A captura de áudio está ligada e viva.
     pub audio: bool,
@@ -146,8 +244,13 @@ struct Shared {
     encoder: Mutex<String>,
     /// Banda estimada de cada espectador, em bits por segundo.
     estimates: Mutex<HashMap<u64, (u64, Instant)>>,
+    /// Caminho de cada espectador no último segundo medido: fração de pacotes perdidos e quanto foi
+    /// enviado a ele (bits por segundo, com reenvios).
+    losses: Mutex<HashMap<u64, (f32, u64, Instant)>>,
     /// Taxa de bits que o codificador está usando agora.
     target: AtomicU32,
+    /// Taxa que o codificador produziu de verdade no último segundo medido.
+    produced: AtomicU32,
     next_id: AtomicU64,
     quality: Mutex<Quality>,
     /// A fonte capturada fechou (a janela ou o jogo foi encerrado).
@@ -224,6 +327,18 @@ struct Coder {
     retry_at: Instant,
     /// Bytes de vídeo produzidos desde `checked`: mostra se a tela está parada.
     produced: u64,
+    /// Degrau atual da escada de qualidade (`LADDER`).
+    step: usize,
+    /// Há quantas medições seguidas a taxa está apertada demais para o degrau, ou folgada.
+    tight_for: u8,
+    roomy_for: u8,
+    /// Quantas medições folgadas seguidas são precisas para subir (dobra quando a subida não vinga).
+    up_after: u8,
+    /// Quando o motor subiu de degrau pela última vez.
+    raised: Option<Instant>,
+    /// Teto da taxa depois de uma perda alta, e desde quando vale.
+    limit: Option<(u32, Instant)>,
+    limit_hold: Duration,
 }
 
 // SAFETY: o Coder só é usado com o Mutex do estado compartilhado travado, uma thread por vez. O
@@ -243,6 +358,13 @@ impl Coder {
             last_key: now,
             retry_at: now,
             produced: 0,
+            step: 0,
+            tight_for: 0,
+            roomy_for: 0,
+            up_after: STEP_UP_AFTER,
+            raised: None,
+            limit: None,
+            limit_hold: LIMIT_HOLD,
         }
     }
 
@@ -341,6 +463,22 @@ impl Shared {
             return Ok(());
         }
         self.adapt(coder);
+        if coder.codec.is_none() {
+            // A escada trocou de degrau: recria já com este quadro, ou espera o próximo capturado.
+            match frame.as_deref() {
+                Some(frame) => self.codec_for(coder, frame)?,
+                None => return Ok(()),
+            }
+        }
+        // Degrau com teto de quadros por segundo: o quadro que chega cedo demais não é codificado.
+        let cap = LADDER[coder.step].fps;
+        if cap != u32::MAX
+            && frame.is_some()
+            && matches!(coder.codec, Some(Codec264::Hardware(_)))
+            && coder.fed.elapsed() < Duration::from_micros(1_000_000 / u64::from(cap) - 2_000)
+        {
+            return Ok(());
+        }
         let paused = self.paused.load(Ordering::Relaxed);
         let mut keyframe = self.keyframe.swap(false, Ordering::Relaxed);
         // Cada pedido de quadro completo custa caro (~250 KB em 1080p) e vale para todos: junta os
@@ -420,7 +558,9 @@ impl Shared {
         // Solta o antigo antes de criar o novo: os dois juntos disputariam a placa.
         coder.codec = None;
         let quality = *self.quality.lock().unwrap();
-        let scale = f64::from(quality.max_height.min(input.1)) / f64::from(input.1);
+        let rung = &LADDER[coder.step];
+        let height = quality.max_height.min(rung.height).min(input.1);
+        let scale = f64::from(height) / f64::from(input.1);
         let output = (
             (f64::from(input.0) * scale) as u32,
             (f64::from(input.1) * scale) as u32,
@@ -431,7 +571,7 @@ impl Shared {
             frame.device_context(),
             input,
             output,
-            quality.fps,
+            quality.fps.min(rung.fps),
             bitrate,
         ) {
             Ok(encoder) => {
@@ -464,6 +604,8 @@ impl Shared {
         let produced = (coder.produced as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
         coder.checked = Instant::now();
         coder.produced = 0;
+        self.produced
+            .store(produced.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
         let ceiling = self.quality.lock().unwrap().bitrate;
         // Só conta quem respondeu há pouco: conexão que caiu sem avisar para de dar retorno, a
         // estimativa dela despenca e arrastaria a qualidade de todos até o tempo limite.
@@ -482,17 +624,111 @@ impl Shared {
         } else {
             0
         };
-        let wanted = ((lowest * 9 / 10)
+        let mut wanted = ((lowest * 9 / 10)
             .saturating_sub(audio)
             .min(u64::from(u32::MAX)) as u32)
             .clamp(MIN_BITRATE.min(ceiling), ceiling);
         let current = self.target.load(Ordering::Relaxed);
+        // Freio pela perda medida. A estimativa de banda, sozinha, oscila demais num caminho que
+        // descarta o excesso sem atrasar (medido com 3 Mbps: ia de 0,8 a 3,7 Mbps a cada ~10 s, e a
+        // imagem travava em cada volta). Com perda alta, o que chega a quem assiste é o que foi
+        // enviado menos o que se perdeu: a taxa fica presa uma folga abaixo disso por um tempo, e
+        // também não desce muito além, porque esse tanto comprovadamente passa.
+        // O espectador com perda alta a quem menos chega: o teto que ele comporta e quanto foi enviado.
+        let worst = self
+            .losses
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|(loss, _, seen)| *loss >= HEAVY_LOSS && seen.elapsed() < STALE)
+            .map(|(loss, sent, _)| (delivered_limit(*sent, *loss), *sent))
+            .min();
+        if let Some((limit, sent)) = worst {
+            match coder.limit {
+                // Perda com o envio já dentro do teto: o teto ainda está alto. Aperta e segura por
+                // mais tempo.
+                Some((old, _)) if sent <= u64::from(old) / 10 * 12 => {
+                    coder.limit_hold = (coder.limit_hold * 2).min(LIMIT_HOLD_MAX);
+                    coder.limit = Some((old.min(limit), Instant::now()));
+                }
+                // Perda com o envio ainda acima do teto: o codificador não terminou de descer
+                // (troca de degrau, reenvios). Não aperta mais, senão a taxa desce até o mínimo sem
+                // necessidade.
+                Some(_) => {}
+                None => coder.limit = Some((limit, Instant::now())),
+            }
+        }
+        match coder.limit {
+            Some((_, since)) if since.elapsed() >= coder.limit_hold => {
+                coder.limit = None;
+                // Passou o prazo sem recaída: da próxima vez o prazo volta ao normal.
+                if since.elapsed() >= coder.limit_hold * 2 {
+                    coder.limit_hold = LIMIT_HOLD;
+                }
+            }
+            Some((limit, _)) => {
+                let limit = limit.min(ceiling);
+                wanted = wanted.clamp((limit / 10 * 6).min(limit), limit);
+            }
+            None => {}
+        }
         // Tela parada (menu, pausa, carregamento): o codificador gasta bem menos que o alvo e a banda
         // estimada cai só por falta de uso, não por rede ruim. Seguir essa queda deixaria todo mundo na
         // qualidade mínima por dezenas de segundos quando a imagem voltasse a se mexer.
         let idle = produced < u64::from(current) / 2;
         if wanted < current && idle {
             return;
+        }
+        // Escada de qualidade (só no codificador da placa; o de software já trabalha em resolução menor).
+        if matches!(coder.codec, Some(Codec264::Hardware(_))) {
+            // O codificador não acompanha a taxa pedida: produz bem mais do que o alvo em vigor.
+            let over = produced > u64::from(current) * 13 / 10;
+            let fit = fitting_step(wanted);
+            let tight = fit > coder.step || (over && wanted <= current);
+            let roomy = coder.step > 0
+                && !over
+                && u64::from(wanted) >= u64::from(LADDER[coder.step - 1].floor) * 5 / 4;
+            coder.tight_for = if tight {
+                coder.tight_for.saturating_add(1)
+            } else {
+                0
+            };
+            coder.roomy_for = if roomy {
+                coder.roomy_for.saturating_add(1)
+            } else {
+                0
+            };
+            // Subiu e ficou: a espera para subir volta ao normal.
+            if coder.raised.is_some_and(|at| at.elapsed() >= SETTLED) {
+                coder.raised = None;
+                coder.up_after = STEP_UP_AFTER;
+            }
+            let step = next_step(
+                coder.step,
+                fit,
+                over,
+                coder.tight_for,
+                coder.roomy_for,
+                coder.up_after,
+            );
+            if step != coder.step {
+                if step > coder.step {
+                    // Desceu logo depois de subir: a rede não aguenta o degrau de cima por enquanto.
+                    if coder.raised.is_some_and(|at| at.elapsed() < BOUNCE) {
+                        coder.up_after = coder.up_after.saturating_mul(2).min(STEP_UP_MAX);
+                    }
+                    coder.raised = None;
+                } else {
+                    coder.raised = Some(Instant::now());
+                }
+                coder.step = step;
+                coder.tight_for = 0;
+                coder.roomy_for = 0;
+                self.target.store(wanted, Ordering::Relaxed);
+                // Outro tamanho de imagem é outro codificador: o próximo quadro capturado recria.
+                coder.codec = None;
+                return;
+            }
         }
         if wanted.abs_diff(current) > current / 12 {
             self.target.store(wanted, Ordering::Relaxed);
@@ -696,6 +932,7 @@ impl Engine {
             encoded: AtomicUsize::new(0),
             encoder: Mutex::default(),
             estimates: Mutex::default(),
+            losses: Mutex::default(),
             target: AtomicU32::new(quality.bitrate),
             next_id: AtomicU64::new(1),
             quality: Mutex::new(quality),
@@ -707,6 +944,7 @@ impl Engine {
             audio_packets: AtomicUsize::new(0),
             epoch: Instant::now(),
             audio_rtp: AtomicU64::new(0),
+            produced: AtomicU32::new(0),
         });
         let weak = Arc::downgrade(&shared);
         std::thread::spawn(move || ticker(weak));
@@ -864,6 +1102,8 @@ impl Engine {
         let ceiling = self.shared.quality.lock().unwrap().bitrate;
         let mut rtc = RtcConfig::new()
             .enable_bwe(Some(Bitrate::bps(u64::from(ceiling) / 2)))
+            // Uma vez por segundo a conexão informa a perda no caminho (freio da taxa, em `adapt`).
+            .set_stats_interval(Some(Duration::from_secs(1)))
             .build(Instant::now());
 
         // Um soquete por endereço local. Com um só soquete "em qualquer endereço" não dá para saber por
@@ -912,6 +1152,7 @@ impl Engine {
             shared.subscribers.lock().unwrap().remove(&id);
             shared.listeners.lock().unwrap().remove(&id);
             shared.estimates.lock().unwrap().remove(&id);
+            shared.losses.lock().unwrap().remove(&id);
             shared.viewers.fetch_sub(1, Ordering::Relaxed);
         });
         Ok((id, answer))
@@ -937,6 +1178,7 @@ impl Engine {
             viewers: self.shared.viewers.load(Ordering::Relaxed),
             encoder: self.shared.encoder.lock().unwrap().clone(),
             target_bitrate: self.shared.target.load(Ordering::Relaxed),
+            produced_bitrate: self.shared.produced.load(Ordering::Relaxed),
             frames_encoded: self.shared.encoded.load(Ordering::Relaxed),
             audio: self
                 .audio
@@ -1284,6 +1526,17 @@ fn set_hops(socket: &UdpSocket, hops: u32) -> bool {
     }
 }
 
+/// Com `NIMBO_TRACE=1`, escreve no stderr o que acontece com cada espectador (testes de rede).
+fn trace(id: u64, start: Instant, what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("NIMBO_TRACE").is_some()) {
+        eprintln!(
+            "[espectador {id}] +{} ms {what}",
+            start.elapsed().as_millis()
+        );
+    }
+}
+
 fn viewer(
     mut rtc: Rtc,
     sockets: &[(SocketAddr, UdpSocket)],
@@ -1298,6 +1551,8 @@ fn viewer(
     let mut connected = false;
     // Desde quando a rede deste espectador sumiu (None = está respondendo).
     let mut lost: Option<Instant> = None;
+    // Total de bytes enviados na medição anterior, para saber a taxa entre duas medições.
+    let mut sent_before: Option<(u64, Instant)> = None;
     loop {
         if quiet.active && start.elapsed() >= quiet_max() {
             quiet.end(sockets);
@@ -1323,10 +1578,15 @@ fn viewer(
                 match event {
                     // Rede que oscila costuma voltar em segundos: só desiste depois de LOST.
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                        trace(id, start, "ice: Disconnected");
                         lost.get_or_insert_with(Instant::now);
                     }
-                    Event::IceConnectionStateChange(_) => lost = None,
+                    Event::IceConnectionStateChange(state) => {
+                        trace(id, start, &format!("ice: {state:?}"));
+                        lost = None;
+                    }
                     Event::Connected => {
+                        trace(id, start, "conectado");
                         connected = true;
                         shared.keyframe.store(true, Ordering::Relaxed);
                         let target = u64::from(shared.target.load(Ordering::Relaxed));
@@ -1359,6 +1619,37 @@ fn viewer(
                         let seen = estimates.get(&id).map_or_else(Instant::now, |e| e.1);
                         estimates.insert(id, (estimate.as_u64(), seen));
                     }
+                    Event::PeerStats(stats) => {
+                        // Bytes enviados a este espectador desde a medição anterior, com reenvios.
+                        let sent = sent_before
+                            .replace((stats.peer_bytes_tx, stats.timestamp))
+                            .and_then(|(bytes, at)| {
+                                let seconds =
+                                    stats.timestamp.saturating_duration_since(at).as_secs_f64();
+                                (seconds > 0.2).then(|| {
+                                    (stats.peer_bytes_tx.saturating_sub(bytes) as f64 * 8.0
+                                        / seconds) as u64
+                                })
+                            });
+                        if let (Some(loss), Some(sent)) = (stats.egress_loss_fraction, sent) {
+                            if loss >= 0.05 {
+                                trace(
+                                    id,
+                                    start,
+                                    &format!(
+                                        "perda {:.0}% com {:.1} Mbps enviados",
+                                        loss * 100.0,
+                                        sent as f64 / 1e6
+                                    ),
+                                );
+                            }
+                            shared
+                                .losses
+                                .lock()
+                                .unwrap()
+                                .insert(id, (loss, sent, Instant::now()));
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -1369,6 +1660,15 @@ fn viewer(
             || (!connected && start.elapsed() > Duration::from_secs(15))
             || lost.is_some_and(|since| since.elapsed() > LOST)
         {
+            trace(
+                id,
+                start,
+                &format!(
+                    "encerrado: vivo={} conectado={connected} semRede={:?}",
+                    rtc.is_alive(),
+                    lost.map(|since| since.elapsed())
+                ),
+            );
             return Ok(());
         }
         // O controle de banda dita o ritmo de envio pacote a pacote; atrasar muito esses avisos faz a
@@ -1576,6 +1876,56 @@ mod tests {
             .map(|text| text.parse().unwrap())
             .collect();
         assert_eq!(remote_addresses(sdp), expected);
+    }
+
+    #[test]
+    fn the_quality_ladder_steps_down_fast_and_up_slowly() {
+        let last = LADDER.len() - 1;
+        // Uma medição apertada só não muda nada; duas seguidas descem.
+        assert_eq!(
+            next_step(0, 1, false, STEP_DOWN_AFTER - 1, 0, STEP_UP_AFTER),
+            0
+        );
+        assert_eq!(next_step(0, 1, false, STEP_DOWN_AFTER, 0, STEP_UP_AFTER), 1);
+        // Desce direto para o degrau que a taxa comporta, sem parar nos do meio.
+        assert_eq!(next_step(0, 3, false, STEP_DOWN_AFTER, 0, STEP_UP_AFTER), 3);
+        // Só o codificador não acompanha (a taxa em si caberia aqui): um degrau.
+        assert_eq!(next_step(1, 1, true, STEP_DOWN_AFTER, 0, STEP_UP_AFTER), 2);
+        // Do último degrau não há para onde descer.
+        assert_eq!(next_step(last, last, true, u8::MAX, 0, STEP_UP_AFTER), last);
+        // Para subir, a folga tem de durar o que a espera atual pede, e um degrau por vez.
+        assert_eq!(
+            next_step(3, 0, false, 0, STEP_UP_AFTER - 1, STEP_UP_AFTER),
+            3
+        );
+        assert_eq!(next_step(3, 0, false, 0, STEP_UP_AFTER, STEP_UP_AFTER), 2);
+        assert_eq!(
+            next_step(3, 0, false, 0, STEP_UP_AFTER, STEP_UP_AFTER * 2),
+            3
+        );
+        assert_eq!(next_step(0, 0, false, 0, u8::MAX, STEP_UP_AFTER), 0);
+        // Não sobe enquanto o codificador estoura a taxa.
+        assert_eq!(next_step(2, 0, true, 0, u8::MAX, STEP_UP_AFTER), 2);
+        // A taxa escolhe o degrau pelo piso; os pisos descem e o último aceita qualquer taxa.
+        assert_eq!(fitting_step(8_000_000), 0);
+        assert_eq!(fitting_step(3_000_000), 1);
+        assert_eq!(fitting_step(2_000_000), 2);
+        assert_eq!(fitting_step(1_200_000), 3);
+        assert_eq!(fitting_step(800_000), last);
+        assert!(LADDER.windows(2).all(|pair| pair[0].floor > pair[1].floor));
+        assert_eq!(LADDER[last].floor, 0);
+    }
+
+    #[test]
+    fn heavy_loss_caps_the_rate_below_what_actually_arrived() {
+        // 6,5 Mbps enviados com 55% de perda: chegam 2,9 Mbps; o teto fica 15% abaixo.
+        let limit = delivered_limit(6_500_000, 0.55);
+        assert!((2_400_000..2_550_000).contains(&limit), "{limit}");
+        // Nunca abaixo do piso do controle de banda, nem com perda total ou valor absurdo.
+        assert_eq!(delivered_limit(6_500_000, 1.0), MIN_BITRATE);
+        assert_eq!(delivered_limit(500_000, 0.5), MIN_BITRATE);
+        assert_eq!(delivered_limit(6_500_000, 7.0), MIN_BITRATE);
+        assert_eq!(delivered_limit(4_000_000, -1.0), 3_400_000);
     }
 
     #[test]

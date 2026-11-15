@@ -203,6 +203,40 @@ verdade e silêncio de 8 s (`NIMBO_QUIET_MS=8000`): o espectador remoto mandou p
 - Nesta máquina, UDP entre dois soquetes em 127.0.0.1 não é entregue (filtro de rede local): testes de rede usam
   o endereço da placa.
 
+### Qualidade com rede apertada (0.5.5)
+
+Bancada de 15/11/2026: janela de teste com movimento fora da tela (1080p, ~48 quadros por segundo), o servidor
+de teste do motor capturando essa janela (`NIMBO_SERVE_WINDOW=<hwnd>`), e um Chrome num servidor do GitHub
+Actions (EUA, 170 ms de ida e volta) assistindo 45 s e medindo a cada 5 s. O lado remoto piora a própria rede
+com regras de filtro: `loss` descarta 3% do que chega; `bw` deixa passar 300 pacotes grandes por segundo (perto
+de 3 Mbps em 1080p).
+
+| Cenário | Antes | Depois |
+| --- | --- | --- |
+| Rede limpa | 1080p, 48 q/s, 6,5 Mbps, sem perda, buffer de 8 a 10 ms | igual |
+| 3% de perda | 1080p, 48 q/s, reenvios (~180 a cada 5 s), travadas de 0,2 s | igual |
+| Banda limitada | **0 q/s**, 40% de perda, imagem parada | 720p, ~24 q/s, 2,2 a 2,6 Mbps, perda de 0 a 6% |
+
+O que estava errado com banda limitada: o controle de banda pedia 0,8 Mbps, mas o codificador da placa não
+comprime 1080p com movimento abaixo de ~4 Mbps e continuava produzindo isso (`produzido_mbps` no servidor de
+teste mostra o alvo e o produzido lado a lado). Duas mudanças em `adapt` (`desktop/rust-media/src/engine.rs`):
+
+- **Escada de qualidade** (`LADDER`): 1080p, 720p, 720p a 30 q/s, 540p a 30, 360p a 30. Desce direto para o
+  degrau que a taxa pedida comporta depois de 2 s apertado (ou um degrau, se é o codificador que não acompanha);
+  sobe um degrau por vez depois de 6 s com folga, e essa espera dobra quando a subida não se sustenta.
+- **Freio pela perda medida**: a cada segundo a conexão informa a perda e os bytes enviados a cada espectador.
+  Com 10% ou mais de perda, o que chegou é o enviado menos o perdido; a taxa fica presa 15% abaixo disso por
+  30 s (dobra a cada recaída, até 4 min) e também não desce além de 60% desse teto. Sem isso a estimativa de
+  banda ia de 0,8 a 3,7 Mbps a cada ~10 s e a imagem travava de 1 a 5 s em cada volta.
+
+O codificador é um só para todos: um espectador com rede apertada baixa a resolução de todos. Dois níveis de
+qualidade continuam sendo a saída para isso. Não medido nesta rodada: fila de quadros por espectador (em rede
+limpa o buffer de quem assiste fica em 8 a 10 ms, sem sinal de acúmulo) e intervalo entre quadros completos
+(com 3% de perda nenhum pedido de quadro completo apareceu; os reenvios bastaram).
+
+A queda periódica a cada ~18 s vista no mesmo dia não era rede nem motor: eram duas sessões da mesma conta no
+canal (app e uma aba de navegador), corrigido no site com `members/{uid}/sid`.
+
 Limites: as lives pelo navegador embutido (webcam) e quem assiste pelo site não passam pelo motor e continuam
 dependendo de quem testa primeiro; e é quem transmite que precisa estar na 0.5.2. O relógio da máquina do dono
 estava 111 s adiantado: testes com horário combinado entre máquinas precisam medir essa diferença antes.

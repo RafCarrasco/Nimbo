@@ -97,6 +97,8 @@ pub struct State {
     viewers: usize,
     encoder: String,
     target_bitrate: u32,
+    /// Quanto o codificador produziu de verdade no último segundo, em bits por segundo.
+    produced_bitrate: u32,
     audio: bool,
 }
 
@@ -245,6 +247,7 @@ pub async fn media_state(_caller: FromApp, app: AppHandle) -> Reply<State> {
         viewers: stats.viewers,
         encoder: stats.encoder,
         target_bitrate: stats.target_bitrate,
+        produced_bitrate: stats.produced_bitrate,
         audio: stats.audio,
     })
 }
