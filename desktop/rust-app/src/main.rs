@@ -9,7 +9,7 @@
 //! - `NIMBO_LOGIN_PRINT`: escreve o link de login no stdout em vez de abrir o navegador.
 //! - `NIMBO_SELFTEST=<arquivo>`: confere a ponte com o site carregado e fecha (ver `selftest.rs`).
 //! - `NIMBO_SELFTEST_SCRIPT=<arquivo .js>`: com a anterior, roda esse roteiro no lugar da conferência.
-//! - `NIMBO_UPDATE_URL`: outro endereço do `latest-beta.json` (ver `update.rs`).
+//! - `NIMBO_UPDATE_URL`: outro endereço do `latest.json` (ver `update.rs`).
 
 // Sem janela de console atrás do app instalado.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]

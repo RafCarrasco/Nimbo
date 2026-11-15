@@ -28,8 +28,9 @@ git push --force-with-lease
 | Pasta | O que é | Vai para o pessoal? |
 |---|---|---|
 | `src/` | Site (React + TypeScript + Vite) | Sim, pelo Firebase Hosting |
-| `desktop/main.cjs`, `preload.cjs`, `native/` | App de Windows (Electron) e o capturador de áudio | Sim, pelo Release no GitHub |
-| `desktop/rust/` | Experimento do app em Rust | **Não.** Ainda não captura tela; ver `desktop/rust/README.md` |
+| `desktop/rust-app`, `rust-media`, `rust-audio`, `rust-native` | App de Windows (Rust): janela, motor de mídia, som, janelas | Sim, pelo Release no GitHub |
+| `desktop/main.cjs`, `preload.cjs`, `native/` | App antigo (Electron), mantido só como caminho de volta | Não |
+| `desktop/rust/` | Primeiro experimento em Rust (só diagnóstico) | Não |
 | `scripts/build-rules.mjs` | Gera `database.rules.json` (não edite o JSON à mão) | Sim, junto com o site |
 
 ## Antes de abrir o PR
@@ -40,24 +41,34 @@ npm run test:desktop
 npm run test:rules
 ```
 
-Mexeu em `desktop/rust/`:
+Mexeu no app (`desktop/rust-*`)? Em cada pasta alterada, com o CMake no PATH (ver
+`desktop/rust-app/README.md`):
 
 ```powershell
-cargo fmt --manifest-path desktop/rust/Cargo.toml --all -- --check
-cargo clippy --manifest-path desktop/rust/Cargo.toml --locked --all-targets -- -D warnings
-cargo test --manifest-path desktop/rust/Cargo.toml --locked
+cargo fmt -- --check
 ```
 
-O GitHub Actions roda tudo isso sozinho no PR: **Community validation** (site, testes do app e regras) e
-**Rust desktop** (só quando `desktop/rust/` muda, em Windows). PR com check vermelho não entra.
+```powershell
+cargo clippy --locked --release --all-targets -- -D warnings
+```
+
+```powershell
+cargo test --locked --release
+```
+
+O GitHub Actions roda tudo isso sozinho no PR: **Community validation** (site, regras e testes do app
+antigo) e **Rust desktop** (cada pasta `desktop/rust-*`, em Windows). PR com check vermelho não entra.
 
 ## Publicar (só a partir da `main`)
 
 - **Site e regras:** `npm run build`, depois
   `firebase deploy --project golive-ad118 --only hosting,database`. Regras e site vão sempre juntos.
-- **App:** suba a versão em `package.json`, escreva as novidades em `src/lib/changelog.ts`, rode
-  `npm run desktop:pack` e crie o Release `vX.Y.Z` no GitHub com `release/Nimbo-Setup.exe`,
-  `Nimbo-Setup.exe.blockmap` e `latest.yml`. O app instalado se atualiza sozinho por esse Release.
+- **App:** suba a versão em `desktop/rust-app/Cargo.toml` e em `package.json`, escreva as novidades em
+  `src/lib/changelog.ts`, gere o instalador e crie o Release `vX.Y.Z` com `Nimbo-Setup.exe`,
+  `Nimbo-Setup.exe.sig` e `latest.json`. O passo a passo e as duas regras do canal de atualização estão em
+  `desktop/rust-app/README.md`. O app instalado se atualiza sozinho por esse Release.
+- **Nunca publique um Release "latest" sem `latest.json`**, nem um Release do app antigo como "latest":
+  os apps instalados ficariam sem atualização.
 
 ## Nunca
 

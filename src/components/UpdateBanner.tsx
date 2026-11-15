@@ -7,6 +7,8 @@ import { useEmulators } from '../firebase';
 import { Modal } from '../ui/Modal';
 
 const CHECK_EVERY = 5 * 60 * 1000;
+// App antigo, feito em Electron (o app novo, em Rust, não leva "Electron" no user agent).
+const LEGACY_APP = /Electron/i.test(navigator.userAgent);
 const SEEN_KEY = 'nimbo.seenVersion';
 // Gravado ao clicar em atualizar o app: de qual versão para qual. Ao reabrir, mostra as novidades
 // da versão nova ou, se o app voltou na mesma versão, avisa que a instalação falhou.
@@ -108,10 +110,9 @@ export function UpdateBanner({ live }: { live: boolean }) {
   }, []);
 
   useEffect(() => {
-    const inApp = /Electron/i.test(navigator.userAgent);
-    // Só para apps que não se atualizam sozinhos (o portátil e os anteriores à 0.3.0). Os
-    // instalados 0.3.x baixam a versão nova em segundo plano: nada de mandar baixar de novo.
-    if (inApp && (!APP_VERSION || newer('0.3.0', APP_VERSION))) setOutdated(APP_VERSION || 'antiga');
+    // O app antigo (Electron) não recebe mais atualização: a partir da 0.5.0 o Nimbo é outro app,
+    // e quem ainda está no antigo é convidado a trocar. O instalador novo remove o antigo.
+    if (LEGACY_APP) setOutdated(APP_VERSION || 'antiga');
   }, []);
 
   useEffect(() => {
@@ -177,12 +178,10 @@ export function UpdateBanner({ live }: { live: boolean }) {
         <div className="update-card" role="alert">
           <img src="/nimbo-icon-128.png" alt="" />
           <div className="update-text">
-            <strong>{failed ? 'A atualização não foi instalada' : 'Seu app do Nimbo está desatualizado'}</strong>
+            <strong>O Nimbo tem um app novo</strong>
             <span>
-              Você está com a versão {outdated} e a atual é a {SITE_VERSION}.{' '}
-              {APP_VERSION && !newer('0.3.0', APP_VERSION)
-                ? 'A atualização automática não chegou: feche e abra o Nimbo. Se continuar, baixe o instalador novo.'
-                : 'Esta versão não se atualiza sozinha: baixe o instalador novo e abra. Seu login continua salvo.'}
+              Mais leve e com imagem melhor nas lives. Baixe e abra o instalador: ele troca este app pelo novo.
+              Você entra com o Google mais uma vez.
             </span>
             <div className="update-actions">
               <button

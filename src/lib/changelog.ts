@@ -4,6 +4,16 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.0',
+    date: '14/11/2026',
+    items: [
+      'O Nimbo agora é um app novo, feito do zero: instalador de 5 MB e bem mais leve aberto.',
+      'Sua live é preparada uma vez só para todo mundo que assiste: plateia maior não pesa mais no seu jogo.',
+      'Imagem em 1080p nas cenas de muito movimento, onde antes a resolução caía.',
+      'Tela nova para escolher o que transmitir, com prévia de cada tela, janela e jogo.',
+    ],
+  },
+  {
     version: '0.4.1',
     date: '06/11/2026',
     items: [
