@@ -10,7 +10,7 @@ import fs from 'node:fs';
 
 const key = Buffer.from(process.env.REMOTE_TEST_KEY || '', 'hex');
 if (key.length !== 32) throw new Error('REMOTE_TEST_KEY ausente ou inválida');
-const id = fs.readFileSync(new URL('./run.txt', import.meta.url), 'utf8').trim();
+const id = fs.readFileSync(new URL('./run.txt', import.meta.url), 'utf8').trim().split(/\s+/).pop();
 const branch = process.env.GITHUB_REF_NAME;
 const base = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/.github/remote-viewer`;
 const headers = {
@@ -163,17 +163,37 @@ try {
     // Fica assistindo por um bom tempo: houve queda sempre aos 18 s, e 5 s de teste não mostravam.
     const watched = [];
     if (pc.connectionState === 'connected') {
-      let before = 0;
+      // A cada 5 s: quadros por segundo, banda, travadas, espera no buffer, pedidos de reenvio e de
+      // quadro completo, perda e tempo de ida e volta.
+      let before = null;
       for (let second = 1; second <= 45; second++) {
         await wait(1000);
-        let now = 0;
+        if (second % 5 !== 0) continue;
+        const now = { frames: 0, bytes: 0, freezes: 0, frozen: 0, buffer: 0, emitted: 0, nack: 0, pli: 0, lost: 0, received: 0, size: '', rtt: 0 };
         (await pc.getStats()).forEach((s) => {
-          if (s.type === 'inbound-rtp' && s.kind === 'video') now = s.framesDecoded || 0;
+          if (s.type === 'inbound-rtp' && s.kind === 'video') {
+            now.frames = s.framesDecoded || 0;
+            now.bytes = s.bytesReceived || 0;
+            now.freezes = s.freezeCount || 0;
+            now.frozen = s.totalFreezesDuration || 0;
+            now.buffer = s.jitterBufferDelay || 0;
+            now.emitted = s.jitterBufferEmittedCount || 0;
+            now.nack = s.nackCount || 0;
+            now.pli = s.pliCount || 0;
+            now.lost = s.packetsLost || 0;
+            now.received = s.packetsReceived || 0;
+            now.size = `${s.frameWidth}x${s.frameHeight}`;
+          }
+          if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') now.rtt = Math.round((s.currentRoundTripTime || 0) * 1000);
         });
-        if (second % 5 === 0) {
-          watched.push(`${second}s: ${now - before} quadros, ${pc.iceConnectionState}/${pc.connectionState}`);
-          before = now;
-        }
+        const d = before || { frames: 0, bytes: 0, freezes: 0, frozen: 0, buffer: 0, emitted: 0, nack: 0, pli: 0, lost: 0, received: 0 };
+        const packets = now.received - d.received + (now.lost - d.lost);
+        watched.push(
+          `${second}s: ${((now.frames - d.frames) / 5).toFixed(0)} q/s, ${(((now.bytes - d.bytes) * 8) / 5e6).toFixed(1)} Mbps, ${now.size}, ` +
+            `travadas ${now.freezes - d.freezes} (${(now.frozen - d.frozen).toFixed(1)} s), buffer ${now.emitted > d.emitted ? Math.round(((now.buffer - d.buffer) / (now.emitted - d.emitted)) * 1000) : 0} ms, ` +
+            `reenvios ${now.nack - d.nack}, quadro completo ${now.pli - d.pli}, perda ${packets > 0 ? (((now.lost - d.lost) / packets) * 100).toFixed(1) : '0'}%, ida e volta ${now.rtt} ms, ${pc.connectionState}`,
+        );
+        before = now;
       }
     }
     window.watched = watched;
