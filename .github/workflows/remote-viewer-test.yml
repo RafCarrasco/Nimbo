@@ -44,4 +44,4 @@ jobs:
             sudo iptables -A INPUT -p udp -m length --length 300:1600 -m limit --limit 300/sec --limit-burst 100 -j ACCEPT
             sudo iptables -A INPUT -p udp -m length --length 300:1600 -j DROP
           fi
-          if [ "$mode" = "udp" ]; then node udp-peer.mjs; elif [ "$mode" = "rev" ] || [ "$mode" = "revq" ]; then node peer-rev.mjs; elif [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
+          if [ "$mode" = "udp" ]; then node udp-peer.mjs; elif [ "$mode" = "rev" ] || [ "$mode" = "revq" ] || [ "$mode" = "revh" ]; then node peer-rev.mjs; elif [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
