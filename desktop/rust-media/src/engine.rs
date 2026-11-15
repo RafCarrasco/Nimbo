@@ -309,6 +309,40 @@ enum Codec264 {
     },
 }
 
+/// Deixa passar, na média, `fps` quadros por segundo de uma fonte que entrega mais do que isso.
+///
+/// Descartar "o quadro que chegou cedo demais desde o último aceito" derruba a taxa para um divisor
+/// da taxa da fonte. Medido em 15/11/2026: uma janela a 75 quadros por segundo saía a 37,5 com teto de
+/// 60 (um sim, um não), e uma tela de 144 Hz dá 48. Aqui o teto segue um relógio próprio: passa o
+/// primeiro quadro depois de cada batida, então a média fica no teto, com intervalos um pouco
+/// desiguais (em 75 Hz, quatro quadros em cada cinco).
+struct Pacer {
+    due: Instant,
+}
+
+impl Pacer {
+    /// Quadro que chega até isto antes da batida conta como pontual (a fonte não é um relógio exato).
+    const EARLY: Duration = Duration::from_millis(2);
+
+    fn new(now: Instant) -> Self {
+        Self { due: now }
+    }
+
+    fn accept(&mut self, now: Instant, fps: u32) -> bool {
+        if fps == u32::MAX {
+            return true;
+        }
+        if now + Self::EARLY < self.due {
+            return false;
+        }
+        let gap = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
+        // A batida seguinte conta a partir da anterior (é o que mantém a média). Depois de uma pausa
+        // (tela parada), no máximo um intervalo de atraso é recuperado: nada de rajada.
+        self.due = (self.due + gap).max(now.checked_sub(gap).unwrap_or(now));
+        true
+    }
+}
+
 /// O codificador de vídeo e o que ele lembra entre quadros. Fica no estado compartilhado porque dois
 /// lugares o alimentam: a captura (quadro novo) e o relógio do motor (repetir o quadro quando a tela
 /// está parada, mandar a tela de pausa, atender um pedido de quadro completo).
@@ -322,6 +356,8 @@ struct Coder {
     checked: Instant,
     /// Última vez que o codificador aceitou um quadro (novo ou repetido).
     fed: Instant,
+    /// Ritmo dos quadros novos: o teto de quadros por segundo é aplicado aqui, não na captura.
+    pacer: Pacer,
     last_key: Instant,
     /// Depois de um erro, só tenta de novo a partir daqui.
     retry_at: Instant,
@@ -355,6 +391,7 @@ impl Coder {
             out: Vec::new(),
             checked: now,
             fed: now,
+            pacer: Pacer::new(now),
             last_key: now,
             retry_at: now,
             produced: 0,
@@ -443,6 +480,16 @@ impl Shared {
             None if coder.codec.is_none() => return Ok(()),
             None => {}
         }
+        // Teto de quadros por segundo: o da qualidade pedida e o do degrau da escada. A captura entrega
+        // mais rápido que o teto (ver `launch`) e o ritmo certo sai daqui. O codificador por software
+        // tem o próprio teto, mais abaixo.
+        let cap = self.quality.lock().unwrap().fps.min(LADDER[coder.step].fps);
+        if frame.is_some()
+            && matches!(coder.codec, Some(Codec264::Hardware(_)))
+            && !coder.pacer.accept(Instant::now(), cap)
+        {
+            return Ok(());
+        }
         // Ninguém assistindo ainda: não codifica, só guarda o quadro. A captura só entrega quadro
         // quando a tela muda; sem isto, quem entrasse com a tela parada não teria o que ver.
         if self.viewers.load(Ordering::Relaxed) == 0 {
@@ -469,15 +516,6 @@ impl Shared {
                 Some(frame) => self.codec_for(coder, frame)?,
                 None => return Ok(()),
             }
-        }
-        // Degrau com teto de quadros por segundo: o quadro que chega cedo demais não é codificado.
-        let cap = LADDER[coder.step].fps;
-        if cap != u32::MAX
-            && frame.is_some()
-            && matches!(coder.codec, Some(Codec264::Hardware(_)))
-            && coder.fed.elapsed() < Duration::from_micros(1_000_000 / u64::from(cap) - 2_000)
-        {
-            return Ok(());
         }
         let paused = self.paused.load(Ordering::Relaxed);
         let mut keyframe = self.keyframe.swap(false, Ordering::Relaxed);
@@ -1046,8 +1084,11 @@ impl Engine {
             CursorCaptureSettings::Default,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
+            // Metade do intervalo do teto: com o intervalo inteiro, o Windows descartava o quadro que
+            // chegava um pouco antes da hora, e uma tela de 75 Hz saía a 37,5 quadros por segundo (144 Hz
+            // dá 48). Assim a captura entrega no máximo o dobro do teto, e o `Pacer` acerta a média.
             MinimumUpdateIntervalSettings::Custom(Duration::from_micros(
-                1_000_000 / u64::from(quality.fps.max(1)),
+                500_000 / u64::from(quality.fps.max(1)),
             )),
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
@@ -1772,6 +1813,60 @@ mod tests {
     use str0m::media::Direction;
 
     use super::*;
+
+    /// Quantos quadros por segundo passam pelo teto com uma fonte regular de `source` quadros por segundo.
+    fn paced(source: f64, cap: u32) -> f64 {
+        let start = Instant::now();
+        let mut pacer = Pacer::new(start);
+        let seconds = 10.0;
+        let mut accepted = 0u32;
+        let mut frame = 0u32;
+        loop {
+            let at = f64::from(frame) / source;
+            if at >= seconds {
+                break;
+            }
+            if pacer.accept(start + Duration::from_secs_f64(at), cap) {
+                accepted += 1;
+            }
+            frame += 1;
+        }
+        f64::from(accepted) / seconds
+    }
+
+    #[test]
+    fn pacer_keeps_the_cap_whatever_the_source_rate() {
+        // Antes, 75 Hz dava 37,5 e 144 Hz dava 48 com teto de 60.
+        for source in [72.0, 75.0, 90.0, 120.0, 144.0, 165.0, 240.0] {
+            let rate = paced(source, 60);
+            assert!((59.0..=61.0).contains(&rate), "fonte {source}: {rate}");
+            let rate = paced(source, 30);
+            assert!((29.5..=30.5).contains(&rate), "fonte {source} a 30: {rate}");
+        }
+    }
+
+    #[test]
+    fn pacer_passes_every_frame_of_a_source_at_or_below_the_cap() {
+        for source in [24.0, 30.0, 59.94, 60.0] {
+            let rate = paced(source, 60);
+            assert!((rate - source).abs() < 0.2, "fonte {source}: {rate}");
+        }
+        assert_eq!(paced(144.0, u32::MAX), 144.0);
+    }
+
+    #[test]
+    fn pacer_does_not_burst_after_a_pause() {
+        let start = Instant::now();
+        let mut pacer = Pacer::new(start);
+        assert!(pacer.accept(start, 60));
+        // Tela parada por 5 s; depois, quadros a cada 4 ms. Em 100 ms passam no máximo 8 (seis no
+        // ritmo e a folga de um intervalo), não os 25 que chegaram.
+        let resume = start + Duration::from_secs(5);
+        let passed = (0..25)
+            .filter(|i| pacer.accept(resume + Duration::from_millis(4 * i), 60))
+            .count();
+        assert!((6..=8).contains(&passed), "{passed}");
+    }
 
     #[test]
     fn offers_every_network_card_with_the_default_route_first() {

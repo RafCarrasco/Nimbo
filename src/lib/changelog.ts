@@ -4,6 +4,13 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.6',
+    date: '15/11/2026',
+    items: [
+      'Lives de tela pelo app agora saem a 60 quadros por segundo de verdade. Antes, numa tela de 144 Hz a live saía a 48, e numa de 75 Hz a 37: o app descartava quadros a mais.',
+    ],
+  },
+  {
     version: '0.5.5',
     date: '15/11/2026',
     items: [

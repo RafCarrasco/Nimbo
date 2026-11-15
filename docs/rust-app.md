@@ -245,6 +245,34 @@ O "Copiar diagnóstico" de uma live nativa agora traz, por tentativa: os caminho
 de endereço), se a resposta do app de quem transmite chegou e em quanto tempo, o tipo de NAT de quem assiste, os
 testes de caminho e a versão do app de quem transmite (gravada na presença do canal).
 
+### Teto de quadros por segundo (0.5.6)
+
+O teto de 60 quadros por segundo era aplicado pela captura do Windows (`MinimumUpdateInterval` de 1/60 s), que
+descarta o quadro que chega antes do intervalo. Numa fonte mais rápida que o teto isso dá um divisor da taxa da
+fonte: 75 Hz sai a 37,5 (um sim, um não) e 144 Hz a 48, que é o "48 quadros por segundo" de todas as medições
+anteriores deste documento (não era o limite da cena de teste). O teto de 30 dos degraus baixos da escada tinha
+o mesmo defeito.
+
+Agora a captura entrega até o dobro do teto e o ritmo é feito no motor (`Pacer` em
+`desktop/rust-media/src/engine.rs`): passa o primeiro quadro depois de cada batida de um relógio próprio, então
+a média fica no teto, com intervalos um pouco desiguais (em 75 Hz, quatro quadros em cada cinco).
+
+Medido em 15/11/2026, janela de teste a 75 quadros por segundo em 1920x1032, um navegador assistindo ao
+`nimbo-media serve`, as duas versões do motor na mesma bancada:
+
+| Medida | Antes | Depois |
+| --- | --- | --- |
+| Quadros por segundo codificados | 37,5 | 60,0 |
+| Quadros por segundo recebidos pelo navegador | 37 a 38 | 60 |
+| Pacotes perdidos | 0 | 0 |
+| Taxa produzida | 5,0 Mbps | 8,1 Mbps (o teto de 8) |
+| CPU do motor com um espectador (um núcleo) | 2,7% (0 a 7) | 5,1% (3,1 a 7,8) |
+| CPU do motor sem espectador | 1,9% | 1,5% (0,8 a 3,1) |
+
+Mais quadros custam mais banda e um pouco mais de CPU; por quadro, a taxa ficou igual (133 e 135 kb). Não medido:
+tela de 144 Hz de verdade (o teste de unidade cobre 72 a 240 Hz, e a conta dá 60), jogo de verdade, e o teto de
+30 dos degraus baixos numa live real.
+
 ### Defeitos conhecidos e otimizações pendentes
 
 - **CPU do envio subiu depois das correções**: com 5 espectadores e som, 6% a 14% de um núcleo (antes, sem som e
