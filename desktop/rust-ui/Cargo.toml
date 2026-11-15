@@ -18,6 +18,13 @@ egui = "0.37"
 # Os mesmos ícones do site (lucide), como fonte.
 lucide-icons = "1"
 serde_json = "1"
+# Login pelo navegador do sistema: o mesmo módulo do app atual (desktop/rust-app/src/login.rs).
+getrandom = "0.3"
+url = "2"
+# Abre links no navegador padrão pelo ShellExecute (sem a feature, a crate chama o PowerShell).
+open = { version = "5", features = ["shellexecute-on-windows"] }
+# Cifra a sessão guardada com a chave do usuário do Windows (DPAPI).
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 # Logo e fotos de perfil (PNG e WebP).
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 

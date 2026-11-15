@@ -315,10 +315,10 @@ Peças novas:
 | N3 | Janela: entrada, espera de aprovação, barra lateral, tela inicial | **Feito**, só com contas de teste do emulador; comparado com o site na mesma conta |
 | N4 | Entrar e sair de canal | **Feito**: aparece para os outros com a versão do app, some ao fechar, e a sessão antiga sai quando a mesma conta entra em outro lugar |
 | N5 | Player: receber, decodificar e tocar a live | Em andamento |
-| N6 | Sinalização das lives no miolo (`native.ts` e o resto de `room.ts`) | Falta |
+| N6 | Sinalização das lives no miolo (`native.ts` e o resto de `room.ts`) | **Parte feita**: lives anunciadas, caixa de entrada (entrega uma vez e apaga) e envio da oferta para lives nativas. Falta ligar ao player e atender as lives de navegador |
 | N7 | Assistir dentro do app nativo (palco, várias lives, tela cheia) | Falta |
 | N8 | Transmitir tela pelo motor, com o seletor | Falta |
-| N9 | Login de verdade do Google e sessão guardada entre aberturas | Falta |
+| N9 | Login de verdade do Google e sessão guardada entre aberturas | **Feito no emulador**: o app abre a página `/desktop-login` no navegador (mesmo módulo do app atual), recebe a credencial, e ao reabrir entra sozinho com a sessão guardada (cifrada pelo Windows, DPAPI). Falta um login real do Google (`--production`), que só o dono pode fazer |
 | N10 | Webcam (enviar) e lives vindas de navegador (receber) | Falta |
 | N11 | Apelido, perfil e foto; administração (no app ou só pelo site) | Falta |
 | N12 | Atualização automática, instalador, instância única | Falta |
@@ -336,17 +336,23 @@ A memória ficou menor que a do app atual, mas longe de "leve": quase tudo é da
 wgpu), não da interface. Fica para otimizar depois que o player entrar, porque é ele que decide como a placa
 é usada. Ainda não mede nada de vídeo.
 
-Como rodar (só fala com os emuladores nesta etapa):
+Como rodar (emuladores; `--production` fala com o Firebase de verdade e ainda está em validação):
 
 ```
 npm run emulators
 cargo run --manifest-path desktop/rust-core/Cargo.toml -- selftest
+cargo run --manifest-path desktop/rust-core/Cargo.toml -- probe
 cargo run --manifest-path desktop/rust-ui/Cargo.toml -- --dev-user owner [--join <canal>] [--screenshot foto.png]
+cargo run --manifest-path desktop/rust-ui/Cargo.toml          # login pelo navegador, com `npm run dev:local` no ar
 ```
 
 `--dev-user nome` entra na mesma conta que `?devUser=nome` no site. O que ainda não existe no nativo aparece
 desligado ou com aviso na própria tela (assistir, transmitir, perfil, administração).
 
-Não testado: banco de verdade (o cliente só rodou contra o emulador; o servidor de verdade manda a conexão
-para outra máquina, caminho escrito mas nunca exercitado), conta real do Google, token vencendo de verdade
-(a renovação foi testada chamando direto), telas com escala diferente de 100%.
+Banco de verdade: `nimbo-core probe` abre a conexão sem conta nenhuma (não lê nem grava nada). Em 15/11/2026
+conectou em 0,5 s e a leitura sem login foi recusada pelas regras, como deve ser; o relógio do servidor estava
+112 s atrás do da máquina do dono (o mesmo desvio já conhecido).
+
+Não testado: banco de verdade com conta (só a conexão sem login), conta real do Google, token vencendo de
+verdade (a renovação foi testada chamando direto), telas com escala diferente de 100%, sair da conta pelo botão
+(apaga a sessão guardada; só o código foi revisto).

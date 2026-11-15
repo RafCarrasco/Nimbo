@@ -20,6 +20,8 @@ use nimbo_core::room::{Room, RoomSnapshot};
 use nimbo_core::rtdb::{Db, Event, Status};
 use serde_json::json;
 
+use crate::login::{self, LoginManager, Outcome, Timing};
+use crate::session_store;
 use crate::sidebar::{Action, Connection, Sidebar};
 use crate::theme;
 use crate::widgets::icon;
@@ -34,10 +36,20 @@ pub struct Args {
     pub screenshot: Option<PathBuf>,
     /// Entra neste canal assim que a comunidade carregar (para testar sem clicar).
     pub join: Option<String>,
+    /// Fala com o Firebase de verdade em vez dos emuladores.
+    pub production: bool,
+    /// Endereço do site que faz o login do Google (a página `/desktop-login`).
+    pub site: Option<String>,
+    /// Começa o login pelo navegador ao abrir, como se a pessoa tivesse clicado (para testar).
+    pub login: bool,
 }
 
+const PRODUCTION_SITE: &str = "https://golive-ad118.web.app";
+const EMULATOR_SITE: &str = "http://localhost:5173";
+
 enum Msg {
-    SignedIn(Result<Session, String>),
+    /// Resultado de um login. `None` no erro: não havia sessão guardada, ou a pessoa cancelou.
+    SignedIn(Result<Session, Option<String>>),
     /// Token renovado da mesma conta.
     Renewed(Session),
     Approved(bool),
@@ -77,6 +89,9 @@ pub struct Nimbo {
     rx: Receiver<Msg>,
     account: Option<Account>,
     signing_in: bool,
+    /// Login em andamento no navegador (a pessoa pode cancelar).
+    in_browser: bool,
+    logins: Arc<LoginManager>,
     error: String,
     logo: TextureHandle,
     collapsed: BTreeSet<String>,
@@ -97,14 +112,16 @@ impl Nimbo {
             .unwrap_or_else(|_| egui::ColorImage::filled([1, 1], Color32::TRANSPARENT));
         let logo = cc.egui_ctx.load_texture("nimbo", logo, egui::TextureOptions::LINEAR);
         let (tx, rx) = channel();
+        let project = if args.production { Project::production() } else { Project::emulator() };
         let mut app = Self {
             args,
-            // Enquanto o login de verdade não entra nesta versão, o app nativo só fala com os emuladores.
-            project: Project::emulator(),
+            project,
             tx,
             rx,
             account: None,
             signing_in: false,
+            in_browser: false,
+            logins: Arc::new(LoginManager::default()),
             error: String::new(),
             logo,
             collapsed: BTreeSet::new(),
@@ -114,8 +131,12 @@ impl Nimbo {
             auto_joined: false,
             shot_done: Arc::new(AtomicBool::new(false)),
         };
-        if let Some(name) = app.args.dev_user.clone() {
-            app.sign_in(&cc.egui_ctx, &name);
+        match app.args.dev_user.clone() {
+            Some(name) if app.project.emulator => app.sign_in(&cc.egui_ctx, &name),
+            _ => app.resume(&cc.egui_ctx),
+        }
+        if app.args.login && !app.signing_in {
+            app.sign_in_with_browser(&cc.egui_ctx);
         }
         app
     }
@@ -125,7 +146,59 @@ impl Nimbo {
         self.error.clear();
         let (project, tx, ctx, credential) = (self.project.clone(), self.tx.clone(), ctx.clone(), auth::dev_credential(dev_user));
         std::thread::spawn(move || {
-            let result = auth::sign_in_google(&project, &credential, "").map_err(|e| e.to_string());
+            let result = auth::sign_in_google(&project, &credential, "").map_err(|e| Some(e.to_string()));
+            let _ = tx.send(Msg::SignedIn(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Ao abrir: se há sessão guardada, entra com ela sem passar pelo navegador.
+    fn resume(&mut self, ctx: &egui::Context) {
+        let Some(saved) = session_store::load(self.project.emulator) else { return };
+        self.signing_in = true;
+        let (project, tx, ctx) = (self.project.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            // Sessão vencida ou revogada: volta para a tela de entrada, sem mensagem de erro.
+            let result = auth::resume(&project, &saved.refresh_token, &saved.email).map_err(|_| None);
+            let _ = tx.send(Msg::SignedIn(result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// "Entrar com Google": abre o navegador do sistema na página de login do site, que devolve a
+    /// credencial do Google para uma porta local deste app (o mesmo caminho do app atual).
+    fn sign_in_with_browser(&mut self, ctx: &egui::Context) {
+        let login = match self.logins.begin(Timing::default()) {
+            Ok(login) => login,
+            Err(e) => {
+                self.error = format!("Não foi possível iniciar o login: {e}");
+                return;
+            }
+        };
+        let site = self.args.site.clone().unwrap_or_else(|| {
+            if self.project.emulator { EMULATOR_SITE } else { PRODUCTION_SITE }.to_owned()
+        });
+        let url = login::login_url(&site, login.port, &login.state);
+        // O link leva só a porta e o código de uso único; a credencial nunca passa por aqui.
+        if std::env::var_os("NIMBO_LOGIN_PRINT").is_some() {
+            println!("{}", json!({ "login": url }));
+        } else if let Err(e) = open::that_detached(&url) {
+            self.error = format!("Não foi possível abrir o navegador: {e}");
+            return;
+        }
+        self.signing_in = true;
+        self.in_browser = true;
+        self.error.clear();
+        let (project, tx, ctx) = (self.project.clone(), self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = match login.wait() {
+                Outcome::SignedIn(credentials) => {
+                    auth::sign_in_google(&project, &credentials.id_token, &credentials.access_token).map_err(|e| Some(e.to_string()))
+                }
+                Outcome::MissingCredential => Err(Some(login::MISSING_CREDENTIAL.to_owned())),
+                Outcome::Cancelled => Err(None),
+                Outcome::Expired => Err(Some(login::EXPIRED.to_owned())),
+            };
             let _ = tx.send(Msg::SignedIn(result));
             ctx.request_repaint();
         });
@@ -181,15 +254,21 @@ impl Nimbo {
     fn drain(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::SignedIn(Ok(session)) => {
+                Msg::SignedIn(result) => {
                     self.signing_in = false;
-                    self.signed_in(ctx, session);
-                }
-                Msg::SignedIn(Err(error)) => {
-                    self.signing_in = false;
-                    self.error = error;
+                    self.in_browser = false;
+                    match result {
+                        Ok(session) => {
+                            self.remember(&session);
+                            self.signed_in(ctx, session);
+                            // Volta para a frente: a pessoa estava no navegador.
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        }
+                        Err(error) => self.error = error.unwrap_or_default(),
+                    }
                 }
                 Msg::Renewed(session) => {
+                    self.remember(&session);
                     if let Some(account) = &mut self.account {
                         account.session = session;
                     }
@@ -270,6 +349,14 @@ impl Nimbo {
         }
     }
 
+    /// Guarda a sessão para a próxima abertura. Contas de teste (`--dev-user`) não são guardadas.
+    fn remember(&self, session: &Session) {
+        if self.args.dev_user.is_none() {
+            let saved = session_store::Saved { refresh_token: session.refresh_token.clone(), email: session.email.clone() };
+            session_store::save(self.project.emulator, &saved);
+        }
+    }
+
     fn act(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
         for action in actions {
             match action {
@@ -278,7 +365,10 @@ impl Nimbo {
                         self.collapsed.insert(id);
                     }
                 }
-                Action::SignOut => self.account = None,
+                Action::SignOut => {
+                    self.account = None;
+                    session_store::clear(self.project.emulator);
+                }
                 Action::Join(channel) | Action::Watch(channel, _) => self.join(ctx, channel),
                 Action::Leave => self.leave(),
                 // Assistir, perfil e administração chegam nas próximas etapas.
@@ -374,7 +464,7 @@ impl Nimbo {
                 ("Ninguém ao vivo por aqui", "Compartilhar tela e webcam pelo app nativo chega nas próximas etapas.")
             };
             let strong = painter.layout_no_wrap(strong.to_owned(), theme::bold(17.0), theme::TEXT);
-            let hint = painter.layout(hint.to_owned(), theme::regular(14.0), theme::MUTED, 420.0);
+            let hint = theme::centered(&painter, hint, theme::regular(14.0), theme::MUTED, 420.0);
             let height = 90.0 + 8.0 + strong.size().y + 8.0 + hint.size().y;
             let mut y = body.center().y - height / 2.0;
             let logo = Rect::from_min_size(pos2(body.center().x - 45.0, y), vec2(90.0, 90.0));
@@ -382,7 +472,7 @@ impl Nimbo {
             y += 98.0;
             painter.galley(pos2(body.center().x - strong.size().x / 2.0, y), strong.clone(), theme::TEXT);
             y += strong.size().y + 8.0;
-            painter.galley(pos2(body.center().x - hint.size().x / 2.0, y), hint, theme::MUTED);
+            painter.galley(pos2(body.center().x, y), hint, theme::MUTED);
             if !self.notice.is_empty() {
                 self.notice_bar(ui, body);
             }
@@ -409,7 +499,9 @@ impl Nimbo {
             return;
         }
         let waited = self.started.elapsed();
-        if !self.shot_requested && ((ready && waited > Duration::from_secs(3)) || waited > Duration::from_secs(12)) {
+        // Com o login pelo navegador no meio, a espera é maior: alguém precisa terminar o login lá.
+        let limit = Duration::from_secs(if self.args.login { 90 } else { 12 });
+        if !self.shot_requested && ((ready && waited > Duration::from_secs(3)) || waited > limit) {
             self.shot_requested = true;
             let (done, repaint) = (self.shot_done.clone(), ctx.clone());
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |shot| {
@@ -433,9 +525,10 @@ impl eframe::App for Nimbo {
         let mut ready = false;
         match &self.account {
             None => {
-                let (signing_in, error) = (self.signing_in, self.error.clone());
-                self.gate(ui, if signing_in { 230.0 } else { 330.0 }, |ui| {
-                    if signing_in {
+                let (signing_in, in_browser, error) = (self.signing_in, self.in_browser, self.error.clone());
+                let (mut start, mut cancel) = (false, false);
+                self.gate(ui, if signing_in && !in_browser { 230.0 } else { 400.0 }, |ui| {
+                    if signing_in && !in_browser {
                         ui.add_space(20.0);
                         ui.add(egui::Spinner::new().size(28.0).color(theme::MUTED));
                         return;
@@ -444,13 +537,32 @@ impl eframe::App for Nimbo {
                     ui.add_space(14.0);
                     ui.label(egui::RichText::new("Suas lives. Sua comunidade.").color(theme::MUTED));
                     ui.add_space(20.0);
-                    let note = if error.is_empty() {
-                        "Versão de teste do app nativo: abra com --dev-user <conta> e os emuladores ligados.".to_owned()
+                    if in_browser {
+                        ui.add(egui::Spinner::new().size(22.0).color(theme::MUTED));
+                        ui.add_space(12.0);
+                        ui.label(egui::RichText::new("Termine o login na janela do navegador que abriu.").font(theme::regular(12.0)).color(theme::MUTED));
+                        ui.add_space(10.0);
+                        cancel = ghost_button(ui, "Cancelar");
                     } else {
-                        error
-                    };
-                    ui.label(egui::RichText::new(note).font(theme::regular(12.0)).color(theme::MUTED));
+                        start = google_button(ui);
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new("O acesso depende da aprovação de um administrador.")
+                                .font(theme::regular(12.0))
+                                .color(theme::MUTED),
+                        );
+                    }
+                    if !error.is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new(error).font(theme::regular(13.0)).color(theme::DANGER));
+                    }
                 });
+                if start {
+                    self.sign_in_with_browser(&ctx);
+                }
+                if cancel {
+                    self.logins.cancel();
+                }
             }
             Some(account) if account.approved != Some(true) => {
                 let (waiting, email) = (account.approved.is_none(), account.session.email.clone());
@@ -544,6 +656,22 @@ fn wordmark(ui: &mut Ui) {
     let split = x + first.size().x;
     painter.galley(pos2(x, y), first, theme::TEXT);
     painter.galley(pos2(split, y), second, theme::PRIMARY);
+}
+
+/// Botão branco "Entrar com Google" (`.google-button` no site).
+fn google_button(ui: &mut Ui) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
+    let painter = ui.painter();
+    let fill = if response.hovered() { Color32::from_rgb(0xf1, 0xf3, 0xf9) } else { Color32::WHITE };
+    painter.rect_filled(rect, 10.0, fill);
+    let dark = Color32::from_rgb(0x1f, 0x23, 0x33);
+    let label = painter.layout_no_wrap("Entrar com Google".to_owned(), theme::semibold(14.0), dark);
+    let mark = painter.layout_no_wrap("G".to_owned(), theme::bold(17.0), Color32::from_rgb(0x19, 0x76, 0xd2));
+    let x = rect.center().x - (mark.size().x + 10.0 + label.size().x) / 2.0;
+    let label_x = x + mark.size().x + 10.0;
+    painter.galley(pos2(x, rect.center().y - mark.size().y / 2.0), mark, dark);
+    painter.galley(pos2(label_x, rect.center().y - label.size().y / 2.0), label, dark);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// Botão discreto (`.button.ghost` no site).

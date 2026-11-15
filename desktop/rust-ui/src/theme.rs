@@ -112,6 +112,14 @@ pub fn spaced(
     painter.layout_job(job)
 }
 
+/// Parágrafo com quebra de linha e cada linha centralizada. Desenhe com o x no meio da área.
+pub fn centered(painter: &Painter, text: &str, font: FontId, color: Color32, max_width: f32) -> Arc<Galley> {
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat { font_id: font, color, ..TextFormat::default() });
+    job.wrap = TextWrapping { max_width, ..TextWrapping::default() };
+    job.halign = egui::Align::Center;
+    painter.layout_job(job)
+}
+
 /// Cor `#rrggbb` de um cargo.
 pub fn hex(color: &str) -> Option<Color32> {
     let digits = color.strip_prefix('#').filter(|d| d.len() == 6)?;

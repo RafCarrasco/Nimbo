@@ -79,6 +79,18 @@ pub fn refresh(project: &Project, old: &Session) -> Result<Session, AuthError> {
     session(&reply, "user_id", "id_token", "refresh_token", "expires_in", &old.email)
 }
 
+/// Volta a entrar com um token de renovação guardado de uma abertura anterior.
+pub fn resume(project: &Project, refresh_token: &str, email: &str) -> Result<Session, AuthError> {
+    let saved = Session {
+        uid: String::new(),
+        email: email.to_owned(),
+        id_token: String::new(),
+        refresh_token: refresh_token.to_owned(),
+        expires_at: Instant::now(),
+    };
+    refresh(project, &saved)
+}
+
 fn session(
     reply: &Json,
     uid: &str,
