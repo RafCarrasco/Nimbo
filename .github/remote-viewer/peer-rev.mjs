@@ -4,10 +4,17 @@
 import puppeteer from 'puppeteer-core';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { execSync } from 'node:child_process';
 
 const key = Buffer.from(process.env.REMOTE_TEST_KEY || '', 'hex');
 if (key.length !== 32) throw new Error('REMOTE_TEST_KEY ausente ou inválida');
 const id = fs.readFileSync(new URL('./run.txt', import.meta.url), 'utf8').trim().split(/\s+/).pop();
+// Modo "revq": fora os servidores STUN, o que sai por UDP morre depois de poucos saltos nos
+// primeiros segundos: abre a passagem deste lado sem chegar ao roteador do outro lado.
+const quiet = fs.readFileSync(new URL('./run.txt', import.meta.url), 'utf8').trim().startsWith('revq');
+const out = execSync("ip route show default | awk '{print $5; exit}'").toString().trim();
+const rule = `-o ${out} -p udp -m multiport ! --dports 53,3478,19302 -j TTL --ttl-set ${process.env.QUIET_TTL || 3}`;
+if (quiet) execSync(`sudo iptables -t mangle -A POSTROUTING ${rule}`);
 const branch = process.env.GITHUB_REF_NAME;
 const base = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/.github/remote-viewer`;
 const headers = {
@@ -78,7 +85,12 @@ try {
     body: JSON.stringify({ message: `test: answers ${id}`, branch, content: Buffer.from(seal(JSON.stringify(answers))).toString('base64') }),
   });
   if (!put.ok) throw new Error(`não deu para publicar as respostas: ${put.status}`);
-  console.log('respostas publicadas; este lado já está mandando testes de caminho');
+  console.log(quiet ? 'respostas publicadas; este lado fica quieto por 9 s' : 'respostas publicadas; este lado já está mandando testes de caminho');
+  if (quiet)
+    setTimeout(() => {
+      execSync(`sudo iptables -t mangle -D POSTROUTING ${rule}`);
+      console.log('silêncio encerrado');
+    }, 9000);
   const result = await page.evaluate(async () => {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     const names = Object.keys(window.pcs);
