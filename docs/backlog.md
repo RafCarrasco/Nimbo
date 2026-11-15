@@ -96,3 +96,39 @@ Installing, please wait..."), em inglês e cinza.
   são uma página customizada em script NSIS (`nsis.include`) ou trocar o instalador por um próprio
   (um app Electron pequeno que baixa e instala, com a nossa tela). Avaliar custo antes.
 
+
+## Ideias anotadas (ainda sem data)
+
+### App full Rust, em etapas, mantendo o site (anotado em 15/11/2026)
+O dono gostou da ideia depois de ver que o Discord anunciou em 04/11/2026 a troca do Electron por um app em
+Rust (miolo compartilhado, interface desenhada com GPUI, sem Tauri), e que o site deles continua existindo.
+Hoje no Nimbo só a transmissão é Rust; a interface e o player de quem assiste são o site dentro do WebView2.
+Decisão: só anotar por enquanto, e antes de começar validar bem a 0.5.5 (jogo de verdade: som, tela cheia,
+anticheat; e alguns dias de uso).
+
+Etapas, cada uma já utilizável e sem desligar o site:
+
+1. **Player em Rust**: receber, decodificar e desenhar a live dentro do app atual. É a parte mais difícil e a que
+   mais rende (menos memória, controle da rede de quem assiste). Vale mesmo que o resto não saia.
+2. **Miolo em Rust**: login do Google e a conversa com o banco, sem interface, testado contra os emuladores.
+3. **Interface em Rust**: canais, palco, seletor, perfil. O painel de administração pode continuar no site.
+4. **Troca**: o app deixa de carregar o site, que continua para celular, navegador e administração.
+
+Custos conhecidos: duas interfaces para manter; correção rápida pelo site deixa de valer para o app (cada ajuste
+vira versão nova, que chega em até 30 minutos e pede reinício, como no Discord); ganho de memória menor que o
+deles (o Nimbo usa 385 MB hoje, medido em 15/11/2026, contra 544 MB do app antigo).
+
+### Chat de texto e, mais adiante, chamada de voz (perguntado em 15/11/2026)
+Voz e chat continuam fora do escopo até o dono pedir; aqui fica só a viabilidade no plano gratuito.
+
+- **Chat de texto**: cabe com folga. Mensagem é pequena (centenas de bytes) e o banco em tempo real já é a
+  sinalização das lives. Cuidados: carregar só as últimas mensagens de cada canal (o limite que aperta é o de
+  download do banco), regras de escrita por canal e por autor, apagar e moderar. Sem anexos: imagem e arquivo
+  pediriam um lugar para guardar, e o Firebase Storage está vetado para fotos de perfil.
+- **Chamada de voz**: cabe para grupos pequenos, com cada pessoa ligada direto às outras (áudio gasta de 30 a
+  60 kbps por pessoa). Até umas 8 pessoas por canal funciona assim; acima disso precisa de um servidor que
+  misture ou redistribua o áudio, que é onde começa a custar. Depende do servidor de retransmissão (TURN) para
+  os pares que não fecham conexão direta, e hoje o app não concede o microfone à página (só a câmera).
+- **Limite que vale para tudo**: o plano gratuito do banco aceita no máximo 100 conexões ao mesmo tempo, e não
+  dá para aumentar sem mudar de plano. Para o grupo de hoje sobra; conferir os números de armazenamento e
+  download na página de preços antes de contar com eles.
