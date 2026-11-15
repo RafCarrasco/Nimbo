@@ -1,17 +1,17 @@
-//! Atualização automática do app instalado ("Nimbo Beta"), no contrato que o site já usa com o
-//! app em Electron (`watchUpdate`, `installUpdate` e `onUpdateProgress` de `src/desktop.ts`):
+//! Atualização automática do app instalado, no contrato que o site já usava com o app antigo
+//! em Electron (`watchUpdate`, `installUpdate` e `onUpdateProgress` de `src/desktop.ts`):
 //! confere ao abrir e a cada 6 horas, baixa em segundo plano, avisa a página e instala quando ela
 //! pede (fechando e reabrindo o app) ou, sem reabrir, quando a pessoa fecha o app.
 //!
-//! O canal é só deste app: `latest-beta.json`, num Release de etiqueta fixa (`rust-beta`) marcado
-//! como pré-lançamento. O app em Electron lê `latest.yml` do Release "latest", que o GitHub nunca
-//! aponta para um pré-lançamento; um app não enxerga o arquivo do outro. O endereço fica em
-//! `tauri.conf.json`.
+//! O canal é o `latest.json` do Release mais recente do repositório (o endereço fica em
+//! `tauri.conf.json`). O app antigo em Electron lia `latest.yml` no mesmo Release; como esse arquivo
+//! não é mais publicado, ele simplesmente não acha atualização. Por isso não se publica mais
+//! Release do Electron como "latest": ele tiraria o `latest.json` do ar para este app.
 //!
 //! Qualquer falha (sem rede, 404, assinatura errada) vai só para `nimbo-update.log`, na pasta de
 //! dados do app: a pessoa não vê erro, e a próxima conferência tenta de novo.
 //!
-//! `NIMBO_UPDATE_URL=<endereço do latest-beta.json>` troca o servidor, só para testar o ciclo
+//! `NIMBO_UPDATE_URL=<endereço do latest.json>` troca o servidor, só para testar o ciclo
 //! inteiro. A assinatura continua sendo conferida com a chave pública que está no app.
 
 use std::collections::HashMap;
@@ -100,7 +100,7 @@ fn endpoint_override(configured: Option<&str>) -> Result<Option<Url>, String> {
     }
 }
 
-/// Troca o endereço do `latest-beta.json` na configuração do plugin.
+/// Troca o endereço do `latest.json` na configuração do plugin.
 fn point_at(plugins: &mut HashMap<String, Value>, url: &Url) {
     let settings = plugins.entry("updater".into()).or_insert_with(|| json!({}));
     let Some(settings) = settings.as_object_mut() else {
@@ -124,7 +124,7 @@ fn usable_pubkey(key: &str) -> bool {
 }
 
 /// O instalador deixa um `uninstall.exe` ao lado do app. Sem ele é um build de desenvolvimento:
-/// atualizar dali instalaria o Nimbo Beta na máquina de quem só rodou `cargo run`.
+/// atualizar dali instalaria o Nimbo na máquina de quem só rodou `cargo run`.
 fn installed(exe: &Path) -> bool {
     exe.parent()
         .is_some_and(|folder| folder.join("uninstall.exe").is_file())
@@ -451,8 +451,7 @@ mod tests {
     use super::*;
 
     const CONFIG: &str = include_str!("../tauri.conf.json");
-    const FEED: &str =
-        "https://github.com/RafCarrasco/Nimbo/releases/download/rust-beta/latest-beta.json";
+    const FEED: &str = "https://github.com/RafCarrasco/Nimbo/releases/latest/download/latest.json";
     /// Formato de uma chave pública do Tauri (base64 do arquivo do minisign). Não é chave de ninguém.
     const SAMPLE_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAxMjM0NTY3ODlBQkNERUYKUldUdnphdUpaMFVqQVFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUEK";
 
@@ -492,21 +491,21 @@ mod tests {
         assert_eq!(endpoint_override(None), Ok(None));
         assert_eq!(endpoint_override(Some("")), Ok(None));
         for good in [
-            "http://127.0.0.1:8765/latest-beta.json",
-            "http://localhost:8765/latest-beta.json",
-            "http://[::1]:8765/latest-beta.json",
-            "https://example.com/beta/latest-beta.json",
+            "http://127.0.0.1:8765/latest.json",
+            "http://localhost:8765/latest.json",
+            "http://[::1]:8765/latest.json",
+            "https://example.com/beta/latest.json",
         ] {
             assert_eq!(chosen(good), Ok(Some(good.to_string())), "{good}");
         }
         for bad in [
-            "http://example.com/latest-beta.json",
-            "http://192.168.0.10/latest-beta.json",
-            "http://localhost.evil.invalid/latest-beta.json",
-            "http://127.0.0.1.evil.invalid/latest-beta.json",
-            "file:///C:/latest-beta.json",
-            "ftp://127.0.0.1/latest-beta.json",
-            "latest-beta.json",
+            "http://example.com/latest.json",
+            "http://192.168.0.10/latest.json",
+            "http://localhost.evil.invalid/latest.json",
+            "http://127.0.0.1.evil.invalid/latest.json",
+            "file:///C:/latest.json",
+            "ftp://127.0.0.1/latest.json",
+            "latest.json",
         ] {
             assert!(chosen(bad).is_err(), "{bad}");
         }
@@ -518,7 +517,7 @@ mod tests {
             serde_json::from_value(config()["plugins"].clone()).unwrap();
         let before = plugins["updater"].clone();
 
-        let secure = Url::parse("https://example.com/latest-beta.json").unwrap();
+        let secure = Url::parse("https://example.com/latest.json").unwrap();
         point_at(&mut plugins, &secure);
         assert_eq!(plugins["updater"]["endpoints"], json!([secure.as_str()]));
         assert!(
@@ -527,7 +526,7 @@ mod tests {
                 .is_none()
         );
 
-        let local = Url::parse("http://127.0.0.1:8765/latest-beta.json").unwrap();
+        let local = Url::parse("http://127.0.0.1:8765/latest.json").unwrap();
         point_at(&mut plugins, &local);
         assert_eq!(plugins["updater"]["endpoints"], json!([local.as_str()]));
         assert_eq!(
@@ -560,12 +559,12 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("nimbo-update-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
         std::fs::create_dir_all(&folder).unwrap();
-        let exe = folder.join("nimbo-beta.exe");
+        let exe = folder.join("nimbo-app.exe");
         assert!(!installed(&exe));
         std::fs::write(folder.join("uninstall.exe"), b"").unwrap();
         assert!(installed(&exe));
         std::fs::remove_dir_all(&folder).unwrap();
-        assert!(!installed(Path::new("nimbo-beta.exe")));
+        assert!(!installed(Path::new("nimbo-app.exe")));
     }
 
     #[test]
@@ -606,17 +605,28 @@ mod tests {
     }
 
     #[test]
-    fn beta_installs_beside_the_electron_app_and_has_its_own_feed() {
+    fn app_replaces_the_electron_one_without_sharing_its_data() {
         let config = config();
         let electron: Value = serde_json::from_str(include_str!("../../../package.json")).unwrap();
 
-        // Nome, identificador e executável diferentes: pasta de instalação, atalhos, dados, trava
-        // de instância única e entrada de desinstalação não se misturam com os do Electron.
-        assert_eq!(config["productName"], "Nimbo Beta");
+        // Mesmo nome do app antigo (é o Nimbo, e os atalhos novos tomam o lugar dos antigos), mas
+        // identificador e executável diferentes: dados, trava de instância única e pasta de
+        // instalação não se misturam com os do Electron, que o instalador remove.
+        assert_eq!(config["productName"], "Nimbo");
+        assert_eq!(config["productName"], electron["build"]["productName"]);
         assert_eq!(config["identifier"], "app.nimbo.rust");
-        assert_eq!(config["mainBinaryName"], "nimbo-beta");
-        assert_ne!(config["productName"], electron["build"]["productName"]);
+        assert_eq!(config["mainBinaryName"], "nimbo-app");
         assert_ne!(config["identifier"], electron["build"]["appId"]);
+        let hooks = include_str!("../installer-hooks.nsh");
+        assert!(hooks.contains("NSIS_HOOK_PREINSTALL"));
+        assert!(hooks.contains(r"$LOCALAPPDATA\Programs\Nimbo\Nimbo.exe"));
+        // O app novo não pode ter o nome de executável que o gancho encerra.
+        assert!(hooks.contains("taskkill /F /T /IM Nimbo.exe"));
+        assert_ne!(config["mainBinaryName"], "Nimbo");
+        assert_eq!(
+            config["bundle"]["windows"]["nsis"]["installerHooks"],
+            "./installer-hooks.nsh"
+        );
 
         // A versão vem só do Cargo.toml.
         assert!(config.get("version").is_none());
@@ -632,10 +642,10 @@ mod tests {
             "downloadBootstrapper"
         );
 
-        // Um endereço só, de etiqueta fixa: não passa por "latest" nem pelo arquivo do Electron.
+        // Um endereço só: o `latest.json` do Release mais recente (o app antigo lia `latest.yml`).
         let updater = &config["plugins"]["updater"];
         assert_eq!(updater["endpoints"], json!([FEED]));
-        assert!(!FEED.contains("/releases/latest/"));
+        assert!(FEED.ends_with("/releases/latest/download/latest.json"));
         assert!(!FEED.ends_with("latest.yml"));
         assert_eq!(updater["requireSignedVersion"], true);
         assert_eq!(updater["windows"]["installMode"], "quiet");
@@ -647,28 +657,28 @@ mod tests {
 
     #[test]
     fn updater_reads_the_manifest_the_pack_script_writes() {
-        // Mesmo formato que scripts/pack.ps1 grava em latest-beta.json.
+        // Mesmo formato que scripts/pack.ps1 grava em latest.json.
         let manifest = json!({
-            "version": "0.1.1",
-            "notes": "Nimbo Beta 0.1.1",
+            "version": "0.5.1",
+            "notes": "Nimbo 0.5.1",
             "pub_date": "2026-11-12T13:45:09Z",
             "platforms": {
                 "windows-x86_64": {
                     "signature": "c2lnbmF0dXJl",
-                    "url": "https://github.com/RafCarrasco/Nimbo/releases/download/rust-beta/Nimbo-Beta-Setup.exe"
+                    "url": "https://github.com/RafCarrasco/Nimbo/releases/download/v0.5.1/Nimbo-Setup.exe"
                 }
             }
         });
         let release: tauri_plugin_updater::RemoteRelease =
             serde_json::from_value(manifest).unwrap();
-        assert_eq!(release.version.to_string(), "0.1.1");
+        assert_eq!(release.version.to_string(), "0.5.1");
         assert!(release.pub_date.is_some());
         assert!(
             release
                 .download_url("windows-x86_64")
                 .unwrap()
                 .as_str()
-                .ends_with("/rust-beta/Nimbo-Beta-Setup.exe")
+                .ends_with("/v0.5.1/Nimbo-Setup.exe")
         );
         assert_eq!(release.signature("windows-x86_64").unwrap(), "c2lnbmF0dXJl");
         let script = include_str!("../scripts/pack.ps1");

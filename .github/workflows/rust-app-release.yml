@@ -1,7 +1,7 @@
-name: Nimbo Beta installer (Rust app)
-# Gera o instalador do app em Rust ("Nimbo Beta") e o manifesto de atualização e os deixa como
+name: Nimbo installer (Rust app)
+# Gera o instalador do Nimbo (app em Rust) e o manifesto de atualização e os deixa como
 # artefatos deste workflow. Não cria Release nem tag e não publica nada: quem publica é o dono,
-# à mão, no Release fixo `rust-beta` (passo a passo em desktop/rust-app/README.md).
+# à mão, num Release novo (passo a passo em desktop/rust-app/README.md).
 # Só roda quando alguém clica em "Run workflow".
 on:
   workflow_dispatch:
@@ -67,10 +67,10 @@ jobs:
         run: ./scripts/pack.ps1
       - uses: actions/upload-artifact@v4
         with:
-          name: nimbo-beta-installer
+          name: nimbo-installer
           path: |
-            desktop/rust-app/release/Nimbo-Beta-Setup.exe
-            desktop/rust-app/release/Nimbo-Beta-Setup.exe.sig
-            desktop/rust-app/release/latest-beta.json
+            desktop/rust-app/release/Nimbo-Setup.exe
+            desktop/rust-app/release/Nimbo-Setup.exe.sig
+            desktop/rust-app/release/latest.json
           if-no-files-found: error
           retention-days: 14

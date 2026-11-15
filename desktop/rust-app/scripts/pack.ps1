@@ -1,10 +1,10 @@
 ﻿<#
 .SYNOPSIS
-  Gera o instalador do Nimbo Beta (app em Rust) e o manifesto de atualização.
+  Gera o instalador do Nimbo (app em Rust) e o manifesto de atualização.
 
 .DESCRIPTION
   Roda `cargo tauri build`, confere a assinatura e deixa em -OutDir os três arquivos de um
-  lançamento: Nimbo-Beta-Setup.exe, Nimbo-Beta-Setup.exe.sig e latest-beta.json.
+  lançamento: Nimbo-Setup.exe, Nimbo-Setup.exe.sig e latest.json.
   Não publica nada. Ver desktop/rust-app/README.md.
 
   Precisa de TAURI_SIGNING_PRIVATE_KEY (a chave privada ou o caminho do arquivo dela) e, se a
@@ -19,12 +19,13 @@
   outra chave pública, outra versão).
 #>
 param(
-  [string]$BaseUrl = 'https://github.com/RafCarrasco/Nimbo/releases/download/rust-beta',
+  # Vazio = o Release desta versão: https://github.com/RafCarrasco/Nimbo/releases/download/v<versão>
+  [string]$BaseUrl = '',
   [string]$OutDir = '',
   [string]$Config = '',
   [string]$Notes = '',
-  [string]$ArtifactName = 'Nimbo-Beta-Setup.exe',
-  [string]$ManifestName = 'latest-beta.json'
+  [string]$ArtifactName = 'Nimbo-Setup.exe',
+  [string]$ManifestName = 'latest.json'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -132,7 +133,10 @@ $OutDir = (Resolve-Path $OutDir).Path
 Copy-Item $installer.FullName (Join-Path $OutDir $ArtifactName) -Force
 Copy-Item $signatureFile (Join-Path $OutDir "$ArtifactName.sig") -Force
 
-if (-not $Notes) { $Notes = "Nimbo Beta $version" }
+if (-not $Notes) { $Notes = "Nimbo $version" }
+# O manifesto aponta para o instalador desta versão, e não para "o mais recente": quem lê um
+# manifesto antigo tem que baixar o arquivo que a assinatura dele confere.
+if (-not $BaseUrl) { $BaseUrl = "https://github.com/RafCarrasco/Nimbo/releases/download/v$version" }
 $manifest = [ordered]@{
   version   = $version
   notes     = $Notes
@@ -149,7 +153,7 @@ $json = $manifest | ConvertTo-Json -Depth 5
 [IO.File]::WriteAllText((Join-Path $OutDir $ManifestName), $json, (New-Object Text.UTF8Encoding($false)))
 
 Write-Host ''
-Write-Host "Nimbo Beta $version pronto em $OutDir"
+Write-Host "Nimbo $version pronto em $OutDir"
 Get-ChildItem $OutDir -File | Where-Object { $_.Name -in @($ArtifactName, "$ArtifactName.sig", $ManifestName) } |
   ForEach-Object { '{0,12:N0} bytes  {1}' -f $_.Length, $_.Name }
 Write-Host "SHA256 $((Get-FileHash (Join-Path $OutDir $ArtifactName) -Algorithm SHA256).Hash)  $ArtifactName"

@@ -104,7 +104,8 @@ o Rust assume justamente a captura e o envio.
 
 ## Etapas
 
-O Electron continua sendo o app distribuído até a última etapa. Estado em 14/11/2026:
+Em 14/11/2026 o app em Rust virou o Nimbo oficial (versão 0.5.0): é o que o link de download entrega, e o
+instalador dele remove o app antigo em Electron. Estado:
 
 | # | Entrega | Estado |
 |---|---|---|
@@ -119,18 +120,20 @@ O Electron continua sendo o app distribuído até a última etapa. Estado em 14/
 | 6c | Seletor "o que transmitir", com miniaturas e ícones | **Feito** (`src/components/SourcePicker.tsx`) |
 | 6d | Pausa (tela escura para quem assiste) e fim da live quando o jogo ou a janela fecha | **Feito no motor e no app**; a pausa foi vista por quem assiste. Não testado com jogo de verdade |
 | 6e | Login pelo navegador | **Feito** com credenciais de teste; falta um login real do Google |
-| 7a | Instalador "Nimbo Beta" e atualização automática assinada | **Feito e testado localmente** (instalar, atualizar de uma versão para outra, relançar). Falta a chave real e o primeiro Release |
-| 7b | Beta com os amigos, lado a lado com o app atual | Não começou |
-| 7c | Troca: o app em Rust vira o Nimbo | Não começou |
+| 7a | Instalador e atualização automática assinada | **Feito**: instalado numa máquina com o app antigo aberto (fechou, removeu, trocou os atalhos); ciclo de atualização testado localmente |
+| 7b | Troca: o app em Rust vira o Nimbo | **Feito em 14/11/2026** (0.5.0). Quem está no app antigo vê no site o convite para baixar o novo |
 
-### O que falta antes do beta (7b)
+### O que ainda não foi testado com gente de verdade
 
-1. Criar a chave de atualização e cadastrar os dois segredos no GitHub (passo a passo em `desktop/rust-app/README.md`).
-2. Rodar o workflow "Nimbo Beta installer" pela primeira vez e publicar no Release fixo `rust-beta`.
-3. Publicar o site com a parte de lives nativas (sem ela, quem assiste não conecta no app em Rust).
-4. Testar com jogo de verdade: som, tela cheia, Alt+Tab, anticheat (CS2, Valorant).
-5. Testar com alguém em outra rede e com o servidor de retransmissão (TURN).
-6. Decidir a numeração: o beta está em 0.1.0 e as novidades do site usam a versão do Electron (0.4.x).
+1. Jogo de verdade: som, tela cheia, Alt+Tab, anticheat (CS2, Valorant).
+2. Alguém em outra rede e o servidor de retransmissão (TURN).
+3. Login real do Google no app novo (só foi testado com credenciais de mentira).
+4. A primeira atualização pelo GitHub (o ciclo foi testado com um servidor local).
+5. Placas Intel e AMD, e máquina sem codificador na placa.
+
+Se algo disso falhar feio, o caminho de volta é publicar de novo o instalador do Electron (Release 0.4.1) como
+"latest" e tirar o convite do site (`LEGACY_APP` em `src/components/UpdateBanner.tsx`). O código do app antigo
+continua em `desktop/main.cjs` por isso.
 
 ### Defeitos conhecidos e otimizações pendentes
 
@@ -165,9 +168,9 @@ O Electron continua sendo o app distribuído até a última etapa. Estado em 14/
 - **Jogos em tela cheia exclusiva e anticheat.** O Windows Graphics Capture tem os mesmos limites
   do Chromium; não piora, mas também não resolve sozinho.
 - **Máquina sem codificador na placa.** Precisa de um codificador por software (OpenH264) de reserva.
-- **Troca de app.** O beta é instalado ao lado do app atual, com outro nome ("Nimbo Beta"), outro identificador e
-  outro canal de atualização (Release fixo `rust-beta`), para um nunca interferir no outro. Como migrar quem tem o
-  Electron, na troca final, ainda está por decidir.
+- **Troca de app.** O instalador novo fecha e remove o app antigo (`desktop/rust-app/installer-hooks.nsh`); o login
+  e as preferências do antigo não são apagados, mas o app novo pede o login do Google uma vez. O app antigo não se
+  atualiza sozinho para o novo: cada pessoa baixa o instalador pelo convite do site.
 - **Um espectador com rede ruim segura a qualidade de todos**, porque o codificador é um só. Quem cai sem
   avisar deixa de contar depois de 2 s; rede ruim de verdade ainda afeta a todos. Saída planejada: dois níveis.
 - **AdGuard e filtros de rede locais** cortam conexões HTTP locais ao acaso (visto nesta máquina). O app

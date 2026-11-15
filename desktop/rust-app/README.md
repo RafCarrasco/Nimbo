@@ -1,212 +1,118 @@
-# Nimbo em Rust (`desktop/rust-app`)
+# Nimbo para Windows (app em Rust)
 
-A casca do app de Windows em Rust (Tauri 2): uma janela que mostra o site do Nimbo no WebView2 e
-entrega a ele a ponte `window.nimboDesktop` (login, motor de mídia, atualização). O plano geral
-está em `docs/rust-app.md`; o contrato da ponte, em `src/desktop.ts`.
+Este é o app do Nimbo a partir da versão 0.5.0. A janela é Tauri 2 e mostra o próprio site; o que é
+pesado roda em Rust: captura de tela, codificação pela placa de vídeo, envio das lives, som do jogo,
+lista de telas e janelas, instalação e atualização. O plano e as medições estão em
+[`docs/rust-app.md`](../../docs/rust-app.md).
 
-Ela é distribuída como **Nimbo Beta**, ao lado do Nimbo atual (Electron). Os dois podem ficar
-instalados juntos:
+O app antigo, em Electron (`desktop/main.cjs`), não é mais distribuído. O instalador deste app o
+remove (`installer-hooks.nsh`); o login e as preferências do antigo ficam em outra pasta e não são tocados.
 
-| | Nimbo (Electron) | Nimbo Beta (Rust) |
+| | App antigo (Electron) | Este app |
 |---|---|---|
-| Identificador | `app.nimbo.desktop` | `app.nimbo.rust` |
-| Pasta de instalação | `%LOCALAPPDATA%\Programs\nimbo` | `%LOCALAPPDATA%\Nimbo Beta` |
-| Executável | `Nimbo.exe` | `nimbo-beta.exe` |
-| Dados (login, cookies) | `%APPDATA%\Nimbo` | `%LOCALAPPDATA%\app.nimbo.rust` |
-| Atalhos | "Nimbo" | "Nimbo Beta" |
-| Instalador | `Nimbo-Setup.exe` | `Nimbo-Beta-Setup.exe` |
-| Atualização | `latest.yml` do Release "latest" | `latest-beta.json` do Release `rust-beta` |
+| Pasta de instalação | `%LOCALAPPDATA%\Programs\Nimbo` | `%LOCALAPPDATA%\Nimbo` |
+| Executável | `Nimbo.exe` | `nimbo-app.exe` |
+| Dados | `%APPDATA%\Nimbo` | `%LOCALAPPDATA%\app.nimbo.rust` |
+| Atalhos | "Nimbo" | "Nimbo" (tomam o lugar dos antigos) |
+| Instalador | `Nimbo-Setup.exe` (até a 0.4.1) | `Nimbo-Setup.exe` (da 0.5.0 em diante) |
+| Atualização | `latest.yml` | `latest.json` do Release mais recente |
 
-## Rodar
+## Peças
 
-O Rust não fica no PATH nesta máquina; use o caminho inteiro. O motor de mídia compila o libopus
-com o **CMake**, que precisa estar no PATH (o que vem com o Visual Studio Build Tools serve):
+| Pasta | O que faz |
+|---|---|
+| `desktop/rust-app` | Janela, ponte com o site (`window.nimboDesktop`), login, atualização, instalador |
+| `desktop/rust-media` | Motor de mídia: captura, codificador da placa, envio WebRTC, som em Opus |
+| `desktop/rust-audio` | Captura do som do jogo (ou de tudo menos o Nimbo) |
+| `desktop/rust-native` | Telas, janelas, miniaturas, ícones, vigia do jogo |
+
+## Rodar e testar
+
+O Rust fica em `%USERPROFILE%\.cargo\bin`. O motor de mídia precisa do CMake no PATH (o que vem com o
+Visual Studio Build Tools serve):
 
 ```powershell
-$env:PATH = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;$env:PATH"
-cd desktop\rust-app
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" run --release
+$env:PATH = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;$env:USERPROFILE\.cargo\bin;$env:PATH"
 ```
 
-Variáveis de ambiente que a casca lê (todas opcionais, só para teste):
+```powershell
+cargo run --release --manifest-path desktop/rust-app/Cargo.toml
+```
+
+```powershell
+cargo test --locked --release --manifest-path desktop/rust-app/Cargo.toml
+```
+
+Variáveis de ambiente, só para desenvolvimento e teste:
 
 | Variável | Para quê |
 |---|---|
-| `NIMBO_URL` | Outro endereço no lugar do site publicado (ex.: `http://localhost:5173`). |
-| `NIMBO_APP_ID` | Outro identificador: não divide trava de instância única nem dados com o app instalado. |
-| `NIMBO_DATA_DIR` | Pasta dos dados do WebView2 (login, cookies) e do `nimbo-update.log`. |
-| `NIMBO_LOGIN_PRINT` | Escreve o link de login no stdout em vez de abrir o navegador. |
-| `NIMBO_SELFTEST=<arquivo>` | Confere a ponte com o site carregado, grava o relatório no arquivo e fecha. |
-| `NIMBO_SELFTEST_SCRIPT=<arquivo .js>` | Com a anterior, roda esse roteiro no lugar da conferência padrão. |
-| `NIMBO_UPDATE_URL` | Outro endereço do `latest-beta.json`, para testar a atualização (ver abaixo). |
-
-Só para gerar o instalador (lidas pelo `tauri-cli`, nunca pelo app):
-`TAURI_SIGNING_PRIVATE_KEY` e `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
-
-## Testar
-
-```powershell
-cd desktop\rust-app
-$cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
-& $cargo fmt -- --check
-& $cargo clippy --locked --release --all-targets -- -D warnings
-& $cargo test --locked --release
-```
-
-Com o site de verdade carregado (abre a janela, confere a ponte e fecha sozinho):
-
-```powershell
-$env:NIMBO_APP_ID = 'app.nimbo.rusttest'
-$env:NIMBO_DATA_DIR = "$env:TEMP\nimbo-rust-selftest"
-$env:NIMBO_SELFTEST = "$env:TEMP\nimbo-rust-selftest.txt"
-& $cargo run --release
-Get-Content $env:NIMBO_SELFTEST
-```
-
-## Versão
-
-A versão do app vem de **um lugar só: `version` no `Cargo.toml`**. O `tauri.conf.json` não tem
-`version` de propósito; sem ela o Tauri usa a do Cargo no executável, no instalador, na assinatura
-e no que o app informa à página (`nimboDesktop.appVersion`). Para lançar, suba a versão ali.
+| `NIMBO_URL` | Outro endereço do site (ex.: `http://localhost:5173/?devUser=owner` com o emulador). |
+| `NIMBO_APP_ID` e `NIMBO_DATA_DIR` | Outro identificador e outra pasta de dados, para não misturar com o app instalado. |
+| `NIMBO_LOGIN_PRINT` | Imprime o link de login em vez de abrir o navegador. |
+| `NIMBO_SELFTEST=<arquivo>` | Confere a ponte com o site carregado, grava o resultado e fecha. |
+| `NIMBO_SELFTEST_SCRIPT=<arquivo .js>` | Com a anterior, roda esse roteiro dentro da página no lugar da conferência. |
+| `NIMBO_UPDATE_URL` | Outro endereço do `latest.json`, para testar a atualização (https, ou http só em 127.0.0.1). |
 
 ## Instalador
 
-Precisa do `tauri-cli` (uma vez):
-
 ```powershell
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" install tauri-cli --version "^2" --locked
+powershell -ExecutionPolicy Bypass -File desktop/rust-app/scripts/pack.ps1
 ```
 
-Com a chave de atualização nas duas variáveis de ambiente (seção seguinte):
+Precisa do `tauri-cli` (`cargo install tauri-cli --version "^2" --locked`) e da chave de atualização
+(abaixo). Gera em `desktop/rust-app/release/`:
 
-```powershell
-.\desktop\rust-app\scripts\pack.ps1
-```
+- `Nimbo-Setup.exe` (~5 MB): instala por usuário, sem pedir administrador, remove o app antigo e
+  cria os atalhos "Nimbo". Se a máquina não tiver o WebView2, o instalador baixa.
+- `Nimbo-Setup.exe.sig`: assinatura de atualização.
+- `latest.json`: o que o app instalado lê para saber da versão nova.
 
-O script acha sozinho o `cargo` e o CMake do Visual Studio quando não estão no PATH.
-Sai em `desktop\rust-app\release\` (fora do git):
-
-- `Nimbo-Beta-Setup.exe` (~5 MB): instalador NSIS, por usuário, sem pedir administrador. Se a
-  máquina não tiver o WebView2, o instalador baixa e instala. Aberto com dois cliques ele mostra
-  as telas de instalação em português (o do Electron instala direto); com `/S` instala sem janela.
-  Cria os atalhos "Nimbo Beta" na área de trabalho e no menu Iniciar e a entrada "Nimbo Beta" em
-  Aplicativos instalados. Desinstalar não apaga o login, a não ser que a pessoa marque a opção.
-- `Nimbo-Beta-Setup.exe.sig`: assinatura de atualização.
-- `latest-beta.json`: o que o app instalado lê para saber da versão nova.
-
-O script para com erro se a chave pública do `tauri.conf.json` ainda for o marcador, se a chave
-privada não for o par dela ou se a assinatura não levar a versão.
-
-O mesmo roda no GitHub em **Actions > Nimbo Beta installer (Rust app) > Run workflow**
-(`.github/workflows/rust-app-release.yml`). Ele só deixa os três arquivos como artefato do
-workflow: não cria Release nem tag.
+O mesmo roda no GitHub em **Actions > Nimbo installer (Rust app) > Run workflow**. O workflow só deixa
+os arquivos como artefatos; não cria Release.
 
 ## Atualização automática
 
-O app instalado confere `latest-beta.json` ao abrir e a cada 6 horas, baixa a versão nova em
-segundo plano, confere a assinatura e avisa o site, que mostra o cartão "pronto" e pede a
-instalação (`watchUpdate`, `onUpdateProgress`, `installUpdate`). Instala sem janela e reabre.
-Se a pessoa fechar o app com a atualização baixada, ela é instalada ao fechar, sem reabrir.
+O app confere `https://github.com/RafCarrasco/Nimbo/releases/latest/download/latest.json` ao abrir e
+a cada 6 horas, baixa a versão nova em segundo plano e avisa o site, que mostra "Reiniciar agora".
+Fechar o app com uma atualização baixada também instala. Falhas vão só para `nimbo-update.log`, na
+pasta de dados.
 
-Falha de rede, 404 ou assinatura errada não aparecem para a pessoa: vão para
-`%LOCALAPPDATA%\app.nimbo.rust\nimbo-update.log`, e a conferência tenta de novo (30 s, 2 min,
-10 min, depois o intervalo normal). Build de desenvolvimento (`cargo run`) não se atualiza.
+Duas regras para o canal não quebrar:
 
-### Onde fica o canal e por que não esbarra no Electron
+- **Todo Release marcado como "latest" precisa ter os três arquivos acima.** Um Release "latest" sem
+  `latest.json` deixa todos os apps instalados sem atualização até o próximo.
+- **Não publique mais Release do app antigo como "latest".**
 
-O app em Electron procura `latest.yml` no Release marcado como **latest**, e o link de download
-do pessoal é `releases/latest/download/Nimbo-Setup.exe`. Se um Release do beta virasse "latest",
-os dois quebrariam. Por isso o beta nunca usa "latest":
+## Chave de atualização
 
-- existe **um Release fixo, com a tag `rust-beta`, marcado como pré-lançamento** (o GitHub nunca
-  escolhe pré-lançamento como "latest");
-- o app em Rust lê sempre
-  `https://github.com/RafCarrasco/Nimbo/releases/download/rust-beta/latest-beta.json`;
-- a cada versão do beta, os três arquivos desse Release são trocados.
+O app só aceita atualização assinada com a chave cujo par público está em `tauri.conf.json`
+(`plugins.updater.pubkey`). A chave privada **não fica no repositório**:
 
-O link para o pessoal baixar o beta também é fixo:
-`https://github.com/RafCarrasco/Nimbo/releases/download/rust-beta/Nimbo-Beta-Setup.exe`.
+- na máquina de quem publica: `%USERPROFILE%\.nimbo-chaves\nimbo.key` e a senha em
+  `%USERPROFILE%\.nimbo-chaves\nimbo.key.senha`;
+- no GitHub: segredos `TAURI_SIGNING_PRIVATE_KEY` e `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 
-### Chave de assinatura (uma vez só)
+**Guarde uma cópia dessa pasta fora do computador.** Sem a chave não dá para publicar atualização
+para quem já instalou: seria preciso todo mundo baixar o instalador de novo.
 
-O app só instala uma atualização assinada pela chave privada cujo par público está dentro dele.
-**A chave privada e a senha nunca entram no repositório.** Quem perde a chave privada não
-consegue mais atualizar quem já instalou: guarde uma cópia fora do computador.
+## Publicar uma versão
 
-1. Crie o par de chaves fora do repositório. O comando pede uma senha (duas vezes); escolha uma
-   e guarde.
+1. Suba `version` em `desktop/rust-app/Cargo.toml` e em `package.json`, e escreva as novidades em
+   `src/lib/changelog.ts`. Mescle na `main` por PR.
+2. Gere o instalador (comando acima, ou o workflow).
+3. Crie o Release e suba os três arquivos:
 
    ```powershell
-   New-Item -ItemType Directory -Force "$env:USERPROFILE\.nimbo-chaves" | Out-Null
-   & "$env:USERPROFILE\.cargo\bin\cargo.exe" tauri signer generate -w "$env:USERPROFILE\.nimbo-chaves\nimbo-beta.key"
+   gh release create v0.5.1 desktop/rust-app/release/Nimbo-Setup.exe desktop/rust-app/release/Nimbo-Setup.exe.sig desktop/rust-app/release/latest.json --repo RafCarrasco/Nimbo --title "Nimbo 0.5.1" --notes "O que mudou"
    ```
 
-2. Cole a chave **pública** no repositório: abra `desktop/rust-app/tauri.conf.json` e troque o
-   valor de `plugins.updater.pubkey` (hoje um marcador que deixa a atualização desligada) pelo
-   texto que este comando mostra. Commit normal, por PR.
+4. Publique o site (`firebase deploy --project golive-ad118 --only hosting,database`).
 
-   ```powershell
-   Get-Content "$env:USERPROFILE\.nimbo-chaves\nimbo-beta.key.pub"
-   ```
+## Testar a atualização sem publicar
 
-3. Cadastre a chave **privada** e a senha como secrets do repositório. Pelo site: **Settings >
-   Secrets and variables > Actions > New repository secret**, com os nomes
-   `TAURI_SIGNING_PRIVATE_KEY` (o conteúdo inteiro de `nimbo-beta.key`) e
-   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (a senha). Ou pelo terminal:
-
-   ```powershell
-   Get-Content "$env:USERPROFILE\.nimbo-chaves\nimbo-beta.key" -Raw | gh secret set TAURI_SIGNING_PRIVATE_KEY --repo RafCarrasco/Nimbo
-   gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --repo RafCarrasco/Nimbo
-   ```
-
-   O segundo comando pede a senha sem mostrar na tela.
-
-4. Para gerar o instalador na sua máquina, as mesmas duas variáveis, só na sessão do terminal:
-
-   ```powershell
-   $env:TAURI_SIGNING_PRIVATE_KEY = "$env:USERPROFILE\.nimbo-chaves\nimbo-beta.key"
-   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = Read-Host 'Senha da chave'
-   .\desktop\rust-app\scripts\pack.ps1
-   ```
-
-### Publicar uma versão do beta
-
-1. Suba `version` em `desktop/rust-app/Cargo.toml` (e rode `cargo build` para o `Cargo.lock`
-   acompanhar). Merge na `main`.
-2. Rode o workflow **Nimbo Beta installer (Rust app)** e baixe o artefato `nimbo-beta-installer`
-   (ou rode `scripts\pack.ps1` na sua máquina).
-3. Na primeira vez, crie o Release fixo, **como pré-lançamento**:
-
-   ```powershell
-   gh release create rust-beta --repo RafCarrasco/Nimbo --prerelease --latest=false --title "Nimbo Beta (app em Rust)" --notes "Canal de testes do app em Rust. O Nimbo de sempre continua no Release mais recente."
-   ```
-
-4. Troque os arquivos do Release, **o manifesto por último** (é ele que avisa os apps):
-
-   ```powershell
-   gh release upload rust-beta Nimbo-Beta-Setup.exe Nimbo-Beta-Setup.exe.sig --repo RafCarrasco/Nimbo --clobber
-   gh release upload rust-beta latest-beta.json --repo RafCarrasco/Nimbo --clobber
-   ```
-
-Nunca marque o Release `rust-beta` como "latest" nem tire o "pré-lançamento": é isso que mantém
-o link e a atualização do Nimbo atual apontando para o Release dele.
-
-### Testar o ciclo inteiro sem tocar no GitHub
-
-`NIMBO_UPDATE_URL` aponta o app para outro `latest-beta.json`. Aceita `https://` ou, só nesta
-máquina, `http://127.0.0.1` e `http://localhost`. A assinatura continua valendo: o instalador
-servido tem que ter sido assinado pela chave cujo par público está no app em teste.
-
-Roteiro usado na validação (tudo com nome de produto, identificador e chave descartáveis):
-
-1. Crie uma chave de teste fora do repositório (`cargo tauri signer generate --ci -p <senha> -w <arquivo>`).
-2. Gere duas versões com um arquivo de ajustes para o `tauri-cli`, por exemplo
-   `{"productName":"Nimbo UpdTest","mainBinaryName":"nimbo-updtest","identifier":"app.nimbotest.updtest","version":"0.1.0","bundle":{"publisher":"NimboTest"},"plugins":{"updater":{"pubkey":"<pública de teste>"}}}`
-   e outro igual com `"version":"0.1.1"`:
-   `scripts\pack.ps1 -Config a.json -OutDir <pasta>\a -BaseUrl http://127.0.0.1:8765 -ArtifactName Setup.exe`.
-3. Instale a primeira sem janela numa pasta de teste: `Setup.exe /S /D=<pasta>\instalado`.
-4. Sirva `latest-beta.json` e `Setup.exe` da segunda em `http://127.0.0.1:8765`.
-5. Abra o app instalado com `NIMBO_UPDATE_URL=http://127.0.0.1:8765/latest-beta.json`,
-   `NIMBO_APP_ID`, `NIMBO_DATA_DIR` e um roteiro em `NIMBO_SELFTEST_SCRIPT` que chame
-   `watchUpdate`, `onUpdateProgress` e `installUpdate`.
-6. Desinstale no fim: `<pasta>\instalado\uninstall.exe /S`.
+1. Gere duas versões com `pack.ps1 -Config <json de teste> -OutDir <pasta>`, com outro nome de
+   produto e outro identificador no JSON de teste, para não mexer no Nimbo instalado.
+2. Instale a primeira (`Setup.exe /S /D=<pasta de teste>`).
+3. Sirva `latest.json` e `Setup.exe` da segunda em `http://127.0.0.1:8765`.
+4. Abra a instalada com `NIMBO_UPDATE_URL=http://127.0.0.1:8765/latest.json`.
