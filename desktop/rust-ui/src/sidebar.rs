@@ -15,9 +15,16 @@ pub enum Action {
     ToggleCategory(String),
     Join(String),
     Watch(String, String),
+    Leave,
     OpenAdmin,
     EditProfile,
     SignOut,
+}
+
+/// Canal em que a pessoa está, para o painel de conexão acima da conta.
+pub struct Connection<'a> {
+    pub online: bool,
+    pub channel: &'a str,
 }
 
 pub struct Sidebar<'a> {
@@ -26,6 +33,7 @@ pub struct Sidebar<'a> {
     pub room: &'a str,
     pub logo: &'a TextureHandle,
     pub version: &'a str,
+    pub connection: Option<Connection<'a>>,
 }
 
 impl Sidebar<'_> {
@@ -239,10 +247,39 @@ impl Sidebar<'_> {
         ui.add_space(4.0);
     }
 
+    /// "Conectado" + nome do canal + botão de sair, como o painel de voz do site.
+    fn connection(&self, ui: &mut Ui, actions: &mut Vec<Action>, connection: &Connection<'_>) {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::hover());
+        let painter = ui.painter().clone();
+        painter.hline(rect.x_range(), rect.bottom() - 0.5, (1.0, theme::BORDER));
+        let (glyph, color, status) = if connection.online {
+            (Icon::Signal, theme::SUCCESS, "Conectado")
+        } else {
+            (Icon::WifiOff, theme::WARNING, "Reconectando…")
+        };
+        icon(&painter, pos2(rect.left() + 10.0 + 15.0, rect.center().y), glyph, 16.0, color);
+        let left = rect.left() + 10.0 + 30.0 + 8.0;
+        let room = rect.right() - 10.0 - 32.0 - 8.0 - left;
+        let title = theme::line(&painter, status, theme::bold(13.0), color, room);
+        let channel = theme::line(&painter, connection.channel, theme::regular(12.0), theme::MUTED, room);
+        let y = rect.center().y - (title.size().y + channel.size().y) / 2.0;
+        let channel_y = y + title.size().y;
+        painter.galley(pos2(left, y), title, color);
+        painter.galley(pos2(left, channel_y), channel, theme::MUTED);
+        let button = Rect::from_center_size(pos2(rect.right() - 10.0 - 16.0, rect.center().y), vec2(32.0, 32.0));
+        let response = ui.interact(button, ui.scope_id().with("sair-do-canal"), Sense::click());
+        if icon_button_at(ui, button, response, Icon::PhoneOff, 16.0, "Sair do canal", true).clicked() {
+            actions.push(Action::Leave);
+        }
+    }
+
     fn account(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let data = self.data;
         let top = ui.max_rect();
         ui.painter().hline(top.x_range(), top.top() + 0.5, (1.0, theme::BORDER));
+        if let Some(connection) = &self.connection {
+            self.connection(ui, actions, connection);
+        }
         let nickname = data.profiles.get(&data.uid).map_or("", String::as_str);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::hover());
         let painter = ui.painter().clone();

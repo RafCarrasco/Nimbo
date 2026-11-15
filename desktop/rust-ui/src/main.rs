@@ -5,7 +5,7 @@
 //! Ver `docs/rust-app.md`, seção "App full Rust".
 //!
 //! Uso nesta etapa (só com os emuladores, `npm run emulators`):
-//!   nimbo-native --dev-user owner [--screenshot foto.png]
+//!   nimbo-native --dev-user owner [--join <id do canal>] [--screenshot foto.png]
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -15,12 +15,13 @@ mod theme;
 mod widgets;
 
 fn main() -> eframe::Result {
-    let mut args = app::Args { dev_user: None, screenshot: None };
+    let mut args = app::Args { dev_user: None, screenshot: None, join: None };
     let mut list = std::env::args().skip(1);
     while let Some(arg) = list.next() {
         match arg.as_str() {
             "--dev-user" => args.dev_user = list.next(),
             "--screenshot" => args.screenshot = list.next().map(Into::into),
+            "--join" => args.join = list.next(),
             _ => {}
         }
     }

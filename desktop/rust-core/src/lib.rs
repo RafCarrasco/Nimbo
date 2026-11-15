@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod community;
 pub mod config;
+pub mod room;
 pub mod rtdb;
 
 pub type Json = serde_json::Value;

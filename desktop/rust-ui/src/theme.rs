@@ -16,6 +16,8 @@ pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xed, 0xf7);
 pub const MUTED: Color32 = Color32::from_rgb(0x8d, 0x98, 0xb0);
 pub const PRIMARY: Color32 = Color32::from_rgb(0x7c, 0x6c, 0xff);
 pub const PRIMARY_STRONG: Color32 = Color32::from_rgb(0x68, 0x57, 0xf2);
+pub const SUCCESS: Color32 = Color32::from_rgb(0x3e, 0xcf, 0x8e);
+pub const WARNING: Color32 = Color32::from_rgb(0xf5, 0xb1, 0x4c);
 pub const DANGER: Color32 = Color32::from_rgb(0xf0, 0x47, 0x5a);
 pub const LIVE: Color32 = Color32::from_rgb(0xff, 0x3b, 0x4e);
 

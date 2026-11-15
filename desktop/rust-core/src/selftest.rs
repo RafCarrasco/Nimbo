@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nimbo_core::Json;
 use nimbo_core::auth::{self, Session};
 use nimbo_core::config::Project;
+use nimbo_core::room::Room;
 use nimbo_core::rtdb::{Db, DbError, Event, Status};
 use serde_json::json;
 
@@ -163,8 +164,33 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     expect(&members, "A, reconectada, vê B", |e| matches!(e, Event::Value(v) if v[&b.uid].is_object()))?;
     step("queda: o servidor remove a presença, a conexão volta e as escutas continuam");
 
-    db_a.close();
     db_b.remove(&format!("rooms/geral/members/{}", b.uid))?;
+
+    // Sala: entrar aparece para os outros com a versão do app; a mesma conta entrando em outro lugar
+    // tira a sessão antiga; sair remove a presença.
+    let room = Room::join(db_a, &a.uid, "competitivo", "teste (nativo)", || {})?;
+    let in_room = watch(db_b, "rooms/competitivo/members");
+    expect(&in_room, "B vê A no canal, com a versão do app", |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "teste (nativo)" && v[&a.uid]["joinedAt"].is_number()))?;
+    if !room.snapshot().joined || room.snapshot().issue.is_some() {
+        return Err("a sala deveria estar aberta e sem problema".into());
+    }
+    let (_, other) = account(project, a.email.split('@').next().unwrap_or(""))?;
+    let second = Room::join(&other, &a.uid, "competitivo", "outra sessão", || {})?;
+    let until = Instant::now() + WAIT;
+    while !room.snapshot().issue.is_some_and(|issue| issue.fatal) {
+        if Instant::now() > until {
+            return Err("a sessão antiga não percebeu a nova".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    room.leave();
+    expect(&in_room, "a presença continua sendo da sessão nova", |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "outra sessão"))?;
+    second.leave();
+    expect(&in_room, "A some do canal ao sair", |e| matches!(e, Event::Value(v) if v[&a.uid].is_null()))?;
+    other.close();
+    step("sala: entrar, ser trocada por outra sessão da mesma conta e sair");
+
+    db_a.close();
     db_b.close();
     Ok(())
 }

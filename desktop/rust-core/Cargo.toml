@@ -12,6 +12,8 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # Login (API REST do Firebase Auth).
 ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
 serde_json = "1"
+# Identificador ao acaso de cada sessão num canal.
+getrandom = "0.3"
 
 [profile.release]
 opt-level = 3
