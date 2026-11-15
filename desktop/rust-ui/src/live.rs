@@ -301,13 +301,6 @@ impl Watching {
         self.conns.get(key).is_some_and(|conn| conn.live.sound)
     }
 
-    pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume;
-        for viewer in self.conns.values().filter_map(|conn| conn.viewer.as_ref()) {
-            viewer.set_volume(volume);
-        }
-    }
-
     /// Números de cada conexão aberta, para o relatório de medidas.
     pub fn stats(&self) -> Vec<(String, viewer::Stats)> {
         self.conns.iter().filter_map(|(key, conn)| Some((key.clone(), conn.viewer.as_ref()?.stats()))).collect()

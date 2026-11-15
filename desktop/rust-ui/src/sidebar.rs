@@ -21,6 +21,8 @@ pub enum Action {
     ToggleLive(String),
     /// "Tentar de novo" nas lives de uma pessoa.
     RetryLive(String),
+    /// Abre o seletor do que transmitir.
+    PickSource,
     StopBroadcast,
     OpenAdmin,
     EditProfile,
@@ -259,9 +261,6 @@ impl Sidebar<'_> {
     fn connection(&self, ui: &mut Ui, actions: &mut Vec<Action>, connection: &Connection<'_>) {
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::hover());
         let painter = ui.painter().clone();
-        if !matches!(connection.broadcasting, Some(BroadcastState::Starting | BroadcastState::Live)) {
-            painter.hline(rect.x_range(), rect.bottom() - 0.5, (1.0, theme::BORDER));
-        }
         let live = matches!(connection.broadcasting, Some(BroadcastState::Starting | BroadcastState::Live));
         let (glyph, color, status) = match (connection.online, live) {
             (false, _) => (Icon::WifiOff, theme::WARNING, "Reconectando…"),
@@ -282,24 +281,26 @@ impl Sidebar<'_> {
         if icon_button_at(ui, button, response, Icon::PhoneOff, 16.0, "Sair do canal", true).clicked() {
             actions.push(Action::Leave);
         }
-        // Com uma transmissão no ar: o botão de encerrar, como "Encerrar" no site.
-        if live {
-            ui.add_space(8.0);
-            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
-            let button = Rect::from_min_max(pos2(row.left() + 10.0, row.top()), pos2(row.right() - 10.0, row.bottom()));
-            let response = ui.interact(button, ui.scope_id().with("encerrar-live"), Sense::click());
-            ui.painter().rect_filled(button, 8.0, if response.hovered() { theme::LIVE.gamma_multiply(0.85) } else { theme::LIVE });
-            let label = ui.painter().layout_no_wrap("Encerrar".to_owned(), theme::semibold(13.0), egui::Color32::WHITE);
-            let x = button.center().x - (18.0 + 6.0 + label.size().x) / 2.0;
-            icon(ui.painter(), pos2(x + 9.0, button.center().y), Icon::MonitorOff, 18.0, egui::Color32::WHITE);
-            ui.painter().galley(pos2(x + 24.0, button.center().y - label.size().y / 2.0), label, egui::Color32::WHITE);
-            if response.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Encerrar transmissão").clicked() {
-                actions.push(Action::StopBroadcast);
-            }
-            ui.add_space(8.0);
-            let line = ui.max_rect();
-            ui.painter().hline(line.x_range(), ui.cursor().top() - 0.5, (1.0, theme::BORDER));
+        // Botão de transmitir a tela, como "Tela" / "Encerrar" no site (a webcam ainda não existe aqui).
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+        let button = Rect::from_min_max(pos2(row.left() + 10.0, row.top()), pos2(row.right() - 10.0, row.bottom()));
+        let response = ui.interact(button, ui.scope_id().with("transmitir-tela"), Sense::click());
+        let (fill, text, glyph, hint) = match (live, response.hovered()) {
+            (true, hovered) => (theme::LIVE.gamma_multiply(if hovered { 0.85 } else { 1.0 }), "Encerrar", Icon::MonitorOff, "Encerrar transmissão"),
+            (false, true) => (theme::SURFACE_3, "Tela", Icon::MonitorUp, "Compartilhar tela"),
+            (false, false) => (theme::SURFACE_2, "Tela", Icon::MonitorUp, "Compartilhar tela"),
+        };
+        ui.painter().rect_filled(button, 8.0, fill);
+        let color = if live { egui::Color32::WHITE } else { theme::TEXT };
+        let label = ui.painter().layout_no_wrap(text.to_owned(), theme::semibold(13.0), color);
+        let x = button.center().x - (18.0 + 6.0 + label.size().x) / 2.0;
+        icon(ui.painter(), pos2(x + 9.0, button.center().y), glyph, 18.0, color);
+        ui.painter().galley(pos2(x + 24.0, button.center().y - label.size().y / 2.0), label, color);
+        if response.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(hint).clicked() {
+            actions.push(if live { Action::StopBroadcast } else { Action::PickSource });
         }
+        ui.add_space(8.0);
+        ui.painter().hline(rect.x_range(), ui.cursor().top() - 0.5, (1.0, theme::BORDER));
     }
 
     fn account(&self, ui: &mut Ui, actions: &mut Vec<Action>) {

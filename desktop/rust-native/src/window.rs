@@ -13,8 +13,8 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindow,
-    GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_TOOLWINDOW,
+    GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, InternalGetWindowText,
+    IsIconic, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
 
@@ -104,10 +104,18 @@ fn describe(hwnd: HWND) -> Option<WindowInfo> {
     let mut title = [0u16; 512];
     let mut class = [0u16; 256];
     let mut cloaked = 0u32;
+    let pid = owner_pid(hwnd);
     // SAFETY: consultas sobre um HWND; se a janela já fechou, elas só devolvem vazio/falso. Os
     // buffers são locais e o tamanho vai junto; `cloaked` tem os 4 bytes informados.
     let (visible, is_cloaked, minimized, owned, tool) = unsafe {
-        let titled = GetWindowTextW(hwnd, &mut title) != 0;
+        // Pedir o título a uma janela do próprio processo manda uma mensagem a ela e espera a
+        // resposta: se a thread dona não estiver atendendo mensagens (janelas auxiliares de vídeo e
+        // som, por exemplo), a lista nunca terminaria. Para essas o título é lido direto do Windows.
+        let titled = if pid == std::process::id() {
+            InternalGetWindowText(hwnd, &mut title) != 0
+        } else {
+            GetWindowTextW(hwnd, &mut title) != 0
+        };
         let visible = IsWindowVisible(hwnd).as_bool();
         // Sem título só entra se estiver visível (o Nimbo mostra o nome do executável).
         if !titled && !visible {
@@ -124,7 +132,6 @@ fn describe(hwnd: HWND) -> Option<WindowInfo> {
             GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0,
         )
     };
-    let pid = owner_pid(hwnd);
     Some(WindowInfo {
         hwnd: hwnd.0 as Hwnd,
         pid,

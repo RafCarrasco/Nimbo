@@ -26,6 +26,7 @@ mod live;
 #[allow(dead_code)]
 #[path = "../../rust-app/src/login.rs"]
 mod login;
+mod picker;
 mod session_store;
 mod sidebar;
 mod stage;
@@ -56,6 +57,7 @@ fn main() -> eframe::Result {
             "--exit-after" => args.exit_after = list.next().and_then(|seconds| seconds.parse().ok()),
             "--shot-after" => args.shot_after = list.next().and_then(|seconds| seconds.parse().ok()),
             "--cpu-video" => args.cpu_video = true,
+            "--pick" => args.pick = true,
             "--site" => args.site = list.next(),
             // Onde abrir a janela ("x,y") e de que tamanho ("largura,altura"): os testes abrem fora da
             // tela, para não aparecer para quem está usando o computador.

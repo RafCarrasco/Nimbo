@@ -24,6 +24,7 @@ use serde_json::json;
 
 use crate::live::{BroadcastState, Broadcasting, Capture, LiveState, Watching, live_key, parse_key};
 use crate::login::{self, LoginManager, Outcome, Timing};
+use crate::picker::{Choice, Picker};
 use crate::session_store;
 use crate::sidebar::{Action, Connection, Sidebar};
 use crate::stage::{Stage, notice_bar};
@@ -69,6 +70,8 @@ pub struct Args {
     pub shot_after: Option<u64>,
     /// Converte o vídeo na CPU em vez de na placa (para medir os dois caminhos).
     pub cpu_video: bool,
+    /// Abre o seletor do que transmitir assim que entrar no canal (para conferir a tela sem clicar).
+    pub pick: bool,
 }
 
 const PRODUCTION_SITE: &str = "https://golive-ad118.web.app";
@@ -233,6 +236,8 @@ pub struct Nimbo {
     /// Aviso para a pessoa (não deu para entrar, saiu do canal...).
     notice: String,
     videos: Videos,
+    /// Seletor do que transmitir, quando aberto.
+    picker: Option<Picker>,
     /// Quadros de cada live que já foram para a tela (para medir o que foi desenhado de fato).
     drawn: HashMap<String, u64>,
     meter: Meter,
@@ -268,6 +273,7 @@ impl Nimbo {
             collapsed: BTreeSet::new(),
             notice: String::new(),
             videos,
+            picker: None,
             drawn: HashMap::new(),
             meter: Meter {
                 at: Instant::now(),
@@ -554,6 +560,12 @@ impl Nimbo {
                         lives.watching.reset(Some(&uid));
                     }
                 }
+                Action::PickSource => {
+                    let in_room = self.account.as_ref().is_some_and(|account| account.room.is_some());
+                    if in_room && self.picker.is_none() {
+                        self.picker = Some(Picker::open(ctx));
+                    }
+                }
                 Action::StopBroadcast => {
                     if let Some(lives) = self.account.as_mut().and_then(|account| account.lives.as_mut()) {
                         lives.broadcasting = None;
@@ -597,6 +609,10 @@ impl Nimbo {
         }
         let room = room.filter(|_| kicked.is_none());
         if let (Some(snapshot), Some(handle), Some(lives)) = (&room, &account.room, account.lives.as_mut()) {
+            if args.pick && !*auto_broadcast {
+                *auto_broadcast = true;
+                actions.push(Action::PickSource);
+            }
             if let Some(window) = args.broadcast.filter(|_| !*auto_broadcast) {
                 *auto_broadcast = true;
                 let audio = args.sound.then(|| AudioSource::Exclude(std::process::id()));
@@ -779,6 +795,15 @@ impl eframe::App for Nimbo {
             Some(_) => ready = self.main_screen(ui, &mut actions),
         }
         self.act(&ctx, actions);
+        if let Some(choice) = self.picker.as_mut().and_then(|picker| picker.show(&ctx)) {
+            self.picker = None;
+            if let Choice::Start(capture) = choice
+                && let Some(account) = self.account.as_mut()
+                && let (Some(room), Some(lives)) = (&account.room, account.lives.as_mut())
+            {
+                Self::start_broadcast(lives, room, &account.session.uid, capture, &ctx);
+            }
+        }
         self.screenshot(ui, ready);
         if self.args.exit_after.is_some_and(|seconds| self.started.elapsed() >= Duration::from_secs(seconds)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -796,6 +821,9 @@ fn report(meter: &mut Meter, lives: &Lives, videos: &Videos, drawn: &HashMap<Str
     let seconds = elapsed.as_secs_f64();
     let cpu = nimbo_media::process_cpu();
     let per_second = |now: u64, before: u64| (now.saturating_sub(before) as f64 / seconds * 10.0).round() / 10.0;
+    let percent = |now: Duration, before: Option<Duration>| {
+        (now.saturating_sub(before.unwrap_or(Duration::ZERO)).as_secs_f64() / seconds * 1000.0).round() / 10.0
+    };
     let mut watching = Vec::new();
     let mut current = HashMap::new();
     for (key, stats) in lives.watching.stats() {
@@ -821,6 +849,10 @@ fn report(meter: &mut Meter, lives: &Lives, videos: &Videos, drawn: &HashMap<Str
             "mbps": (f64::from(stats.bitrate) / 1e5).round() / 10.0,
             "som_ms_por_s": per_second(stats.audio_played, before.map_or(0, |old| old.audio_played)) / 48.0,
             "som_secas": stats.audio_underruns,
+            // Para onde vai a CPU do player (o resto do processo é a interface e o desenho).
+            "cpu_rede_pct": percent(stats.cpu_network, before.map(|old| old.cpu_network)),
+            "cpu_decodificador_pct": percent(stats.cpu_decoder, before.map(|old| old.cpu_decoder)),
+            "cpu_som_pct": percent(stats.cpu_audio, before.map(|old| old.cpu_audio)),
         }));
         current.insert(key, stats);
     }
@@ -845,6 +877,8 @@ fn report(meter: &mut Meter, lives: &Lives, videos: &Videos, drawn: &HashMap<Str
             "pid": std::process::id(),
             "cpu_um_nucleo_pct": (cpu.saturating_sub(meter.cpu).as_secs_f64() / seconds * 1000.0).round() / 10.0,
             "desenho": videos.path(),
+            "lives_no_ar": lives.active.len(),
+            "ladrilhos_no_palco": lives.shown.len(),
             "assistindo": watching,
             "transmitindo": broadcast,
         })
