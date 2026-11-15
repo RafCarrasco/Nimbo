@@ -33,4 +33,4 @@ jobs:
             out=$(ip route show default | awk '{print $5; exit}')
             sudo iptables -t nat -A POSTROUTING -o "$out" -p udp ! --dport 53 -j MASQUERADE --random-fully
           fi
-          if [ "$mode" = "rev" ]; then node peer-rev.mjs; elif [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
+          if [ "$mode" = "rev" ] || [ "$mode" = "revq" ]; then node peer-rev.mjs; elif [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
