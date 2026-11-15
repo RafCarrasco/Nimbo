@@ -1,6 +1,6 @@
 [package]
 name = "nimbo-app"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 publish = false
 description = "Nimbo desktop shell in Rust (Tauri 2): the site inside WebView2 plus the native bridge. Experimental."
@@ -20,6 +20,10 @@ nimbo-media = { path = "../rust-media" }
 nimbo-native = { path = "../rust-native" }
 # Miniaturas e ícones vão para a página como data URL.
 base64 = "0.22"
+# Acesso ao navegador embutido para liberar os caminhos de rede (network.rs). Mesmas versões que o
+# Tauri já usa.
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation"] }
 # Atualização automática: confere a assinatura do instalador novo antes de instalar (src/update.rs).
 # native-tls: usa os certificados do Windows, como o navegador (antivírus e proxy que inspecionam
 # HTTPS instalam a raiz deles lá). Sem "zip": no Windows a atualização é o próprio instalador.

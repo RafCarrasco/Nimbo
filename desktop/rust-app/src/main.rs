@@ -17,6 +17,7 @@
 mod bridge;
 mod login;
 mod media;
+mod network;
 mod selftest;
 mod sources;
 mod update;
@@ -39,8 +40,10 @@ const PRODUCTION_URL: &str = "https://golive-ad118.web.app";
 /// O resto repete o que o app em Electron já faz: o Nimbo transmite ao vivo, e com a janela
 /// atrás do jogo ou minimizada o Chromium freava a página (a live caía de ~58 para ~1 quadro/s).
 /// O Electron também deixa vídeo com som tocar sem clique; o WebView2, por padrão, não.
+/// WebRtcHideLocalIpsWithMdns desligado: o endereço local vai de verdade, e não como um nome
+/// `.local` que quem está em outra casa não consegue resolver (ver network.rs).
 const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,\
-CalculateNativeWinOcclusion,IntensiveWakeUpThrottling \
+CalculateNativeWinOcclusion,IntensiveWakeUpThrottling,WebRtcHideLocalIpsWithMdns \
 --disable-renderer-backgrounding --disable-background-timer-throttling \
 --disable-backgrounding-occluded-windows --autoplay-policy=no-user-gesture-required";
 
@@ -184,7 +187,9 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
                 selftest::title_changed(window.app_handle(), &title, &report);
             });
     }
-    window.build()?;
+    let window = window.build()?;
+    // Lives pelo navegador embutido com os mesmos caminhos de rede do app antigo (ver network.rs).
+    network::open_paths(&window, origin.ascii_serialization());
     Ok(())
 }
 

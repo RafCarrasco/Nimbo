@@ -2008,6 +2008,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2517,7 +2527,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nimbo-app"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -2531,6 +2541,8 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "url",
+ "webview2-com",
+ "windows",
 ]
 
 [[package]]
@@ -2545,6 +2557,7 @@ dependencies = [
 name = "nimbo-media"
 version = "0.1.0"
 dependencies = [
+ "if-addrs",
  "nimbo-audio",
  "openh264",
  "opus",

@@ -127,13 +127,29 @@ instalador dele remove o app antigo em Electron. Estado:
 
 1. Jogo de verdade: som, tela cheia, Alt+Tab, anticheat (CS2, Valorant).
 2. Alguém em outra rede e o servidor de retransmissão (TURN).
-3. Login real do Google no app novo (só foi testado com credenciais de mentira).
-4. A primeira atualização pelo GitHub (o ciclo foi testado com um servidor local).
+3. ~~Login real do Google no app novo~~: funcionou em 14/11/2026.
+4. A primeira atualização pelo GitHub (o ciclo foi testado com um servidor local): a 0.5.1 é a primeira.
 5. Placas Intel e AMD, e máquina sem codificador na placa.
 
 Se algo disso falhar feio, o caminho de volta é publicar de novo o instalador do Electron (Release 0.4.1) como
 "latest" e tirar o convite do site (`LEGACY_APP` em `src/components/UpdateBanner.tsx`). O código do app antigo
 continua em `desktop/main.cjs` por isso.
+
+### Caminhos de rede (corrigido na 0.5.1)
+
+No primeiro dia da 0.5.0, duas pessoas que se viam no app antigo deixaram de se ver (`connection failed`, nenhum
+candidato remoto aproveitado). Medido na mesma máquina: o WebView2 oferecia 2 endereços (um nome `.local` e o
+endereço público) contra 9 do Electron (todas as placas, IPv6, rede virtual de jogo). Do outro lado, o motor só
+oferecia a rota padrão em IPv4. Duas correções:
+
+- **Casca** (`desktop/rust-app/src/network.rs`): o Chromium só libera todos os endereços para a página que tem
+  permissão de câmera, então o app concede a câmera à origem do Nimbo no perfil do WebView2, e desliga a troca do
+  endereço local por nome `.local`. Depois disso: 9 endereços, igual ao Electron.
+- **Motor** (`accept` em `desktop/rust-media/src/engine.rs`): um soquete por endereço local (até 6 IPv4 e 4
+  IPv6), cada um com seu candidato. Conferido mantendo um candidato por vez na resposta: segunda placa, rede
+  virtual e IPv6 conectam e passam vídeo.
+
+Quem está atrás de CGNAT dos dois lados, sem IPv6 e sem rede virtual em comum, continua precisando de TURN.
 
 ### Defeitos conhecidos e otimizações pendentes
 
