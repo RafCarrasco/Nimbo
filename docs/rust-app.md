@@ -184,6 +184,25 @@ passagem nos roteadores de quem transmite sem alcançar o roteador de quem assis
 verdade e silêncio de 8 s (`NIMBO_QUIET_MS=8000`): o espectador remoto mandou primeiro e a conexão fechou em
 0,4 s, com vídeo. Na rede local o pacote chega direto e o silêncio acaba na hora.
 
+**0.5.4, depois de a 0.5.2 e a 0.5.3 não resolverem o caso do dono.** O que se soube em 15/11/2026:
+
+- O aparelho que mata a conversa é o modem da Vivo (192.168.15.1), também sozinho, sem o roteador do dono
+  atrás (medido pelo Wi-Fi direto do modem: de fora primeiro, 0 de 90; de dentro primeiro, 90 de 90). O técnico
+  tinha tirado o modem do modo bridge na véspera: por isso "antes funcionava".
+- Pelo Wi-Fi do modem a live do amigo conecta porque os dois lados têm IPv6; pelo cabo, atrás do roteador do
+  dono, não há IPv6 e sobra o IPv4 que o modem barra.
+- A rede de todos no canal tem porta pública estável e igual à local (lido das ofertas que cada app mandou para
+  uma live de teste): ninguém ali precisa de TURN por causa de NAT simétrico.
+- Defeitos do silêncio da 0.5.2/0.5.3: 4 saltos para todo mundo é um a mais que o necessário para quem tem um
+  roteador só (o pacote anda um salto mais longe e pode alcançar o modem de quem assiste), e a abertura dependia
+  da fila de testes do WebRTC (um a cada 50 ms, o endereço público por último). Agora o motor mede os roteadores
+  de casa (`tracert` até 1.1.1.1, endereços privados ou de CGNAT no começo da rota) e usa esse número mais um; e
+  manda um pacote de abertura para cada endereço de quem assiste já ao aceitar a oferta, antes de a resposta sair.
+  Conferido com espectador remoto: mediu 2 roteadores pelo cabo e 1 pelo Wi-Fi, e conectou em 0,5 s.
+- Não foi conferido entre o dono (pelo cabo) e o amigo: precisa de quem transmite na 0.5.4.
+- Nesta máquina, UDP entre dois soquetes em 127.0.0.1 não é entregue (filtro de rede local): testes de rede usam
+  o endereço da placa.
+
 Limites: as lives pelo navegador embutido (webcam) e quem assiste pelo site não passam pelo motor e continuam
 dependendo de quem testa primeiro; e é quem transmite que precisa estar na 0.5.2. O relógio da máquina do dono
 estava 111 s adiantado: testes com horário combinado entre máquinas precisam medir essa diferença antes.

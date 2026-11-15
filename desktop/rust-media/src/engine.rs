@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, Once};
@@ -762,6 +762,8 @@ impl Engine {
     /// Começa a capturar. Trocar de fonte é parar e começar de novo; os espectadores continuam
     /// conectados e recebem a fonte nova.
     pub fn start(&self, source: Source, quality: Quality) -> Result<(), AnyError> {
+        // Enquanto a live começa, mede os roteadores de casa: o primeiro espectador de fora vem depois.
+        measure_hops();
         // Confere a fonte nova antes de largar a que está no ar: uma janela que já fechou não pode
         // congelar a live que estava funcionando.
         match source {
@@ -857,6 +859,7 @@ impl Engine {
             return Err("espectadores demais conectados".into());
         }
         let offer: SdpOffer = serde_json::from_slice(offer)?;
+        let remotes = remote_addresses(&offer.to_sdp_string());
         let offer = SdpOffer::from_sdp_string(&same_stream(&offer.to_sdp_string()))?;
         let ceiling = self.shared.quality.lock().unwrap().bitrate;
         let mut rtc = RtcConfig::new()
@@ -880,6 +883,9 @@ impl Engine {
             }
         }
         let answer = serde_json::to_vec(&rtc.sdp_api().accept_offer(offer)?)?;
+        // Antes de a resposta sair daqui: quando quem assiste souber o nosso endereço, a passagem
+        // de volta já está aberta nos roteadores deste lado.
+        let quiet = Quiet::start(&sockets, remotes, quiet_hops());
 
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, inbox) = channel();
@@ -900,7 +906,7 @@ impl Engine {
         let shared = self.shared.clone();
         std::thread::spawn(move || {
             shared.viewers.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = viewer(rtc, &sockets, &shared, &inbox, id) {
+            if let Err(e) = viewer(rtc, &sockets, quiet, &shared, &inbox, id) {
                 eprintln!("espectador {id}: {e}");
             }
             shared.subscribers.lock().unwrap().remove(&id);
@@ -1055,9 +1061,102 @@ fn quiet_max() -> Duration {
             .map_or(QUIET_MAX, Duration::from_millis)
     })
 }
-/// Saltos de vida dos pacotes durante o silêncio: passam pelos roteadores de casa (medido com dois
-/// em série: com 2 saltos a passagem não abre, com 3 e com 4 abre) e morrem na rede do provedor.
-const QUIET_HOPS: u32 = 4;
+/// Saltos de vida dos pacotes durante o silêncio quando não deu para medir os roteadores de casa:
+/// atravessa até dois em série (medido: com 2 saltos a passagem não abre em casa com dois roteadores,
+/// com 3 abre) e morre no primeiro roteador do provedor.
+const QUIET_HOPS: u32 = 3;
+/// Com mais que isto a medição está errada (ou a rede é estranha demais para confiar nela).
+const MAX_QUIET_HOPS: u32 = 5;
+
+/// Saltos medidos: roteadores de casa no caminho, mais um. Zero enquanto não mediu.
+static MEASURED_HOPS: AtomicU32 = AtomicU32::new(0);
+
+/// Vida dos pacotes do silêncio: o mínimo que sai de casa. Com um salto a mais que o necessário, o
+/// pacote de quem tem um roteador só chega um salto mais longe e pode bater no roteador de quem
+/// assiste, que é justamente o que o silêncio existe para evitar (0.5.3 usava 4 para todo mundo).
+fn quiet_hops() -> u32 {
+    match MEASURED_HOPS.load(Ordering::Relaxed) {
+        0 => QUIET_HOPS,
+        hops => hops,
+    }
+}
+
+/// Mede uma vez, em segundo plano, quantos roteadores de casa há no caminho para a internet.
+fn measure_hops() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(|| match home_routers() {
+            Some(routers) => {
+                MEASURED_HOPS.store((routers + 1).min(MAX_QUIET_HOPS), Ordering::Relaxed);
+                eprintln!("[nimbo] roteadores de casa no caminho: {routers}");
+            }
+            None => eprintln!("[nimbo] roteadores de casa: não deu para medir"),
+        });
+    });
+}
+
+/// Pergunta ao Windows a rota até um endereço público e conta os roteadores de casa no começo dela.
+fn home_routers() -> Option<u32> {
+    use std::os::windows::process::CommandExt;
+    // Sem janela de console piscando atrás do app.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = std::process::Command::new("tracert")
+        .args(["-d", "-h", "5", "-w", "300", "1.1.1.1"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    count_home_routers(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Na saída do tracert, quantos saltos seguidos, a partir do primeiro, têm endereço de rede de casa
+/// (ou de CGNAT da operadora, que também é um NAT a atravessar). Para no primeiro que não tem ou
+/// que não respondeu.
+fn count_home_routers(trace: &str) -> Option<u32> {
+    let mut count = 0;
+    for line in trace.lines() {
+        let mut words = line.split_whitespace();
+        if words.next().and_then(|word| word.parse::<u32>().ok()) != Some(count + 1) {
+            continue;
+        }
+        let home = words
+            .next_back()
+            .and_then(|word| word.parse::<Ipv4Addr>().ok())
+            .is_some_and(|ip| {
+                let [a, b, ..] = ip.octets();
+                ip.is_private() || (a == 100 && (64..128).contains(&b))
+            });
+        if !home {
+            break;
+        }
+        count += 1;
+    }
+    (count > 0).then_some(count)
+}
+
+/// Endereços UDP que quem assiste ofereceu, lidos da oferta: para onde abrir a passagem de volta.
+fn remote_addresses(sdp: &str) -> Vec<SocketAddr> {
+    let mut found = Vec::new();
+    for line in sdp.lines() {
+        let Some(candidate) = line.trim().strip_prefix("a=candidate:") else {
+            continue;
+        };
+        let fields: Vec<&str> = candidate.split_whitespace().collect();
+        // fundação, componente, transporte, prioridade, endereço, porta, "typ", tipo...
+        if fields.len() < 6 || !fields[2].eq_ignore_ascii_case("udp") {
+            continue;
+        }
+        // Nome ".local" (endereço escondido pelo navegador) não é endereço: fica de fora.
+        if let (Ok(ip), Ok(port)) = (fields[4].parse::<IpAddr>(), fields[5].parse::<u16>())
+            && port != 0
+        {
+            let address = SocketAddr::new(ip, port);
+            if !found.contains(&address) {
+                found.push(address);
+            }
+        }
+    }
+    found
+}
 /// Intervalo entre pacotes para o mesmo destino durante o silêncio: mantém a passagem aberta sem
 /// encher a rede de pacotes que vão morrer no caminho (cada um pode gerar um aviso de erro de volta).
 const QUIET_EVERY: Duration = Duration::from_millis(300);
@@ -1075,8 +1174,15 @@ const QUIET_EVERY: Duration = Duration::from_millis(300);
 /// de vida: atravessa o roteador de quem transmite, abrindo a passagem de volta, e morre antes de
 /// chegar ao roteador de quem assiste. Na rede local não há roteador no caminho: o pacote chega, a
 /// resposta vem e o silêncio acaba na hora.
+///
+/// A passagem é aberta já ao aceitar a oferta, com um pacote vazio para cada endereço de quem
+/// assiste, sem esperar a vez de cada teste de caminho do WebRTC (um a cada 50 ms, e o endereço
+/// público é dos últimos da fila): quem assiste pode mandar o primeiro pacote antes disso.
 struct Quiet {
     active: bool,
+    /// Endereços de quem assiste, para manter a passagem aberta enquanto durar o silêncio.
+    remotes: Vec<SocketAddr>,
+    opened: Instant,
     /// Saltos normais de cada soquete, para devolver no fim. `None`: não deu para limitar os saltos
     /// desse soquete, então ele fica calado durante o silêncio.
     normal: Vec<Option<u32>>,
@@ -1085,18 +1191,45 @@ struct Quiet {
 }
 
 impl Quiet {
-    fn start(sockets: &[(SocketAddr, UdpSocket)]) -> Self {
+    fn start(sockets: &[(SocketAddr, UdpSocket)], remotes: Vec<SocketAddr>, life: u32) -> Self {
         let normal = sockets
             .iter()
             .map(|(_, socket)| {
                 let before = hops(socket)?;
-                set_hops(socket, QUIET_HOPS).then_some(before)
+                set_hops(socket, life).then_some(before)
             })
             .collect();
-        Self {
+        let quiet = Self {
             active: true,
+            remotes,
+            opened: Instant::now(),
             normal,
             sent: HashMap::new(),
+        };
+        quiet.open(sockets);
+        quiet
+    }
+
+    /// Um pacote vazio de cada soquete para cada endereço de quem assiste, com a vida limitada: abre
+    /// a passagem de volta nos roteadores deste lado. Quem recebe (na rede local) ignora.
+    fn open(&self, sockets: &[(SocketAddr, UdpSocket)]) {
+        for ((local, socket), normal) in sockets.iter().zip(&self.normal) {
+            if normal.is_none() {
+                continue;
+            }
+            for remote in &self.remotes {
+                if remote.is_ipv4() == local.is_ipv4() {
+                    let _ = socket.send_to(&[0], remote);
+                }
+            }
+        }
+    }
+
+    /// Repete a abertura de tempos em tempos enquanto o silêncio durar.
+    fn keep_open(&mut self, sockets: &[(SocketAddr, UdpSocket)], now: Instant) {
+        if self.active && now.saturating_duration_since(self.opened) >= QUIET_EVERY {
+            self.opened = now;
+            self.open(sockets);
         }
     }
 
@@ -1154,6 +1287,7 @@ fn set_hops(socket: &UdpSocket, hops: u32) -> bool {
 fn viewer(
     mut rtc: Rtc,
     sockets: &[(SocketAddr, UdpSocket)],
+    mut quiet: Quiet,
     shared: &Shared,
     inbox: &Receiver<Msg>,
     id: u64,
@@ -1164,11 +1298,11 @@ fn viewer(
     let mut connected = false;
     // Desde quando a rede deste espectador sumiu (None = está respondendo).
     let mut lost: Option<Instant> = None;
-    let mut quiet = Quiet::start(sockets);
     loop {
         if quiet.active && start.elapsed() >= quiet_max() {
             quiet.end(sockets);
         }
+        quiet.keep_open(sockets, Instant::now());
         let timeout = match rtc.poll_output()? {
             Output::Timeout(at) => at,
             Output::Transmit(packet) => {
@@ -1243,8 +1377,10 @@ fn viewer(
         // mantém o ritmo (o Chrome agrupa em 5 ms) sem girar.
         let mut wait = timeout.saturating_duration_since(Instant::now());
         if quiet.active {
-            // Acorda no fim do silêncio mesmo que nada chegue.
-            wait = wait.min(quiet_max().saturating_sub(start.elapsed()));
+            // Acorda no fim do silêncio mesmo que nada chegue, e a tempo de repetir a abertura.
+            wait = wait
+                .min(quiet_max().saturating_sub(start.elapsed()))
+                .min(QUIET_EVERY);
         }
         let message = if wait.is_zero() {
             None
@@ -1368,7 +1504,9 @@ mod tests {
 
     #[test]
     fn quiet_start_lets_only_the_first_packets_out_until_the_viewer_speaks() {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // No endereço da placa, e não em 127.0.0.1: há máquina com filtro de rede que não entrega UDP
+        // entre dois soquetes de loopback (visto na do dono), e a live de verdade usa o da placa.
+        let socket = UdpSocket::bind((local_ip(), 0)).unwrap();
         let local = socket.local_addr().unwrap();
         let before = hops(&socket).unwrap();
         let sockets = [(local, socket)];
@@ -1377,8 +1515,17 @@ mod tests {
             "10.0.0.3:5000".parse().unwrap(),
         );
 
-        let mut quiet = Quiet::start(&sockets);
-        assert_eq!(hops(&sockets[0].1), Some(QUIET_HOPS));
+        // Quem assiste, de mentira, na mesma máquina: tem de receber o pacote de abertura.
+        let viewer = UdpSocket::bind((local_ip(), 0)).unwrap();
+        viewer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let remotes = vec![viewer.local_addr().unwrap(), "[::1]:9".parse().unwrap()];
+        let mut quiet = Quiet::start(&sockets, remotes, 2);
+        assert_eq!(hops(&sockets[0].1), Some(2));
+        let mut buf = [0u8; 8];
+        let (n, from) = viewer.recv_from(&mut buf).unwrap();
+        assert_eq!((n, from), (1, sockets[0].0));
         let now = Instant::now();
         assert!(quiet.allows(0, near, now));
         assert!(!quiet.allows(0, near, now + QUIET_EVERY / 2));
@@ -1395,6 +1542,40 @@ mod tests {
         // Terminar de novo não muda nada.
         quiet.end(&sockets);
         assert_eq!(hops(&sockets[0].1), Some(before));
+    }
+
+    #[test]
+    fn counts_the_home_routers_at_the_start_of_the_route() {
+        // Dois roteadores em série (o da pessoa e o da operadora), depois um salto que não responde.
+        let two = "\r\nRastreando a rota para 1.1.1.1 com no máximo 5 saltos\r\n\r\n  1    <1 ms    <1 ms    <1 ms  192.168.0.1 \r\n  2    <1 ms    <1 ms    <1 ms  192.168.15.1 \r\n  3     *        *        *     Esgotado o tempo limite do pedido.\r\n  4     1 ms     2 ms     2 ms  200.1.2.3 \r\n";
+        assert_eq!(count_home_routers(two), Some(2));
+        // Um roteador só, depois a operadora.
+        let one = "Tracing route to 1.1.1.1 over a maximum of 5 hops\n\n  1     1 ms     1 ms     1 ms  192.168.1.1\n  2     3 ms     3 ms     3 ms  187.10.20.30\n";
+        assert_eq!(count_home_routers(one), Some(1));
+        // CGNAT da operadora também é um NAT a atravessar.
+        let cgnat = "  1     1 ms     1 ms     1 ms  10.0.0.1\n  2     3 ms     3 ms     3 ms  100.64.0.1\n  3     5 ms     5 ms     5 ms  8.8.8.8\n";
+        assert_eq!(count_home_routers(cgnat), Some(2));
+        // Sem resposta do primeiro salto, ou saída que não é do tracert: não chuta.
+        assert_eq!(
+            count_home_routers("  1     *        *        *     Request timed out.\n"),
+            None
+        );
+        assert_eq!(count_home_routers("comando não encontrado"), None);
+    }
+
+    #[test]
+    fn reads_the_viewer_addresses_from_the_offer() {
+        let sdp = "v=0\r\na=candidate:1 1 udp 2122260223 192.168.0.5 50000 typ host\r\n\
+                   a=candidate:2 1 UDP 1686052607 200.1.2.3 50000 typ srflx raddr 192.168.0.5 rport 50000\r\n\
+                   a=candidate:3 1 tcp 1518280447 192.168.0.5 9 typ host tcptype active\r\n\
+                   a=candidate:4 1 udp 2122260223 abc123.local 50001 typ host\r\n\
+                   a=candidate:5 1 udp 2122260223 fd00::5 50002 typ host\r\n\
+                   a=candidate:1 1 udp 2122260223 192.168.0.5 50000 typ host\r\n";
+        let expected: Vec<SocketAddr> = ["192.168.0.5:50000", "200.1.2.3:50000", "[fd00::5]:50002"]
+            .iter()
+            .map(|text| text.parse().unwrap())
+            .collect();
+        assert_eq!(remote_addresses(sdp), expected);
     }
 
     #[test]
