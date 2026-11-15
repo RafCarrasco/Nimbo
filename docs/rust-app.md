@@ -388,6 +388,15 @@ houve falha de conexão para exercitar); som audível; o clique no seletor; moni
 duas lives; janela visível na tela (os testes abrem fora dela); queda da conexão com o banco durante a live
 (só no `selftest` do miolo).
 
+Compatibilidade com o site e com o app atual, conferida em 15/11/2026 no emulador, nos dois sentidos:
+
+| Quem transmite | Quem assiste | Resultado |
+| --- | --- | --- |
+| App nativo (`--broadcast`, janela de teste) | Site no navegador (a versão publicada naquele dia) | Conectou em 0,24 s; 1920x1032 a 37,5 quadros por segundo (o teto antigo do motor); o diagnóstico do site mostrou o transmissor como "0.1.0 (nativo)" |
+| App atual (`desktop/rust-app`, compilado da branch da 0.5.6, escolhendo a janela pelo seletor) | App nativo | 60 quadros por segundo recebidos, decodificados e desenhados; 1920x1032; nenhum quadro descartado nem pacote faltando; som decodificado inteiro (volume 0); 1,6 ms para decodificar cada quadro |
+
+Tudo na mesma máquina. Duas máquinas, internet e perda de rede continuam sem teste.
+
 Como rodar (emuladores; `--production` fala com o Firebase de verdade e ainda está em validação):
 
 ```
