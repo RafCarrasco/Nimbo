@@ -7,9 +7,12 @@
 //!                                             envia a tela por WebRTC para navegadores; com
 //!                                             `exclude`/`include`, envia também o som
 //!   nimbo-media hw [s] [largura] [altura] [fps] codifica pela placa direto na GPU e mede
+//!   nimbo-media watch <http://host:porta> [opções]
+//!                                             assiste ao `serve` com o player em Rust (watch.rs)
 
 mod hwbench;
 mod serve;
+mod watch;
 
 use std::time::{Duration, Instant};
 
@@ -124,6 +127,9 @@ fn main() -> Result<(), AnyError> {
     if mode == "hw" {
         return hwbench::run(&args);
     }
+    if mode == "watch" {
+        return watch::run(&args);
+    }
     if mode == "serve" {
         let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3070);
         let pid = args.get(3).and_then(|s| s.parse().ok());
@@ -143,9 +149,10 @@ fn main() -> Result<(), AnyError> {
                 .unwrap_or_else(|| "nimbo-media.mp4".into()),
         ),
         other => {
-            return Err(
-                format!("modo desconhecido: {other} (use capture, encode ou serve)").into(),
-            );
+            return Err(format!(
+                "modo desconhecido: {other} (use capture, encode, serve, hw ou watch)"
+            )
+            .into());
         }
     };
     let monitor = Monitor::primary()?;

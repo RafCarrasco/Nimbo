@@ -817,7 +817,7 @@ fn ticker(shared: std::sync::Weak<Shared>) {
 }
 
 /// Endereço da máquina na rede local, pela rota padrão.
-fn local_ip() -> IpAddr {
+pub(crate) fn local_ip() -> IpAddr {
     UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.connect("8.8.8.8:80").and_then(|()| s.local_addr()))
         .map_or(IpAddr::from([127, 0, 0, 1]), |a| a.ip())
@@ -825,7 +825,7 @@ fn local_ip() -> IpAddr {
 
 /// Pergunta a um servidor STUN com que endereço público este soquete aparece na internet.
 /// É o que permite a conexão direta com quem está fora da rede local.
-fn public_address(socket: &UdpSocket) -> Option<SocketAddr> {
+pub(crate) fn public_address(socket: &UdpSocket) -> Option<SocketAddr> {
     const MAGIC: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
     // Pedido de "binding": tipo 0x0001, tamanho 0, cookie mágico e 12 bytes de identificação.
     let mut request = [0u8; 20];
@@ -908,6 +908,12 @@ fn same_stream(sdp: &str) -> String {
     out
 }
 
+/// Instala a criptografia do processo, que o WebRTC exige. Vale uma vez, para o motor e para o player.
+pub(crate) fn install_crypto() {
+    static CRYPTO: Once = Once::new();
+    CRYPTO.call_once(|| str0m::crypto::from_feature_flags().install_process_default());
+}
+
 pub struct Engine {
     shared: Arc<Shared>,
     control: Mutex<Option<CaptureControl<Capture, AnyError>>>,
@@ -922,8 +928,7 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Self {
-        static CRYPTO: Once = Once::new();
-        CRYPTO.call_once(|| str0m::crypto::from_feature_flags().install_process_default());
+        install_crypto();
         let quality = Quality::default();
         let shared = Arc::new(Shared {
             subscribers: Mutex::default(),
@@ -1272,7 +1277,7 @@ fn choose_addresses(mut found: Vec<IpAddr>, default: IpAddr) -> Vec<IpAddr> {
 }
 
 /// Abre um soquete em cada endereço local. Um endereço que não aceita (placa caindo) é pulado.
-fn bind_all() -> Result<Vec<(SocketAddr, UdpSocket)>, AnyError> {
+pub(crate) fn bind_all() -> Result<Vec<(SocketAddr, UdpSocket)>, AnyError> {
     let mut sockets = Vec::new();
     for ip in local_addresses() {
         if let Ok(socket) = UdpSocket::bind(SocketAddr::new(ip, 0))
