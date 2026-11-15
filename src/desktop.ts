@@ -41,6 +41,8 @@ type DesktopBridge = {
   onGameEnded?(id: string, onEnded: () => void): () => void;
   // Só no app em Rust: o motor nativo captura, codifica uma vez e envia para todos (live/native.ts).
   engine?: 'rust';
+  // Versão do app em Rust (o user agent dele não informa).
+  appVersion?: string;
   media?: {
     // source nulo = tela principal. Chamar de novo troca a fonte sem derrubar quem assiste.
     start(

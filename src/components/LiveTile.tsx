@@ -65,7 +65,7 @@ export function LiveTile({
     const debug = (window as unknown as { nimboDebug?: () => Promise<unknown> }).nimboDebug;
     const report = {
       quando: new Date().toISOString(),
-      app: APP_VERSION || 'navegador',
+      app: APP_VERSION ? APP_VERSION + (desktop?.engine === 'rust' ? ' (Rust)' : '') : 'navegador',
       live: name,
       estado: state,
       quadros: hasFrames,

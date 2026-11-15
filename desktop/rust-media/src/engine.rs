@@ -253,6 +253,33 @@ impl Coder {
     }
 }
 
+/// Copia o quadro para a memória em metade da resolução (caminho por software).
+fn shrink(
+    frame: &mut Frame,
+    small: &mut Vec<u8>,
+    dims: &mut (usize, usize),
+) -> Result<(), AnyError> {
+    let mut buffer = frame.buffer()?;
+    let (width, height, pitch) = (
+        buffer.width() as usize,
+        buffer.height() as usize,
+        buffer.row_pitch() as usize,
+    );
+    let raw = buffer.as_raw_buffer();
+    // Metade da resolução, com lados pares (exigência do H.264).
+    let (w, h) = ((width / 2) & !1, (height / 2) & !1);
+    small.resize(w * h * 4, 0);
+    for y in 0..h {
+        let row = &raw[y * 2 * pitch..];
+        let line = &mut small[y * w * 4..(y + 1) * w * 4];
+        for x in 0..w {
+            line[x * 4..x * 4 + 4].copy_from_slice(&row[x * 8..x * 8 + 4]);
+        }
+    }
+    *dims = (w, h);
+    Ok(())
+}
+
 fn software(bitrate: u32) -> Result<Codec264, AnyError> {
     let config = EncoderConfig::new()
         .bitrate(BitRate::from_bps(bitrate.min(SOFTWARE_BITRATE)))
@@ -293,6 +320,25 @@ impl Shared {
             None if coder.codec.is_none() => return Ok(()),
             None => {}
         }
+        // Ninguém assistindo ainda: não codifica, só guarda o quadro. A captura só entrega quadro
+        // quando a tela muda; sem isto, quem entrasse com a tela parada não teria o que ver.
+        if self.viewers.load(Ordering::Relaxed) == 0 {
+            if let (Some(frame), Some(codec)) = (frame.as_mut(), coder.codec.as_mut()) {
+                match codec {
+                    Codec264::Hardware(encoder) => encoder.copy(frame.as_raw_texture()),
+                    // Trazer o quadro da GPU para a memória custa caro: sem plateia, um por segundo basta.
+                    Codec264::Software {
+                        last, small, dims, ..
+                    } => {
+                        if last.elapsed() >= Duration::from_secs(1) {
+                            *last = Instant::now();
+                            shrink(frame, small, dims)?;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
         self.adapt(coder);
         let paused = self.paused.load(Ordering::Relaxed);
         let mut keyframe = self.keyframe.swap(false, Ordering::Relaxed);
@@ -326,24 +372,7 @@ impl Shared {
                     false
                 } else {
                     if let (true, Some(frame)) = (fresh, frame.as_mut()) {
-                        let mut buffer = frame.buffer()?;
-                        let (width, height, pitch) = (
-                            buffer.width() as usize,
-                            buffer.height() as usize,
-                            buffer.row_pitch() as usize,
-                        );
-                        let raw = buffer.as_raw_buffer();
-                        // Metade da resolução, com lados pares (exigência do H.264).
-                        let (w, h) = ((width / 2) & !1, (height / 2) & !1);
-                        small.resize(w * h * 4, 0);
-                        for y in 0..h {
-                            let row = &raw[y * 2 * pitch..];
-                            let line = &mut small[y * w * 4..(y + 1) * w * 4];
-                            for x in 0..w {
-                                line[x * 4..x * 4 + 4].copy_from_slice(&row[x * 8..x * 8 + 4]);
-                            }
-                        }
-                        *dims = (w, h);
+                        shrink(frame, small, dims)?;
                     }
                     if dims.0 == 0 || dims.1 == 0 {
                         false
@@ -504,12 +533,9 @@ impl GraphicsCaptureApiHandler for Capture {
         frame: &mut Frame,
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        // Sem ninguém assistindo não codifica nada. Janela encolhida a quase nada também não: nenhum
-        // codificador aceita, e devolver erro aqui encerraria a captura de vez.
-        if self.shared.viewers.load(Ordering::Relaxed) == 0
-            || frame.width() < 16
-            || frame.height() < 16
-        {
+        // Janela encolhida a quase nada: nenhum codificador aceita, e devolver erro aqui encerraria a
+        // captura de vez.
+        if frame.width() < 16 || frame.height() < 16 {
             return Ok(());
         }
         self.shared.feed(Some(frame));

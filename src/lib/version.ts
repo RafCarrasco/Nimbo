@@ -1,9 +1,12 @@
 import { version } from '../../package.json';
+import { desktop } from '../desktop';
 import { useEmulators } from '../firebase';
 
 export const SITE_VERSION = version;
-// O Electron põe o nome e a versão do app no user agent ("Nimbo/0.3.1"); no navegador fica vazio.
-export const APP_VERSION = /\bnimbo\/(\d+\.\d+\.\d+)/i.exec(navigator.userAgent)?.[1] || '';
+// O Electron põe o nome e a versão do app no user agent ("Nimbo/0.3.1"); o app em Rust informa pela
+// ponte, porque o navegador embutido dele não leva isso. No navegador fica vazio.
+export const APP_VERSION =
+  /\bnimbo\/(\d+\.\d+\.\d+)/i.exec(navigator.userAgent)?.[1] || desktop?.appVersion || '';
 
 const bundleOf = (html: string) => /\/assets\/index-[\w-]+\.js/.exec(html)?.[0] || '';
 
