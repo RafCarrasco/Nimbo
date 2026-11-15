@@ -975,7 +975,7 @@ fn listen(reader: &UdpSocket, local: SocketAddr, sender: &Sender<Msg>) {
                 // leitura também não é motivo para ficar surdo. Depois acorda a conexão, para ela
                 // notar se acabou.
                 if !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 if sender.send(Msg::Tick).is_err() {
                     return;
@@ -1042,6 +1042,115 @@ fn bind_all() -> Result<Vec<(SocketAddr, UdpSocket)>, AnyError> {
     Ok(sockets)
 }
 
+/// Quanto dura, no máximo, o silêncio inicial de um espectador.
+const QUIET_MAX: Duration = Duration::from_millis(1500);
+
+/// O prazo do silêncio. `NIMBO_QUIET_MS` troca o valor nos testes de rede (ver docs/rust-app.md).
+fn quiet_max() -> Duration {
+    static MAX: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("NIMBO_QUIET_MS")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .map_or(QUIET_MAX, Duration::from_millis)
+    })
+}
+/// Saltos de vida dos pacotes durante o silêncio: passam pelos roteadores de casa (medido com dois
+/// em série: com 2 saltos a passagem não abre, com 3 e com 4 abre) e morrem na rede do provedor.
+const QUIET_HOPS: u32 = 4;
+/// Intervalo entre pacotes para o mesmo destino durante o silêncio: mantém a passagem aberta sem
+/// encher a rede de pacotes que vão morrer no caminho (cada um pode gerar um aviso de erro de volta).
+const QUIET_EVERY: Duration = Duration::from_millis(300);
+
+/// Silêncio inicial de cada espectador.
+///
+/// Há roteador que, ao receber de fora um pacote que ninguém de dentro pediu, barra aquela conversa
+/// de vez, mesmo depois de o lado de dentro responder. Medido em 15/11/2026 na rede do dono com um
+/// espectador remoto de teste: com o outro lado mandando primeiro, a conexão falhou no app novo e no
+/// antigo; com o outro lado calado até a máquina de dentro mandar, conectou nos dois. O motor respondia
+/// à oferta e já saía testando os caminhos, então os pacotes dele sempre chegavam ao roteador de quem
+/// assiste antes do primeiro pacote de quem assiste. No app antigo a ordem era a contrária.
+///
+/// Por isso, até o espectador mandar o primeiro pacote (ou `QUIET_MAX`), o que sai leva poucos saltos
+/// de vida: atravessa o roteador de quem transmite, abrindo a passagem de volta, e morre antes de
+/// chegar ao roteador de quem assiste. Na rede local não há roteador no caminho: o pacote chega, a
+/// resposta vem e o silêncio acaba na hora.
+struct Quiet {
+    active: bool,
+    /// Saltos normais de cada soquete, para devolver no fim. `None`: não deu para limitar os saltos
+    /// desse soquete, então ele fica calado durante o silêncio.
+    normal: Vec<Option<u32>>,
+    /// Último pacote de cada soquete para cada destino.
+    sent: HashMap<(usize, SocketAddr), Instant>,
+}
+
+impl Quiet {
+    fn start(sockets: &[(SocketAddr, UdpSocket)]) -> Self {
+        let normal = sockets
+            .iter()
+            .map(|(_, socket)| {
+                let before = hops(socket)?;
+                set_hops(socket, QUIET_HOPS).then_some(before)
+            })
+            .collect();
+        Self {
+            active: true,
+            normal,
+            sent: HashMap::new(),
+        }
+    }
+
+    /// Este pacote pode sair agora? Durante o silêncio, só de tempos em tempos para cada destino, e
+    /// só pelos soquetes com os saltos limitados.
+    fn allows(&mut self, socket: usize, destination: SocketAddr, now: Instant) -> bool {
+        if !self.active {
+            return true;
+        }
+        if self.normal.get(socket).copied().flatten().is_none() {
+            return false;
+        }
+        match self.sent.get(&(socket, destination)) {
+            Some(last) if now.saturating_duration_since(*last) < QUIET_EVERY => false,
+            _ => {
+                self.sent.insert((socket, destination), now);
+                true
+            }
+        }
+    }
+
+    /// Fim do silêncio: o espectador mandou o primeiro pacote, ou o prazo acabou.
+    fn end(&mut self, sockets: &[(SocketAddr, UdpSocket)]) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        self.sent = HashMap::new();
+        for ((_, socket), normal) in sockets.iter().zip(&self.normal) {
+            if let Some(normal) = normal {
+                set_hops(socket, *normal);
+            }
+        }
+    }
+}
+
+/// Saltos de vida (TTL no IPv4, "hop limit" no IPv6) dos pacotes que saem deste soquete.
+fn hops(socket: &UdpSocket) -> Option<u32> {
+    let handle = socket2::SockRef::from(socket);
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(_) => handle.ttl_v4().ok(),
+        SocketAddr::V6(_) => handle.unicast_hops_v6().ok(),
+    }
+}
+
+fn set_hops(socket: &UdpSocket, hops: u32) -> bool {
+    let handle = socket2::SockRef::from(socket);
+    match socket.local_addr() {
+        Ok(SocketAddr::V4(_)) => handle.set_ttl_v4(hops).is_ok(),
+        Ok(SocketAddr::V6(_)) => handle.set_unicast_hops_v6(hops).is_ok(),
+        Err(_) => false,
+    }
+}
+
 fn viewer(
     mut rtc: Rtc,
     sockets: &[(SocketAddr, UdpSocket)],
@@ -1055,17 +1164,23 @@ fn viewer(
     let mut connected = false;
     // Desde quando a rede deste espectador sumiu (None = está respondendo).
     let mut lost: Option<Instant> = None;
+    let mut quiet = Quiet::start(sockets);
     loop {
+        if quiet.active && start.elapsed() >= quiet_max() {
+            quiet.end(sockets);
+        }
         let timeout = match rtc.poll_output()? {
             Output::Timeout(at) => at,
             Output::Transmit(packet) => {
                 // Falha de envio (rede do computador piscou) não encerra: o WebRTC reenvia o que importa.
                 // Sai pelo mesmo endereço local que o WebRTC escolheu para este caminho.
-                let socket = sockets
+                let index = sockets
                     .iter()
-                    .find(|(local, _)| *local == packet.source)
-                    .or(sockets.first());
-                if let Some((_, socket)) = socket {
+                    .position(|(local, _)| *local == packet.source)
+                    .unwrap_or(0);
+                if let Some((_, socket)) = sockets.get(index)
+                    && quiet.allows(index, packet.destination, Instant::now())
+                {
                     let _ = socket.send_to(&packet.contents, packet.destination);
                 }
                 continue;
@@ -1126,7 +1241,11 @@ fn viewer(
         // banda estimada despencar (testado com janelas de 4 ms). Mas espera menor que 1 ms não dorme de
         // verdade no Windows: vira um laço girando, com rajadas de 30% de um núcleo. O piso de 1 ms
         // mantém o ritmo (o Chrome agrupa em 5 ms) sem girar.
-        let wait = timeout.saturating_duration_since(Instant::now());
+        let mut wait = timeout.saturating_duration_since(Instant::now());
+        if quiet.active {
+            // Acorda no fim do silêncio mesmo que nada chegue.
+            wait = wait.min(quiet_max().saturating_sub(start.elapsed()));
+        }
         let message = if wait.is_zero() {
             None
         } else {
@@ -1183,6 +1302,8 @@ fn viewer(
                 }
             }
             Some(Msg::Packet(data, source, local)) => {
+                // O espectador já mandou: o roteador dele espera a resposta, pode falar normalmente.
+                quiet.end(sockets);
                 if let Some(entry) = shared.estimates.lock().unwrap().get_mut(&id) {
                     entry.1 = Instant::now();
                 }
@@ -1243,6 +1364,37 @@ mod tests {
         // Sem lista de placas, sobra a rota padrão; e só de volta local não se oferece nada.
         assert_eq!(choose_addresses(Vec::new(), default), vec![default]);
         assert!(choose_addresses(Vec::new(), ip("127.0.0.1")).is_empty());
+    }
+
+    #[test]
+    fn quiet_start_lets_only_the_first_packets_out_until_the_viewer_speaks() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = socket.local_addr().unwrap();
+        let before = hops(&socket).unwrap();
+        let sockets = [(local, socket)];
+        let (near, far) = (
+            "10.0.0.2:5000".parse().unwrap(),
+            "10.0.0.3:5000".parse().unwrap(),
+        );
+
+        let mut quiet = Quiet::start(&sockets);
+        assert_eq!(hops(&sockets[0].1), Some(QUIET_HOPS));
+        let now = Instant::now();
+        assert!(quiet.allows(0, near, now));
+        assert!(!quiet.allows(0, near, now + QUIET_EVERY / 2));
+        // Passado o intervalo, mais um para manter a passagem aberta.
+        assert!(quiet.allows(0, near, now + QUIET_EVERY));
+        // Cada destino tem a sua vez; soquete desconhecido fica calado.
+        assert!(quiet.allows(0, far, now));
+        assert!(!quiet.allows(7, far, now));
+
+        quiet.end(&sockets);
+        assert_eq!(hops(&sockets[0].1), Some(before));
+        assert!(quiet.allows(0, near, now));
+        assert!(quiet.allows(7, far, now));
+        // Terminar de novo não muda nada.
+        quiet.end(&sockets);
+        assert_eq!(hops(&sockets[0].1), Some(before));
     }
 
     #[test]

@@ -2527,7 +2527,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nimbo-app"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -2562,6 +2562,7 @@ dependencies = [
  "openh264",
  "opus",
  "serde_json",
+ "socket2",
  "str0m",
  "windows",
  "windows-capture",
