@@ -14,7 +14,7 @@ import {
   X,
 } from 'lucide-react';
 import { desktop } from '../desktop';
-import { APP_VERSION } from '../lib/version';
+import { APP_LABEL } from '../lib/version';
 
 export type TileState = 'playing' | 'connecting' | 'failed';
 
@@ -65,7 +65,7 @@ export function LiveTile({
     const debug = (window as unknown as { nimboDebug?: () => Promise<unknown> }).nimboDebug;
     const report = {
       quando: new Date().toISOString(),
-      app: APP_VERSION ? APP_VERSION + (desktop?.engine === 'rust' ? ' (Rust)' : '') : 'navegador',
+      app: APP_LABEL,
       live: name,
       estado: state,
       quadros: hasFrames,

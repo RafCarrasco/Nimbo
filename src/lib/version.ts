@@ -8,6 +8,9 @@ export const SITE_VERSION = version;
 export const APP_VERSION =
   /\bnimbo\/(\d+\.\d+\.\d+)/i.exec(navigator.userAgent)?.[1] || desktop?.appVersion || '';
 
+// Como este cliente se apresenta aos outros no canal e no diagnóstico: "0.5.1 (Rust)", "0.4.1" ou "navegador".
+export const APP_LABEL = APP_VERSION ? APP_VERSION + (desktop?.engine === 'rust' ? ' (Rust)' : '') : 'navegador';
+
 const bundleOf = (html: string) => /\/assets\/index-[\w-]+\.js/.exec(html)?.[0] || '';
 
 // Compara o bundle carregado com o publicado agora. Só faz sentido no site publicado.

@@ -151,6 +151,21 @@ oferecia a rota padrão em IPv4. Duas correções:
 
 Quem está atrás de CGNAT dos dois lados, sem IPv6 e sem rede virtual em comum, continua precisando de TURN.
 
+Medido em 14/11/2026 com um espectador remoto de verdade (Chrome num servidor do GitHub Actions, sinalização
+cifrada pela branch `test/remote-viewer`):
+
+- **Motor pela internet funciona**: espectador com NAT amigável conectou em 0,4 s pelo endereço público dos dois
+  lados e recebeu vídeo (155 quadros em 5 s).
+- **Rede difícil não conecta nem no app antigo**: com o servidor simulando NAT simétrico (porta pública que muda a
+  cada destino), a conexão falhou tanto no WebView2 quanto no Electron que tem regra de entrada no Firewall do
+  Windows. A regra de firewall do app antigo não era o que fazia a diferença; para esses casos só o TURN resolve.
+- O app antigo ganhava uma regra de entrada no firewall (o Windows perguntava na primeira vez); o novo não tem.
+  Não mudou o resultado nos testes acima.
+
+O "Copiar diagnóstico" de uma live nativa agora traz, por tentativa: os caminhos que cada lado ofereceu (só o tipo
+de endereço), se a resposta do app de quem transmite chegou e em quanto tempo, o tipo de NAT de quem assiste, os
+testes de caminho e a versão do app de quem transmite (gravada na presença do canal).
+
 ### Defeitos conhecidos e otimizações pendentes
 
 - **CPU do envio subiu depois das correções**: com 5 espectadores e som, 6% a 14% de um núcleo (antes, sem som e
