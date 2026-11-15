@@ -1793,3 +1793,27 @@ img.avatar.photo {
   padding-top: 12px;
   border-top: 1px solid var(--border);
 }
+
+/* ---------- Cargos (grupos) no painel de administração ---------- */
+.admin-note {
+  margin: 0 4px 4px;
+  line-height: 1.5;
+}
+.admin-note strong {
+  color: var(--text);
+}
+.admin-row-text .sees {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.role-card {
+  border-radius: 10px;
+  background: var(--surface);
+}
+.role-people {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 12px 12px 44px;
+}
