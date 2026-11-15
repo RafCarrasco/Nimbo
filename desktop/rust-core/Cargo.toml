@@ -1,0 +1,18 @@
+[package]
+name = "nimbo-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Nimbo core in Rust: Firebase login and realtime database client, without any interface. Experimental."
+
+[dependencies]
+# Conexão em tempo real com o banco (protocolo do Realtime Database por WebSocket).
+# native-tls: usa os certificados do Windows, como o navegador e a atualização do app.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "native-tls"] }
+# Login (API REST do Firebase Auth).
+ureq = { version = "3", default-features = false, features = ["native-tls", "json"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
