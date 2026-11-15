@@ -40,6 +40,6 @@ jobs:
           fi
           if [ "$mode" = "bw" ]; then
             # O que chega por UDP fica limitado a 3 Mbps.
-            sudo iptables -A INPUT -p udp -m hashlimit --hashlimit-name banda --hashlimit-mode dstip --hashlimit-above 375kb/s --hashlimit-burst 60kb -j DROP
+            sudo iptables -A INPUT -p udp -m hashlimit --hashlimit-name banda --hashlimit-mode dstip --hashlimit-above 375kb/s --hashlimit-burst 400kb -j DROP
           fi
           if [ "$mode" = "udp" ]; then node udp-peer.mjs; elif [ "$mode" = "rev" ] || [ "$mode" = "revq" ]; then node peer-rev.mjs; elif [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
