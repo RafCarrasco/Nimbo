@@ -103,8 +103,10 @@ Installing, please wait..."), em inglês e cinza.
 O dono gostou da ideia depois de ver que o Discord anunciou em 04/11/2026 a troca do Electron por um app em
 Rust (miolo compartilhado, interface desenhada com GPUI, sem Tauri), e que o site deles continua existindo.
 Hoje no Nimbo só a transmissão é Rust; a interface e o player de quem assiste são o site dentro do WebView2.
-Decisão: só anotar por enquanto, e antes de começar validar bem a 0.5.5 (jogo de verdade: som, tela cheia,
-anticheat; e alguns dias de uso).
+Decisão de 15/11/2026 (à noite): o dono liberou começar, numa branch à parte (`feat/full-rust`) e validando
+bem antes de trocar. O estado de cada etapa fica em `docs/rust-app.md`, seção "App full Rust". A ordem mudou
+em relação à lista abaixo: o miolo e a janela vieram primeiro (são a base para testar o resto), com o player
+sendo feito em paralelo. A 0.5.5 continua precisando de uso real (jogo de verdade: som, tela cheia, anticheat).
 
 Etapas, cada uma já utilizável e sem desligar o site:
 
