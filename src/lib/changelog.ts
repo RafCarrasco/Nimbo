@@ -4,6 +4,13 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.4',
+    date: '15/11/2026',
+    items: [
+      'Lives entre casas: o app de quem transmite abre o caminho de volta na hora em que alguém pede a live, e com o alcance mínimo para a rede de cada um. Ajuda quem assiste atrás de modem que barra conexão iniciada de fora.',
+    ],
+  },
+  {
     version: '0.5.3',
     date: '15/11/2026',
     items: [
