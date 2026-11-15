@@ -1,5 +1,6 @@
-# Teste de rede descartável (ver .github/remote-viewer/viewer.mjs). Só existe nesta branch de teste
-# e só roda quando run.txt muda.
+# Teste de rede descartável (ver .github/remote-viewer/*.mjs). Só existe nesta branch de teste
+# e só roda quando run.txt muda. run.txt: "<id>" (espectador do motor) ou "sym <id>" / "cone <id>"
+# (duas conexões de navegador, com este servidor atrás de um NAT simétrico ou não).
 name: Remote viewer test
 
 on:
@@ -16,7 +17,7 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
-      - name: Viewer
+      - name: Peer
         working-directory: .github/remote-viewer
         env:
           REMOTE_TEST_KEY: ${{ secrets.REMOTE_TEST_KEY }}
@@ -24,4 +25,9 @@ jobs:
         run: |
           npm init -y > /dev/null
           npm install --no-save --no-audit --no-fund puppeteer-core@23 > /dev/null
-          node viewer.mjs
+          mode=$(cut -d' ' -f1 run.txt)
+          if [ "$mode" = "sym" ]; then
+            # Porta de saída sorteada a cada destino: o que um NAT simétrico faz.
+            sudo iptables -t nat -A POSTROUTING -p udp -j MASQUERADE --random-fully
+          fi
+          if [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
