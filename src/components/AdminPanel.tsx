@@ -71,6 +71,8 @@ export function AdminPanel({
   const [busy, setBusy] = useState('');
   // Cargo com a lista de pessoas aberta, na aba Cargos.
   const [openRole, setOpenRole] = useState('');
+  // Grupos marcados em cada solicitação, para aprovar a pessoa já dentro deles.
+  const [picked, setPicked] = useState<Record<string, Record<string, true>>>({});
   const toast = useToast();
   const dialogs = useDialogs();
 
@@ -93,9 +95,8 @@ export function AdminPanel({
   };
 
   const pending = Object.entries(requests).filter(([id]) => !approved[id]);
-  const memberIds = [
-    ...new Set([...Object.keys(data.profiles), ...Object.keys(approved).filter((id) => approved[id])]),
-  ];
+  // Só quem está aprovado: quem teve o acesso revogado sai da lista (o nome e a foto ficam guardados).
+  const memberIds = Object.keys(approved).filter((id) => approved[id]);
   const tabs: Array<[Tab, string, number?]> = [
     ...(owner ? ([['requests', 'Solicitações', pending.length]] as Array<[Tab, string, number]>) : []),
     ...(owner ? ([['members', 'Membros']] as Array<[Tab, string]>) : []),
@@ -153,7 +154,15 @@ export function AdminPanel({
       {tab === 'requests' && (
         <div className="admin-list">
           {pending.length === 0 && <p className="empty muted">Nenhuma solicitação pendente.</p>}
-          {pending.map(([id, request]) => (
+          {pending.length > 0 && roleEntries.length > 0 && (
+            <p className="muted admin-note">
+              Marque os grupos antes de aprovar: a pessoa já entra vendo os canais deles. Sem nenhum marcado,
+              ela vê só os canais abertos a todos.
+            </p>
+          )}
+          {pending.map(([id, request]) => {
+            const chosen = roleEntries.filter(([roleId]) => picked[id]?.[roleId]);
+            return (
             <div className="admin-row" key={id}>
               <span className="avatar">{request.email.slice(0, 1).toUpperCase()}</span>
               <div className="admin-row-text">
@@ -161,6 +170,34 @@ export function AdminPanel({
                 <small className="muted">
                   Pediu acesso em {new Date(request.createdAt).toLocaleString('pt-BR')}
                 </small>
+                {roleEntries.length > 0 && (
+                  <div className="role-chips">
+                    {roleEntries.map(([roleId, def]) => {
+                      const on = Boolean(picked[id]?.[roleId]);
+                      return (
+                        <button
+                          key={roleId}
+                          className={'role-chip' + (on ? ' on' : '')}
+                          style={{ '--role': def.color } as React.CSSProperties}
+                          disabled={busy !== ''}
+                          aria-pressed={on}
+                          title={on ? 'Não entrar neste grupo' : 'Entrar já neste grupo'}
+                          onClick={() =>
+                            setPicked((old) => {
+                              const mine = { ...old[id] };
+                              if (on) delete mine[roleId];
+                              else mine[roleId] = true;
+                              return { ...old, [id]: mine };
+                            })
+                          }
+                        >
+                          <span className="role-dot" />
+                          {def.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
               <button
                 className="button ghost"
@@ -172,13 +209,26 @@ export function AdminPanel({
               <button
                 className="button primary"
                 disabled={busy !== ''}
-                onClick={() => void run('approve:' + id, () => approveMember(id), 'Acesso liberado')}
+                onClick={() =>
+                  void run(
+                    'approve:' + id,
+                    () =>
+                      approveMember(
+                        id,
+                        chosen.map(([roleId]) => roleId),
+                      ),
+                    chosen.length
+                      ? 'Acesso liberado em ' + chosen.map(([, def]) => def.name).join(', ')
+                      : 'Acesso liberado',
+                  )
+                }
               >
                 {busy === 'approve:' + id ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}
                 Aprovar
               </button>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -268,11 +318,16 @@ export function AdminPanel({
                       onClick={async () => {
                         const ok = await dialogs.confirm({
                           title: 'Revogar acesso?',
-                          message: `${name} sai da comunidade imediatamente e precisará de uma nova aprovação.`,
+                          message: `${name} sai da comunidade imediatamente, perde o nível e os cargos e precisará de uma nova aprovação.`,
                           confirmLabel: 'Revogar',
                           danger: true,
                         });
-                        if (ok) await run('revoke:' + id, () => revokeMember(id), 'Acesso revogado');
+                        if (ok)
+                          await run(
+                            'revoke:' + id,
+                            () => revokeMember(id, data.memberRoles[id]),
+                            'Acesso revogado',
+                          );
                       }}
                     >
                       <UserX size={16} />

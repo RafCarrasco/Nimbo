@@ -82,6 +82,13 @@ const rules = {
   rules: {
     rooms: {
       $room: {
+        // Canal apagado deixa a sala sem dono: administradores podem apagar o que sobrou dela, inteira.
+        '.write': and(
+          approvedAdmin,
+          '!newData.exists()',
+          ...SYSTEM_CHANNELS.map((id) => `$room !== '${id}'`),
+          "!root.child('community/channels').child($room).exists()",
+        ),
         members: {
           '.read': canRoom,
           $uid: {

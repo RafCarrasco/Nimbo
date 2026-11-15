@@ -227,6 +227,8 @@ export async function deleteChannel(id: string) {
   await update(ref(db, 'community'), { [`channels/${id}`]: null, [`channelIds/${id}`]: null });
   await remove(ref(db, 'community/channelAccess/' + id)).catch(() => {});
   await remove(ref(db, 'community/channelRoles/' + id)).catch(() => {});
+  // A sala do canal (presença, lives, sinalização) não tem mais dono: sem isso as sessões ficam presas.
+  await remove(ref(db, 'rooms/' + id)).catch(() => {});
 }
 export async function assignRole(uid: string, role: CommunityRole) {
   await set(ref(db, 'community/roles/' + uid), role);
@@ -384,12 +386,28 @@ export const watchRequests = (cb: (v: Record<string, AccessRequest>) => void, on
   onValue(ref(db, 'community/requests'), (s) => cb(s.val() || {}), onError);
 export const watchApprovedMembers = (cb: (v: Record<string, boolean>) => void, onError: (e: Error) => void) =>
   onValue(ref(db, 'community/approved'), (s) => cb(s.val() || {}), onError);
-export async function approveMember(uid: string) {
-  await set(ref(db, 'community/approved/' + uid), true);
+// Aprova já nos grupos escolhidos. Quem entra começa do zero: nível e cargos que tenham sobrado de uma
+// passagem anterior não voltam (o índice roleMembers é acertado pelo repairRoleMembers do proprietário).
+export async function approveMember(uid: string, roleIds: string[] = []) {
+  const changes: Record<string, unknown> = {
+    [`approved/${uid}`]: true,
+    [`roles/${uid}`]: null,
+    [`memberRoles/${uid}`]: roleIds.length ? Object.fromEntries(roleIds.map((id) => [id, true])) : null,
+  };
+  for (const id of roleIds) changes[`roleMembers/${id}/${uid}`] = true;
+  await update(ref(db, 'community'), changes);
   await remove(ref(db, 'community/requests/' + uid)).catch(() => {});
 }
 export const rejectRequest = (uid: string) => remove(ref(db, 'community/requests/' + uid));
-export const revokeMember = (uid: string) => remove(ref(db, 'community/approved/' + uid));
+// Revogar tira tudo o que dava acesso: aprovação, nível, cargos e a permissão de rede. Nome e foto ficam.
+export const revokeMember = (uid: string, roles: Record<string, true> = {}) =>
+  update(ref(db, 'community'), {
+    [`approved/${uid}`]: null,
+    [`roles/${uid}`]: null,
+    [`netAdmins/${uid}`]: null,
+    [`memberRoles/${uid}`]: null,
+    ...Object.fromEntries(Object.keys(roles).map((id) => [`roleMembers/${id}/${uid}`, null])),
+  });
 // Limpa uma sessão abandonada (ex.: navegador fechado antes do onDisconnect ser registrado).
 export async function removeRoomSession(roomId: string, uid: string) {
   await remove(ref(db, `rooms/${roomId}/streams/${uid}`));
