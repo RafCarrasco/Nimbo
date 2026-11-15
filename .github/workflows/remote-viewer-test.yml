@@ -33,4 +33,14 @@ jobs:
             out=$(ip route show default | awk '{print $5; exit}')
             sudo iptables -t nat -A POSTROUTING -o "$out" -p udp ! --dport 53 -j MASQUERADE --random-fully
           fi
+          out=$(ip route show default | awk '{print $5; exit}')
+          if [ "$mode" = "loss" ]; then
+            # 3% do que chega por UDP se perde no caminho.
+            sudo iptables -A INPUT -p udp -m statistic --mode random --probability 0.03 -j DROP
+          fi
+          if [ "$mode" = "bw" ]; then
+            # O que chega por UDP fica limitado a 3 Mbps.
+            sudo tc qdisc add dev "$out" handle ffff: ingress
+            sudo tc filter add dev "$out" parent ffff: protocol ip u32 match ip protocol 17 0xff police rate 3mbit burst 48k drop flowid :1
+          fi
           if [ "$mode" = "udp" ]; then node udp-peer.mjs; elif [ "$mode" = "rev" ] || [ "$mode" = "revq" ]; then node peer-rev.mjs; elif [ "$mode" = "sym" ] || [ "$mode" = "cone" ]; then node peer.mjs; else node viewer.mjs; fi
