@@ -555,6 +555,44 @@ describe('cargos personalizados (grupos)', () => {
       update(ref(owner(), 'community'), { 'roleDefs/trampo': null, 'roleMembers/trampo': null }),
     );
   });
+  test('aprovar já num grupo e revogar tirando nível e cargos é do proprietário', async () => {
+    const approve = {
+      'approved/pending': true,
+      'roles/pending': null,
+      'memberRoles/pending': { trampo: true },
+      'roleMembers/trampo/pending': true,
+    };
+    await assertFails(update(ref(admin(), 'community'), approve));
+    await assertSucceeds(update(ref(owner(), 'community'), approve));
+    await assertSucceeds(get(ref(pending(), 'community/channels/canalB')));
+    await assertFails(get(ref(pending(), 'community/channels/canalA')));
+    const revoke = {
+      'approved/admin': null,
+      'roles/admin': null,
+      'netAdmins/admin': null,
+      'memberRoles/admin': null,
+      'roleMembers/trampo/admin': null,
+    };
+    await assertFails(update(ref(member(), 'community'), revoke));
+    await assertSucceeds(update(ref(owner(), 'community'), revoke));
+    await assertFails(get(ref(admin(), 'rooms/geral/members')));
+    // O proprietário não revoga a si mesmo.
+    await assertFails(update(ref(owner(), 'community'), { 'approved/owner': null, 'roles/owner': null }));
+  });
+  test('sala de canal apagado pode ser limpa; sala de canal que existe, não', async () => {
+    await env.withSecurityRulesDisabled((ctx) =>
+      set(ref(ctx.database(), 'rooms/sumiu'), {
+        members: { member: { joinedAt: 1 } },
+        streams: { member: { screen: { startedAt: 1, streamId: 's9' } } },
+      }),
+    );
+    await assertFails(remove(ref(member(), 'rooms/sumiu')));
+    await assertFails(remove(ref(admin(), 'rooms/geral')));
+    await assertFails(remove(ref(owner(), 'rooms/geral')));
+    await assertFails(remove(ref(owner(), 'rooms/vip')));
+    await assertFails(set(ref(admin(), 'rooms/sumiu/members/admin'), { joinedAt: 1 }));
+    await assertSucceeds(remove(ref(admin(), 'rooms/sumiu')));
+  });
   test('somente o proprietário cria e atribui cargos', async () => {
     const role = { name: 'Novo', color: '#ff0000', createdAt: 1 };
     await assertFails(set(ref(member(), 'community/memberRoles/member/trampo'), true));
