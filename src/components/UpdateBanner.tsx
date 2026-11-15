@@ -69,6 +69,9 @@ export function UpdateBanner({ live }: { live: boolean }) {
   const failed = false;
   const [progress, setProgress] = useState(0);
   const [updating, setUpdating] = useState('');
+  // App em Rust mais velho que o site e sem atualização chegando: o app só procura atualização ao
+  // abrir e de tempos em tempos, então quem está com ele aberto há horas precisa fechar e abrir.
+  const [stale, setStale] = useState(false);
   const [notes, setNotes] = useState(() => {
     if (pendingResult() === 'installed' && PENDING) {
       writeSeen(SITE_VERSION);
@@ -101,12 +104,20 @@ export function UpdateBanner({ live }: { live: boolean }) {
     if (fake === 'notes') setNotes(CHANGELOG.slice(0, 2));
     if (fake === 'outdated') setOutdated('0.2.0');
     if (fake === 'progress') setProgress(45);
+    if (fake === 'stale') setStale(true);
     const offProgress = desktop?.onUpdateProgress?.(setProgress);
     if (!desktop?.watchUpdate) return offProgress;
     void desktop.watchUpdate((info) => setAppVersion(info.version)).then((r) => {
       if (r.ok && r.value) setAppVersion(r.value.version);
     });
     return offProgress;
+  }, []);
+
+  useEffect(() => {
+    if (desktop?.engine !== 'rust' || !APP_VERSION || !newer(SITE_VERSION, APP_VERSION)) return;
+    // Um tempo para a atualização do próprio app chegar: se chegar, o aviso dela basta.
+    const timer = setTimeout(() => setStale(true), 20 * 1000);
+    return () => clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -193,6 +204,23 @@ export function UpdateBanner({ live }: { live: boolean }) {
               </button>
               <button className="button ghost small" onClick={() => setOutdated('')}>
                 Depois
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {stale && !isApp && !(progress > 0 && progress < 100) && (
+        <div className="update-card" role="alert">
+          <img src="/nimbo-icon-128.png" alt="" />
+          <div className="update-text">
+            <strong>Seu Nimbo está desatualizado</strong>
+            <span>
+              Você está na {APP_VERSION || 'versão antiga'} e a {SITE_VERSION} já saiu. Feche o Nimbo e abra de novo
+              para atualizar. Sem isso, quem assiste suas lives pode não conseguir conectar.
+            </span>
+            <div className="update-actions">
+              <button className="button ghost small" onClick={() => setStale(false)}>
+                Entendi
               </button>
             </div>
           </div>

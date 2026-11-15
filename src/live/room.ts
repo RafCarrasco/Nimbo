@@ -78,6 +78,8 @@ export type LiveSnapshot = {
   // Estado de cada live enviada pelo motor do app ("uid:tipo"). Ela tem conexão própria, então não
   // segue failed/connecting, que são da conexão do navegador com a pessoa.
   native?: Record<string, 'playing' | 'connecting' | 'failed'>;
+  // Versão do app de cada pessoa no canal, como ela informou ao entrar ("0.5.2 (Rust)", "navegador").
+  apps?: Record<string, string>;
 };
 
 export type PeerDiagnostics = {
@@ -290,6 +292,7 @@ export class LiveRoom {
       local: Object.fromEntries([...this.locals].map(([kind, live]) => [kind, live.stream])),
       remote: this.allRemote(),
       native: this.nativeIn.states(this.broadcasts, this.uid),
+      apps: this.apps,
       failed: [...this.failed],
       connecting: [...this.peers.entries()]
         .filter(([, p]) => p.pc.connectionState !== 'connected' && p.pc.connectionState !== 'failed')

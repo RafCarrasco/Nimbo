@@ -24,6 +24,7 @@ export function LiveTile({
   own,
   camera,
   state,
+  hint,
   volume,
   muted,
   onVolume,
@@ -40,6 +41,8 @@ export function LiveTile({
   own: boolean;
   camera: boolean;
   state: TileState;
+  // Explicação do que fazer quando a live não conecta por um motivo conhecido.
+  hint?: string;
   volume: number;
   muted: boolean;
   onVolume: (value: number) => void;
@@ -178,6 +181,7 @@ export function LiveTile({
                 : 'O problema é na captura de quem transmite. Se for um jogo em tela cheia, peça para transmitir a tela inteira.'}
             </small>
           )}
+          {hint && !noImage && !compact && <small className="tile-hint">{hint}</small>}
           {!compact && (state === 'failed' || slow) && (
             <div className="tile-actions">
               {!own && onRetry && (

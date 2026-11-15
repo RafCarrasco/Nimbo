@@ -9,6 +9,7 @@
 import { attachGameWatch, desktop, type GameWatch } from '../desktop';
 import { pickNativeSource } from '../components/SourcePicker';
 import { CaptureCancelled } from '../lib/errors';
+import { newer } from '../lib/changelog';
 import type { Broadcasts } from './room';
 import type { AudioMode, StreamKind } from './capture';
 
@@ -21,6 +22,15 @@ export type NativeSignal = {
   native: StreamKind;
   nonce?: string;
 };
+
+// Primeira versão do app cujo motor espera quem assiste mandar o primeiro pacote (docs/rust-app.md).
+// Live nativa de versão anterior não conecta com quem está atrás de certos roteadores.
+export const NATIVE_FIXED = '0.5.2';
+// Versão do app de quem transmite, se ela for anterior à correção ("0.5.1 (Rust)" → "0.5.1").
+export function nativeOutdated(app: string | undefined) {
+  const version = /^(\d+\.\d+\.\d+) \(Rust\)$/.exec(app || '')?.[1];
+  return version && newer(NATIVE_FIXED, version) ? version : '';
+}
 
 // Só existe no app em Rust; no navegador e no app antigo fica indefinido.
 export const nativeMedia = desktop?.media;

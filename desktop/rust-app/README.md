@@ -74,7 +74,7 @@ os arquivos como artefatos; não cria Release.
 ## Atualização automática
 
 O app confere `https://github.com/RafCarrasco/Nimbo/releases/latest/download/latest.json` ao abrir e
-a cada 6 horas, baixa a versão nova em segundo plano e avisa o site, que mostra "Reiniciar agora".
+a cada 30 minutos, baixa a versão nova em segundo plano e avisa o site, que mostra "Reiniciar agora".
 Fechar o app com uma atualização baixada também instala. Falhas vão só para `nimbo-update.log`, na
 pasta de dados.
 
