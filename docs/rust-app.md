@@ -285,3 +285,68 @@ testes de caminho e a versão do app de quem transmite (gravada na presença do 
   avisar deixa de contar depois de 2 s; rede ruim de verdade ainda afeta a todos. Saída planejada: dois níveis.
 - **AdGuard e filtros de rede locais** cortam conexões HTTP locais ao acaso (visto nesta máquina). O app
   não depende de HTTP local para a mídia; o login pelo navegador usa e já trata esse caso.
+
+## App full Rust (em construção desde 15/11/2026, branch `feat/full-rust`)
+
+Em 15/11/2026 o dono liberou fazer o app inteiro em Rust, sem navegador embutido, "em outra branch" e
+"validando bem antes". Enquanto isso o app oficial continua sendo o `desktop/rust-app` (o site dentro do
+WebView2); o nativo só toma o lugar quando fizer tudo o que o atual faz. O site continua existindo para
+navegador, celular e, se for o caso, para a administração.
+
+Peças novas:
+
+- `desktop/rust-core` (`nimbo-core`): miolo sem interface.
+  - `rtdb.rs`: cliente do Realtime Database por WebSocket (protocolo 5, o do SDK da web): login da conexão,
+    escutas, gravações, "ao desconectar", mensagens em pedaços, reconexão que refaz login e escutas.
+  - `auth.rs`: login pela API REST do Firebase (credencial do Google → token; renovação).
+  - `community.rs`: o mesmo que `useCommunity`/`usePeople`/`useRoomsPresence` do site (proprietário lê as
+    listas; os demais, item a item) e as contas de quem vê o quê.
+  - `room.rs`: entrar e sair de um canal (presença, queda e volta, troca de sessão da mesma conta).
+  - Binário `nimbo-core`: `selftest` (confere tudo contra o emulador), `sidebar <conta>` (a barra lateral em
+    texto) e `watch <conta> <caminho>`.
+- `desktop/rust-ui` (`nimbo-native`): a janela, em egui 0.37 + wgpu. Cores e medidas copiadas de
+  `src/style.css`, fonte Segoe UI lida do Windows, ícones lucide (os mesmos do site).
+- `desktop/rust-media`, módulo `viewer`: o player (receber, decodificar, tocar). Em andamento.
+
+| # | Entrega | Estado |
+|---|---|---|
+| N1 | Cliente do banco e login no miolo | **Feito**: `nimbo-core selftest`, 11 passos contra o emulador com as regras de verdade |
+| N2 | Modelo da comunidade (níveis, cargos, quem vê o quê, presença) | **Feito**: conferido com 5 contas (proprietário, administrador, um membro de cada grupo, conta sem aprovação) |
+| N3 | Janela: entrada, espera de aprovação, barra lateral, tela inicial | **Feito**, só com contas de teste do emulador; comparado com o site na mesma conta |
+| N4 | Entrar e sair de canal | **Feito**: aparece para os outros com a versão do app, some ao fechar, e a sessão antiga sai quando a mesma conta entra em outro lugar |
+| N5 | Player: receber, decodificar e tocar a live | Em andamento |
+| N6 | Sinalização das lives no miolo (`native.ts` e o resto de `room.ts`) | Falta |
+| N7 | Assistir dentro do app nativo (palco, várias lives, tela cheia) | Falta |
+| N8 | Transmitir tela pelo motor, com o seletor | Falta |
+| N9 | Login de verdade do Google e sessão guardada entre aberturas | Falta |
+| N10 | Webcam (enviar) e lives vindas de navegador (receber) | Falta |
+| N11 | Apelido, perfil e foto; administração (no app ou só pelo site) | Falta |
+| N12 | Atualização automática, instalador, instância única | Falta |
+| N13 | Troca: o nativo vira o Nimbo | Falta (só com o OK do dono) |
+
+Medido em 15/11/2026 (i5-14600KF + RTX 5070), app nativo parado na tela inicial, compilado em modo otimizado:
+
+| Medida | Nativo | App atual (medido no mesmo dia) |
+|---|---|---|
+| Executável | 16 MB | - |
+| Memória em uso | 203 MB (DX12), 146 MB (Vulkan), 156 MB (OpenGL) | 385 MB |
+| CPU parado (um núcleo) | 0% a 1,5% | não medido |
+
+A memória ficou menor que a do app atual, mas longe de "leve": quase tudo é da placa de vídeo (o driver e o
+wgpu), não da interface. Fica para otimizar depois que o player entrar, porque é ele que decide como a placa
+é usada. Ainda não mede nada de vídeo.
+
+Como rodar (só fala com os emuladores nesta etapa):
+
+```
+npm run emulators
+cargo run --manifest-path desktop/rust-core/Cargo.toml -- selftest
+cargo run --manifest-path desktop/rust-ui/Cargo.toml -- --dev-user owner [--join <canal>] [--screenshot foto.png]
+```
+
+`--dev-user nome` entra na mesma conta que `?devUser=nome` no site. O que ainda não existe no nativo aparece
+desligado ou com aviso na própria tela (assistir, transmitir, perfil, administração).
+
+Não testado: banco de verdade (o cliente só rodou contra o emulador; o servidor de verdade manda a conexão
+para outra máquina, caminho escrito mas nunca exercitado), conta real do Google, token vencendo de verdade
+(a renovação foi testada chamando direto), telas com escala diferente de 100%.
