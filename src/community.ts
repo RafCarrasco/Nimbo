@@ -408,9 +408,17 @@ export const revokeMember = (uid: string, roles: Record<string, true> = {}) =>
     [`memberRoles/${uid}`]: null,
     ...Object.fromEntries(Object.keys(roles).map((id) => [`roleMembers/${id}/${uid}`, null])),
   });
+// Prévias das lives de uma pessoa num canal (uma leitura só, quando o mouse passa em cima dela).
+export const loadPreviews = (roomId: string, uid: string) =>
+  get(ref(db, `rooms/${roomId}/previews/${uid}`)).then(
+    (s) => (s.val() || {}) as Record<string, unknown>,
+    () => ({}) as Record<string, unknown>,
+  );
 // Limpa uma sessão abandonada (ex.: navegador fechado antes do onDisconnect ser registrado).
 export async function removeRoomSession(roomId: string, uid: string) {
   await remove(ref(db, `rooms/${roomId}/streams/${uid}`));
+  await remove(ref(db, `rooms/${roomId}/watching/${uid}`)).catch(() => {});
+  await remove(ref(db, `rooms/${roomId}/previews/${uid}`)).catch(() => {});
   await remove(ref(db, `rooms/${roomId}/members/${uid}`));
 }
 

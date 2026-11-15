@@ -18,6 +18,7 @@ import {
   isNativeLive,
   nativeMedia,
   NativeReceiver,
+  nativeGame,
   nativeSound,
   releaseNativePreview,
   stopNative,
@@ -25,7 +26,25 @@ import {
   type NativeSignal,
 } from './native';
 import type { StreamKind } from './capture';
+import { PREVIEW_EVERY_MS, PREVIEW_FIRST_MS, snapshotOf, validPreview } from './preview';
 import { APP_LABEL } from '../lib/version';
+import {
+  forcedOrder,
+  HOLD_MAX_MS,
+  HOLD_MIN_MS,
+  iceUfrag,
+  leaderOf,
+  lesson,
+  mustLead,
+  orderFor,
+  remember,
+  ROUND_MAX_MS,
+  SAME_ROUND_MS,
+  WAIT_MS,
+  withoutCandidates,
+  type IceOrder,
+  type IceSide,
+} from './iceOrder';
 
 // Sinalização: rooms/{room}/signals/{destinatário}/{remetente}/{id}
 type Signal =
@@ -38,7 +57,8 @@ type Signal =
 // negociação; é como quem assiste sabe qual stream recebido é a tela e qual é a câmera.
 // native: a live é enviada pelo motor do app; quem assiste abre uma conexão própria (native.ts).
 // sound: a live nativa leva som (quem assiste só pede áudio nesse caso).
-export type Broadcast = { startedAt: number; streamId: string; native?: boolean; sound?: boolean };
+// game: nome do jogo transmitido. startedAt: na hora do servidor (ver clockOffset em LiveSnapshot).
+export type Broadcast = { startedAt: number; streamId: string; native?: boolean; sound?: boolean; game?: string };
 export type Broadcasts = Record<string, Partial<Record<StreamKind, Broadcast>>>;
 export const STREAM_KINDS: StreamKind[] = ['screen', 'camera'];
 
@@ -80,6 +100,13 @@ export type LiveSnapshot = {
   native?: Record<string, 'playing' | 'connecting' | 'failed'>;
   // Versão do app de cada pessoa no canal, como ela informou ao entrar ("0.5.2 (Rust)", "navegador").
   apps?: Record<string, string>;
+  // Quem está assistindo cada live ("uid:tipo" → pessoas), como cada uma informou.
+  watchers?: Record<string, string[]>;
+  // Prévia (foto pequena) de cada live, "uid:tipo" → data URL. Só vem enquanto a interface pede.
+  previews?: Record<string, string>;
+  // Relógio do servidor menos o deste aparelho, em ms. As lives guardam o início na hora do servidor,
+  // para o tempo no ar sair certo mesmo com o relógio de alguém errado.
+  clockOffset?: number;
 };
 
 export type PeerDiagnostics = {
@@ -95,6 +122,8 @@ export type PeerDiagnostics = {
   remoteCandidates: string;
   pairs: string;
   iceRestarts: number;
+  // Quem mandou o primeiro pacote na rodada atual de procura de caminho (ver iceOrder.ts).
+  firstPacket: string;
   encoder: string;
 };
 
@@ -112,6 +141,17 @@ type Peer = {
   lastIceRestart: number;
   // Envios de vídeo que preferem o codificador da placa de vídeo.
   hardware: Set<RTCRtpTransceiver>;
+  // Rodada atual de procura de caminho: quem manda o primeiro pacote (ver iceOrder.ts).
+  order: IceOrder;
+  roundAt: number;
+  // Ordem 'me': os meus endereços ficam aqui até eu já ter mandado testes para os do outro lado.
+  holding: boolean;
+  held: RTCIceCandidateInit[];
+  firstRemoteAt: number;
+  // Ordem 'them': os endereços do outro lado esperam em `candidates` para ele mandar primeiro.
+  waiting: boolean;
+  remoteUfrag: string;
+  timers: Array<ReturnType<typeof setTimeout>>;
 };
 
 type LocalLive = {
@@ -120,6 +160,8 @@ type LocalLive = {
   stream: MediaStream;
   announced: MediaStream;
   bitrate: number;
+  // Nome do jogo, quando a fonte é um jogo (só as lives do app sabem).
+  game?: string;
   startedAt: number;
   // Jogo fora da frente: quem assiste recebe a tela de pausa no lugar do vídeo.
   paused?: boolean;
@@ -268,6 +310,17 @@ export class LiveRoom {
   private apps: Record<string, string> = {};
   // Ofertas da mesma pessoa para a mesma live são atendidas uma de cada vez.
   private nativeQueue = new Map<string, Promise<void>>();
+  // Plateia: o que esta sessão está assistindo (avisado aos outros) e o que cada um assiste.
+  private watching: string[] = [];
+  private watchers: Record<string, string[]> = {};
+  private clockOffset = 0;
+  // Prévias das lives do canal, lidas só enquanto a interface pede (cartões do palco).
+  private previews: Record<string, string> = {};
+  private previewsOff: (() => void) | null = null;
+  // Procura de caminho com cada pessoa: quantas rodadas já começaram desde a última conexão que deu
+  // certo, e quem mandou primeiro nas que falharam (ver iceOrder.ts).
+  private iceAttempts: Record<string, number> = {};
+  private iceFailed: Record<string, Set<IceSide>> = {};
 
   constructor(
     private db: Database,
@@ -287,6 +340,9 @@ export class LiveRoom {
   private get streamsRef() {
     return this.path(`streams/${this.uid}`);
   }
+  private get watchingRef() {
+    return this.path(`watching/${this.uid}`);
+  }
 
   snapshot(): LiveSnapshot {
     return {
@@ -299,6 +355,9 @@ export class LiveRoom {
       remote: this.allRemote(),
       native: this.nativeIn.states(this.broadcasts, this.uid),
       apps: this.apps,
+      watchers: this.watchers,
+      previews: this.previews,
+      clockOffset: this.clockOffset,
       failed: [...this.failed],
       connecting: [...this.peers.entries()]
         .filter(([, p]) => p.pc.connectionState !== 'connected' && p.pc.connectionState !== 'failed')
@@ -357,6 +416,71 @@ export class LiveRoom {
     this.sessionStart = Date.now();
     if (reset) this.nativeIn.sync(this.broadcasts, this.members, this.uid);
     for (const kind of this.locals.keys()) await this.publishStream(kind);
+    await this.publishWatching().catch(() => {});
+  }
+
+  // Quais lives esta sessão está assistindo, para quem transmite (e os demais) verem a plateia.
+  setWatching(keys: string[]) {
+    const next = [...new Set(keys)].filter((key) => parseLiveKey(key).uid !== this.uid).sort();
+    if (next.join('|') === this.watching.join('|')) return;
+    this.watching = next;
+    if (this.joined && !this.replaced) void this.publishWatching().catch(() => {});
+  }
+
+  private async publishWatching() {
+    const value: Record<string, Partial<Record<StreamKind, true>>> = {};
+    for (const key of this.watching) {
+      const { uid, kind } = parseLiveKey(key);
+      (value[uid] ??= {})[kind] = true;
+    }
+    await onDisconnect(this.watchingRef).remove();
+    await set(this.watchingRef, Object.keys(value).length ? value : null);
+  }
+
+  // Renova a prévia de uma live própria: uma foto pequena do que está sendo transmitido.
+  private async publishPreview(kind: StreamKind) {
+    const live = this.locals.get(kind);
+    if (!live || !this.joined || this.replaced || live.paused) return;
+    const track = live.stream.getVideoTracks()[0];
+    const data = track ? await snapshotOf(track).catch(() => null) : null;
+    if (!data || this.locals.get(kind) !== live || !this.joined) return;
+    await onDisconnect(this.path(`previews/${this.uid}`)).remove();
+    await set(this.path(`previews/${this.uid}/${kind}`), data);
+  }
+
+  // A interface pede as prévias só enquanto vai mostrá-las: ninguém baixa foto que não vai ver.
+  watchPreviews(on: boolean) {
+    if (on === Boolean(this.previewsOff) || (on && !this.joined)) return;
+    if (!on) {
+      this.previewsOff?.();
+      this.previewsOff = null;
+      this.previews = {};
+      this.emit();
+      return;
+    }
+    this.previewsOff = onValue(
+      this.path('previews'),
+      (snap) => {
+        const next: Record<string, string> = {};
+        for (const [uid, kinds] of Object.entries((snap.val() as Record<string, Record<string, unknown>>) || {}))
+          for (const kind of STREAM_KINDS) {
+            const value = kinds?.[kind];
+            if (validPreview(value)) next[liveKey(uid, kind)] = value;
+          }
+        this.previews = next;
+        this.emit();
+      },
+      () => {},
+    );
+  }
+
+  private onWatching(raw: Record<string, Record<string, Record<string, unknown>>> | null) {
+    const next: Record<string, string[]> = {};
+    for (const [viewer, lives] of Object.entries(raw || {}))
+      for (const [uid, kinds] of Object.entries(lives || {}))
+        for (const kind of STREAM_KINDS) if (kinds?.[kind]) (next[liveKey(uid, kind)] ??= []).push(viewer);
+    this.watchers = next;
+    this.emit();
   }
 
   private async publishStream(kind: StreamKind) {
@@ -364,8 +488,10 @@ export class LiveRoom {
     if (!live) return;
     await onDisconnect(this.streamsRef).remove();
     await set(this.path(`streams/${this.uid}/${kind}`), {
-      startedAt: live.startedAt,
+      // Na hora do servidor: quem assiste calcula o tempo no ar sem depender do relógio de ninguém.
+      startedAt: Math.round(live.startedAt + this.clockOffset),
       streamId: live.announced.id,
+      ...(live.game ? { game: live.game } : {}),
       ...(isNativeLive(live.stream) ? { native: true, ...(nativeSound(live.stream) ? { sound: true } : {}) } : {}),
     });
   }
@@ -375,7 +501,15 @@ export class LiveRoom {
     const watchdog = setInterval(() => this.checkMissing(), 2000);
     const adapt = setInterval(() => void this.adaptQuality(), 3000);
     const relay = setInterval(() => void this.reportRelayUsage(), 60000);
-    this.unsubs.push(() => clearInterval(watchdog), () => clearInterval(adapt), () => clearInterval(relay));
+    const previews = setInterval(() => {
+      for (const kind of this.locals.keys()) void this.publishPreview(kind).catch(() => {});
+    }, PREVIEW_EVERY_MS);
+    this.unsubs.push(
+      () => clearInterval(watchdog),
+      () => clearInterval(adapt),
+      () => clearInterval(relay),
+      () => clearInterval(previews),
+    );
     this.unsubs.push(
       onValue(ref(this.db, '.info/connected'), (snap) => {
         const connected = snap.val() === true;
@@ -402,6 +536,19 @@ export class LiveRoom {
         (snap) => this.onBroadcasts(snap.val() || {}),
         () => {},
       ),
+    );
+    this.unsubs.push(
+      onValue(
+        this.path('watching'),
+        (snap) => this.onWatching(snap.val()),
+        () => {},
+      ),
+    );
+    this.unsubs.push(
+      onValue(ref(this.db, '.info/serverTimeOffset'), (snap) => {
+        this.clockOffset = Number(snap.val()) || 0;
+        this.emit();
+      }),
     );
     this.unsubs.push(
       onValue(
@@ -556,14 +703,23 @@ export class LiveRoom {
       iceRestarts: 0,
       lastIceRestart: 0,
       hardware: new Set(),
+      order: 'natural',
+      roundAt: 0,
+      holding: false,
+      held: [],
+      firstRemoteAt: 0,
+      waiting: false,
+      remoteUfrag: '',
+      timers: [],
     };
     this.peers.set(id, peer);
+    this.beginRound(id, peer);
     pc.onnegotiationneeded = async () => {
       try {
         peer.makingOffer = true;
         await pc.setLocalDescription();
         const desc = pc.localDescription!;
-        await this.send(id, { type: desc.type as 'offer', sdp: desc.toJSON() });
+        await this.send(id, { type: desc.type as 'offer', sdp: this.outgoing(peer, desc) });
       } catch (e) {
         console.warn('[nimbo] oferta', id, e);
       } finally {
@@ -571,18 +727,22 @@ export class LiveRoom {
       }
     };
     pc.onicecandidate = ({ candidate }) => {
-      if (candidate?.candidate)
-        void this.send(id, { type: 'ice', candidate: candidate.toJSON() }).catch(() => {});
+      if (!candidate?.candidate) return;
+      // Ordem 'me': o outro lado só recebe os meus endereços depois que eu já mandei para os dele.
+      if (peer.holding) peer.held.push(candidate.toJSON());
+      else void this.send(id, { type: 'ice', candidate: candidate.toJSON() }).catch(() => {});
     };
     pc.oniceconnectionstatechange = () => {
       console.info('[nimbo] ICE', id.slice(0, 5), pc.iceConnectionState);
       if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') peer.iceRestarts = 0;
-      if (pc.iceConnectionState === 'failed') pc.restartIce();
+      if (pc.iceConnectionState === 'failed') this.newRoute(id, peer);
     };
     pc.onconnectionstatechange = () => {
       console.info('[nimbo] conexão', id.slice(0, 5), pc.connectionState);
-      if (pc.connectionState === 'connected') this.failed.delete(id);
-      else if (pc.connectionState === 'failed') this.failed.add(id);
+      if (pc.connectionState === 'connected') {
+        this.failed.delete(id);
+        this.roundConnected(id, peer);
+      } else if (pc.connectionState === 'failed') this.failed.add(id);
       this.emit();
     };
     pc.ontrack = ({ track, streams }) => {
@@ -599,6 +759,114 @@ export class LiveRoom {
     };
     for (const kind of this.locals.keys()) this.syncSenders(peer, kind);
     return peer;
+  }
+
+  // Começa uma rodada de procura de caminho com alguém (conexão nova ou "rota nova") e decide quem
+  // manda o primeiro pacote nela. Ver iceOrder.ts.
+  private beginRound(id: string, peer: Peer) {
+    const now = Date.now();
+    // Os dois lados pediram rota nova quase juntos: é a mesma rodada.
+    if (peer.roundAt && now - peer.roundAt < SAME_ROUND_MS) return;
+    this.roundFailed(id, peer);
+    const attempt = this.iceAttempts[id] ?? 0;
+    this.iceAttempts[id] = attempt + 1;
+    for (const timer of peer.timers.splice(0)) clearTimeout(timer);
+    // Endereços guardados da rodada anterior não servem para a nova.
+    if (peer.roundAt) peer.candidates = [];
+    peer.order = forcedOrder() ?? orderFor(attempt, this.uid < id, mustLead());
+    peer.roundAt = now;
+    peer.held = [];
+    peer.firstRemoteAt = 0;
+    peer.holding = peer.order === 'me';
+    peer.waiting = peer.order === 'them';
+    if (peer.order === 'natural') return;
+    console.info('[nimbo] caminho com', id.slice(0, 5), 'tentativa', attempt + 1, 'primeiro pacote:', peer.order);
+    // Teto: nenhuma espera passa daqui (por exemplo, os dois lados segurando os endereços).
+    peer.timers.push(
+      setTimeout(() => {
+        this.releaseHeld(id, peer);
+        this.stopWaiting(peer);
+      }, ROUND_MAX_MS),
+    );
+  }
+
+  // A rodada anterior acabou sem conectar: anota quem tinha mandado primeiro nela.
+  private roundFailed(id: string, peer: Peer) {
+    if (!peer.roundAt || peer.pc.connectionState === 'connected' || !peer.pc.remoteDescription) return;
+    (this.iceFailed[id] ??= new Set()).add(leaderOf(peer.order, peer.pc.localDescription?.type === 'answer'));
+  }
+
+  private roundConnected(id: string, peer: Peer) {
+    const leader = leaderOf(peer.order, peer.pc.localDescription?.type === 'answer');
+    remember(lesson(leader, this.iceFailed[id] ?? new Set()));
+    this.iceAttempts[id] = 0;
+    delete this.iceFailed[id];
+    this.releaseHeld(id, peer);
+    this.stopWaiting(peer);
+  }
+
+  // "Rota nova": o navegador refaz a procura de caminho, com portas novas, numa rodada nova.
+  private newRoute(id: string, peer: Peer) {
+    this.beginRound(id, peer);
+    peer.pc.restartIce();
+  }
+
+  // Oferta ou resposta que sai: sem os meus endereços enquanto eu os estiver segurando.
+  private outgoing(peer: Peer, desc: RTCSessionDescription) {
+    return peer.holding ? withoutCandidates(desc.toJSON()) : desc.toJSON();
+  }
+
+  // Um endereço do outro lado foi aplicado. Segurando os meus (ordem 'me'), a partir daqui o
+  // navegador já manda testes para ele: quando todos os pares tiverem saído, entrego os meus.
+  private remoteAdded(id: string, peer: Peer) {
+    if (!peer.holding || peer.firstRemoteAt) return;
+    const round = (peer.firstRemoteAt = Date.now());
+    const check = async () => {
+      if (!peer.holding || peer.firstRemoteAt !== round || peer.pc.signalingState === 'closed') return;
+      const waited = Date.now() - round;
+      let sent = false;
+      if (waited >= HOLD_MIN_MS && waited < HOLD_MAX_MS) {
+        const stats = await peer.pc.getStats().catch(() => null);
+        let pairs = 0;
+        let pending = 0;
+        stats?.forEach((r: Record<string, unknown>) => {
+          if (r.type !== 'candidate-pair') return;
+          pairs++;
+          if (!r.requestsSent) pending++;
+        });
+        sent = pairs > 0 && pending === 0;
+      }
+      if (sent || waited >= HOLD_MAX_MS) this.releaseHeld(id, peer);
+      else peer.timers.push(setTimeout(() => void check(), 150));
+    };
+    peer.timers.push(setTimeout(() => void check(), HOLD_MIN_MS));
+  }
+
+  private releaseHeld(id: string, peer: Peer) {
+    if (!peer.holding) return;
+    peer.holding = false;
+    console.info('[nimbo] endereços entregues a', id.slice(0, 5), 'após', Date.now() - peer.roundAt, 'ms:', peer.held.length);
+    for (const candidate of peer.held.splice(0)) void this.send(id, { type: 'ice', candidate }).catch(() => {});
+  }
+
+  // Ordem 'them': a oferta e a resposta já estão aplicadas; o outro lado tem um tempo para mandar
+  // primeiro antes de os endereços dele valerem aqui.
+  private scheduleWaitEnd(peer: Peer) {
+    if (!peer.waiting || !peer.pc.remoteDescription || !peer.pc.localDescription) return;
+    peer.timers.push(setTimeout(() => this.stopWaiting(peer), WAIT_MS));
+  }
+
+  private stopWaiting(peer: Peer) {
+    if (!peer.waiting) return;
+    peer.waiting = false;
+    console.info('[nimbo] endereços do outro lado aplicados após', Date.now() - peer.roundAt, 'ms:', peer.candidates.length);
+    // Na fila da conexão, para não passar na frente de uma oferta ou resposta ainda sendo aplicada.
+    peer.queue = peer.queue
+      .then(async () => {
+        if (peer.pc.signalingState === 'closed' || !peer.pc.remoteDescription) return;
+        for (const c of peer.candidates.splice(0)) await peer.pc.addIceCandidate(c).catch(() => {});
+      })
+      .catch(() => {});
   }
 
   // Põe nos envios desta conexão as faixas atuais da live (ou nada, se ela parou). Os canais de envio
@@ -732,12 +1000,14 @@ export class LiveRoom {
     const { pc } = peer;
     if (pc.signalingState === 'closed') return;
     if (msg.type === 'ice') {
-      if (!pc.remoteDescription) {
+      // Sem a oferta/resposta aplicada ainda, ou esperando o outro lado mandar primeiro (ordem 'them').
+      if (!pc.remoteDescription || peer.waiting) {
         peer.candidates.push(msg.candidate);
         return;
       }
       try {
         await pc.addIceCandidate(msg.candidate);
+        this.remoteAdded(id, peer);
       } catch (e) {
         if (!peer.ignoreOffer) throw e;
       }
@@ -746,19 +1016,30 @@ export class LiveRoom {
     const collision = msg.type === 'offer' && (peer.makingOffer || pc.signalingState !== 'stable');
     peer.ignoreOffer = !peer.polite && collision;
     if (peer.ignoreOffer) return;
+    // Oferta com rodada de rotas nova (o outro lado pediu "rota nova"): começa a rodada aqui também.
+    const ufrag = iceUfrag(msg.sdp.sdp);
+    if (msg.type === 'offer' && peer.remoteUfrag && ufrag && ufrag !== peer.remoteUfrag) this.beginRound(id, peer);
+    if (ufrag) peer.remoteUfrag = ufrag;
     await pc.setRemoteDescription(msg.sdp); // rollback implícito quando há colisão
-    for (const c of peer.candidates.splice(0)) await pc.addIceCandidate(c).catch(() => {});
+    if (!peer.waiting) {
+      const pending = peer.candidates.splice(0);
+      for (const c of pending) await pc.addIceCandidate(c).catch(() => {});
+      if (pending.length || /^a=candidate:/m.test(msg.sdp.sdp || '')) this.remoteAdded(id, peer);
+    }
     if (msg.type === 'offer') {
       await pc.setLocalDescription();
       const desc = pc.localDescription!;
-      await this.send(id, { type: 'answer', sdp: desc.toJSON() });
+      await this.send(id, { type: 'answer', sdp: this.outgoing(peer, desc) });
     }
+    this.scheduleWaitEnd(peer);
   }
 
   private closePeer(id: string) {
     const peer = this.peers.get(id);
     if (!peer) return;
     peer.pc.onnegotiationneeded = null;
+    this.roundFailed(id, peer);
+    for (const timer of peer.timers.splice(0)) clearTimeout(timer);
     peer.pc.close();
     this.peers.delete(id);
     delete this.remote[id];
@@ -779,7 +1060,7 @@ export class LiveRoom {
     const peer = this.peers.get(id);
     this.failed.delete(id);
     if (peer && Object.keys(this.remote[id] || {}).length) {
-      peer.pc.restartIce();
+      this.newRoute(id, peer);
       this.emit();
       return;
     }
@@ -818,7 +1099,7 @@ export class LiveRoom {
         peer.lastIceRestart = now;
         peer.checkingSince = now;
         console.info('[nimbo] rota nova para', id.slice(0, 5), 'tentativa', peer.iceRestarts);
-        peer.pc.restartIce();
+        this.newRoute(id, peer);
       }
     }
     const waiting = Object.keys(this.broadcasts).filter(
@@ -895,6 +1176,7 @@ export class LiveRoom {
           remoteCandidates: [...remoteTypes].join(' ') || 'nenhum',
           pairs: Object.entries(pairs).map(([k, v]) => `${k}:${v}`).join(' ') || 'nenhum',
           iceRestarts: this.peers.get(id)?.iceRestarts || 0,
+          firstPacket: `${this.peers.get(id)?.order || 'natural'} (rodada ${this.iceAttempts[id] ?? 0})${mustLead() ? ', esta rede manda primeiro' : ''}`,
           encoder: [...encoders].join(', ') || 'nenhum',
         };
       }),
@@ -913,8 +1195,9 @@ export class LiveRoom {
     // Com a captura já ativa, descobre se dá para codificar pela placa de vídeo (ver hwcodec.ts).
     // A resposta fica guardada: só a primeira live da semana espera o teste (até ~4 s).
     if (!isNativeLive(stream)) this.hardware = await hardwareH264();
-    this.locals.set(kind, { stream, announced, bitrate, startedAt: Date.now() });
+    this.locals.set(kind, { stream, announced, bitrate, game: nativeGame(stream) || undefined, startedAt: Date.now() });
     this.watchEnded(stream, kind);
+    setTimeout(() => void this.publishPreview(kind).catch(() => {}), PREVIEW_FIRST_MS);
     try {
       await this.publishStream(kind);
     } catch (e) {
@@ -942,8 +1225,10 @@ export class LiveRoom {
     const old = live.stream;
     live.stream = stream;
     live.bitrate = bitrate;
+    live.game = nativeGame(stream) || undefined;
     live.paused = false;
     this.watchEnded(stream, kind);
+    setTimeout(() => void this.publishPreview(kind).catch(() => {}), PREVIEW_FIRST_MS);
     for (const peer of this.peers.values()) this.syncSenders(peer, kind);
     // Live nativa: a captura já trocou de fonte no motor; só a prévia antiga é fechada. O anúncio é
     // refeito porque a fonte nova pode ter (ou não ter) som.
@@ -983,6 +1268,7 @@ export class LiveRoom {
       live.stream.getTracks().forEach((t) => t.stop());
       this.emit();
       await remove(this.path(`streams/${this.uid}/${k}`)).catch(() => {});
+      await remove(this.path(`previews/${this.uid}/${k}`)).catch(() => {});
     }
   }
 
@@ -993,6 +1279,8 @@ export class LiveRoom {
     this.joined = false;
     this.unsubs.forEach((u) => u());
     this.unsubs = [];
+    this.previewsOff?.();
+    this.previewsOff = null;
     for (const id of [...this.peers.keys()]) this.closePeer(id);
     this.nativeIn.closeAll();
     await onDisconnect(this.streamsRef)
@@ -1001,6 +1289,13 @@ export class LiveRoom {
     await onDisconnect(this.memberRef)
       .cancel()
       .catch(() => {});
+    await onDisconnect(this.watchingRef)
+      .cancel()
+      .catch(() => {});
+    await onDisconnect(this.path(`previews/${this.uid}`))
+      .cancel()
+      .catch(() => {});
+    if (!this.replaced) await remove(this.watchingRef).catch(() => {});
     // Trocada por outra sessão da mesma conta: o registro de presença agora é dela.
     if (!this.replaced) await remove(this.memberRef).catch(() => {});
     this.emit();

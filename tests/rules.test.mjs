@@ -373,6 +373,53 @@ describe('salas', () => {
     await assertFails(set(ref(member(), 'rooms/geral/streams/member'), true));
     await assertFails(set(ref(member(), 'rooms/geral/streams/member/screen'), { startedAt: 1 }));
   });
+  test('nome do jogo na live é texto curto', async () => {
+    const live = { startedAt: 1, streamId: 's2', native: true };
+    await assertSucceeds(set(ref(member(), 'rooms/geral/streams/member/screen'), { ...live, game: 'Counter-Strike 2' }));
+    await assertFails(set(ref(member(), 'rooms/geral/streams/member/screen'), { ...live, game: 'x'.repeat(49) }));
+    await assertFails(set(ref(member(), 'rooms/geral/streams/member/screen'), { ...live, game: 7 }));
+  });
+  test('plateia: cada pessoa informa só o que ela mesma assiste, e quem está no canal lê', async () => {
+    const mine = { owner: { screen: true } };
+    await assertSucceeds(set(ref(member(), 'rooms/geral/watching/member'), mine));
+    await assertSucceeds(get(ref(owner(), 'rooms/geral/watching')));
+    // Não escreve a plateia de outra pessoa, nem a própria sem estar no canal.
+    await assertFails(set(ref(member(), 'rooms/geral/watching/owner'), mine));
+    await assertFails(set(ref(admin(), 'rooms/geral/watching/admin'), mine));
+    // Só "screen" e "camera", e só `true`.
+    await assertFails(set(ref(member(), 'rooms/geral/watching/member'), { owner: { tela: true } }));
+    await assertFails(set(ref(member(), 'rooms/geral/watching/member'), { owner: { screen: 'sim' } }));
+    // Quem não pode ver o canal não lê a plateia dele.
+    await assertFails(get(ref(member(), 'rooms/vip/watching')));
+    await assertFails(get(ref(pending(), 'rooms/geral/watching')));
+    // Sair apaga a própria; administrador limpa a de uma sessão abandonada; os outros, não.
+    await assertFails(remove(ref(as('outro'), 'rooms/geral/watching/member')));
+    await assertSucceeds(remove(ref(admin(), 'rooms/geral/watching/member')));
+    await assertSucceeds(set(ref(member(), 'rooms/geral/watching/member'), mine));
+    await assertSucceeds(remove(ref(member(), 'rooms/geral/watching/member')));
+  });
+  test('prévia da live: foto pequena, só de quem transmite, lida por quem vê o canal', async () => {
+    const photo = 'data:image/webp;base64,' + 'A'.repeat(4000);
+    await assertSucceeds(set(ref(member(), 'rooms/geral/previews/member/screen'), photo));
+    await assertSucceeds(set(ref(member(), 'rooms/geral/previews/member/camera'), 'data:image/jpeg;base64,AAAA'));
+    await assertSucceeds(get(ref(owner(), 'rooms/geral/previews/member')));
+    await assertSucceeds(get(ref(as('outro'), 'rooms/geral/previews')));
+    // Só a própria, só estando no canal, só imagem pequena.
+    await assertFails(set(ref(member(), 'rooms/geral/previews/owner/screen'), photo));
+    await assertFails(set(ref(admin(), 'rooms/geral/previews/admin/screen'), photo));
+    await assertFails(set(ref(member(), 'rooms/geral/previews/member/outra'), photo));
+    await assertFails(set(ref(member(), 'rooms/geral/previews/member/screen'), 'data:image/webp;base64,' + 'A'.repeat(14000)));
+    await assertFails(set(ref(member(), 'rooms/geral/previews/member/screen'), 'data:text/html;base64,PHNjcmlwdD4='));
+    await assertFails(set(ref(member(), 'rooms/geral/previews/member/screen'), 'https://exemplo.com/foto.png'));
+    await assertFails(set(ref(member(), 'rooms/geral/previews/member/screen'), { url: photo }));
+    // Quem não vê o canal não lê; sair apaga; administrador limpa a de uma sessão abandonada.
+    await assertFails(get(ref(member(), 'rooms/vip/previews')));
+    await assertFails(get(ref(pending(), 'rooms/geral/previews')));
+    await assertFails(remove(ref(as('outro'), 'rooms/geral/previews/member')));
+    await assertSucceeds(remove(ref(admin(), 'rooms/geral/previews/member')));
+    await assertSucceeds(set(ref(member(), 'rooms/geral/previews/member/screen'), photo));
+    await assertSucceeds(remove(ref(member(), 'rooms/geral/previews/member/screen')));
+  });
   test('encerrar uma live mantém a outra; sair remove todas', async () => {
     const live = { startedAt: 1, streamId: 'abc' };
     await assertSucceeds(set(ref(member(), 'rooms/geral/streams/member'), { screen: live, camera: live }));

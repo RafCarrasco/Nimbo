@@ -5,6 +5,7 @@ import {
   LoaderCircle,
   Maximize,
   Minimize,
+  PictureInPicture2,
   RotateCw,
   Video,
   Volume1,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 import { desktop } from '../desktop';
 import { APP_LABEL } from '../lib/version';
+import { Elapsed, Viewers } from './LiveMeta';
 
 export type TileState = 'playing' | 'connecting' | 'failed';
 
@@ -35,6 +37,10 @@ export function LiveTile({
   onRetry,
   compact,
   style,
+  startedAt,
+  clockOffset,
+  viewers,
+  game,
 }: {
   name: string;
   stream: MediaStream | null;
@@ -54,6 +60,12 @@ export function LiveTile({
   onRetry?: () => void;
   compact?: boolean;
   style?: React.CSSProperties;
+  // Início da live na hora do servidor e a correção do relógio daqui, para o tempo no ar.
+  startedAt?: number;
+  clockOffset?: number;
+  // Quem está assistindo (nomes) e o jogo transmitido.
+  viewers?: string[];
+  game?: string;
 }) {
   const tile = useRef<HTMLElement>(null);
   const video = useRef<HTMLVideoElement>(null);
@@ -63,6 +75,9 @@ export function LiveTile({
   const [hasFrames, setHasFrames] = useState(false);
   const [slow, setSlow] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Resolução e quadros por segundo que estão chegando ("1080p · 60 fps").
+  const [quality, setQuality] = useState('');
+  const [floating, setFloating] = useState(false);
   // Estado das conexões (rota, bytes e quadros) para colar a quem cuida do Nimbo quando uma live trava.
   const copyDiagnostics = async () => {
     const debug = (window as unknown as { nimboDebug?: () => Promise<unknown> }).nimboDebug;
@@ -105,6 +120,47 @@ export function LiveTile({
       v.srcObject = null;
     };
   }, [stream]);
+
+  // Mede o que chega de verdade: a altura da imagem e quantos quadros o player recebeu por segundo.
+  // A contagem é a do próprio player, que continua valendo com a janela coberta ou minimizada (medido:
+  // contar pelos quadros desenhados na tela dava 3 por segundo numa live de 59).
+  useEffect(() => {
+    const v = video.current;
+    if (!v || typeof v.getVideoPlaybackQuality !== 'function') return;
+    // Todos os quadros que chegaram ao player, inclusive os que ele não desenhou por estar coberto.
+    const shown = () => v.getVideoPlaybackQuality().totalVideoFrames;
+    let last = shown();
+    let at = performance.now();
+    const timer = setInterval(() => {
+      const [now, frames] = [performance.now(), shown()];
+      const fps = Math.round(((frames - last) * 1000) / Math.max(1, now - at));
+      [last, at] = [frames, now];
+      setQuality(v.videoHeight ? `${v.videoHeight}p${fps > 0 ? ` · ${fps} fps` : ''}` : '');
+    }, 2000);
+    return () => {
+      clearInterval(timer);
+      setQuality('');
+    };
+  }, [stream]);
+
+  // Janela flutuante (fica por cima dos outros programas, para assistir jogando).
+  useEffect(() => {
+    const v = video.current;
+    if (!v) return;
+    const enter = () => setFloating(true);
+    const leave = () => setFloating(false);
+    v.addEventListener('enterpictureinpicture', enter);
+    v.addEventListener('leavepictureinpicture', leave);
+    return () => {
+      v.removeEventListener('enterpictureinpicture', enter);
+      v.removeEventListener('leavepictureinpicture', leave);
+    };
+  }, []);
+  const canFloat = typeof document !== 'undefined' && document.pictureInPictureEnabled;
+  const toggleFloating = () => {
+    if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => {});
+    else void video.current?.requestPictureInPicture().catch(() => {});
+  };
 
   useEffect(() => {
     const v = video.current;
@@ -149,6 +205,11 @@ export function LiveTile({
         // Cliques nos controles (volume, tela cheia, fechar) não mudam o destaque.
         if ((e.target as HTMLElement).closest('button, input')) return;
         if (!fullscreen) onSelect?.();
+      }}
+      // Como no Discord: duplo clique na imagem abre (ou fecha) a tela cheia.
+      onDoubleClick={(e) => {
+        if ((e.target as HTMLElement).closest('button, input')) return;
+        toggleFullscreen();
       }}
     >
       <video ref={video} autoPlay playsInline muted={silent} />
@@ -198,10 +259,13 @@ export function LiveTile({
       )}
       <div className="tile-top">
         <span className="live-badge">AO VIVO</span>
+        {!compact && <Elapsed startedAt={startedAt} clockOffset={clockOffset} />}
         <span className="tile-name">
           {camera && <Video size={14} aria-label="Webcam" />}
           {name}
         </span>
+        {game && !compact && <span className="tile-game">{game}</span>}
+        <Viewers names={viewers || []} />
         {!compact && (
           <button
             className="tile-button"
@@ -250,14 +314,32 @@ export function LiveTile({
             </div>
           )}
           {own && <span className="tile-hint">Sua prévia não reproduz áudio</span>}
-          <button
-            className="tile-button push-right"
-            aria-label={fullscreen ? 'Sair da tela cheia' : 'Tela cheia'}
-            title={fullscreen ? 'Sair da tela cheia' : 'Tela cheia'}
-            onClick={toggleFullscreen}
-          >
-            {fullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
-          </button>
+          <div className="tile-right push-right">
+            {quality && hasFrames && (
+              <span className="tile-quality" title="Imagem que está chegando agora">
+                {quality}
+              </span>
+            )}
+            {canFloat && !own && hasFrames && (
+              <button
+                className="tile-button"
+                aria-label={floating ? 'Fechar a janela flutuante' : 'Janela flutuante'}
+                title={floating ? 'Fechar a janela flutuante' : 'Janela flutuante (fica por cima dos outros programas)'}
+                aria-pressed={floating}
+                onClick={toggleFloating}
+              >
+                <PictureInPicture2 size={18} />
+              </button>
+            )}
+            <button
+              className="tile-button"
+              aria-label={fullscreen ? 'Sair da tela cheia' : 'Tela cheia'}
+              title={fullscreen ? 'Sair da tela cheia' : 'Tela cheia'}
+              onClick={toggleFullscreen}
+            >
+              {fullscreen ? <Minimize size={18} /> : <Maximize size={18} />}
+            </button>
+          </div>
         </div>
       )}
     </section>

@@ -128,6 +128,45 @@ const rules = {
                 // Live enviada pelo motor do app (src/live/native.ts).
                 "(!newData.child('native').exists() || newData.child('native').isBoolean())",
                 "(!newData.child('sound').exists() || newData.child('sound').isBoolean())",
+                // Nome do jogo transmitido, para mostrar em cima da live.
+                "(!newData.child('game').exists() || (newData.child('game').isString() && newData.child('game').val().length <= 48))",
+              ),
+            },
+          },
+        },
+        // Quem está assistindo o quê: watching/{quem assiste}/{quem transmite}/{screen|camera}.
+        // Cada pessoa escreve só a própria plateia; some sozinho quando a conexão cai.
+        watching: {
+          '.read': canRoom,
+          $uid: {
+            '.write': or(
+              and(canRoom, 'auth.uid === $uid', member('$uid')),
+              and(google, 'auth.uid === $uid', '!newData.exists()'),
+              and(adminOver(channelVisible('$room')), '!newData.exists()'),
+            ),
+            $broadcaster: {
+              $kind: { '.validate': "($kind === 'screen' || $kind === 'camera') && newData.val() === true" },
+            },
+          },
+        },
+        // Prévia de cada live: uma foto pequena tirada por quem transmite (src/live/preview.ts).
+        previews: {
+          '.read': canRoom,
+          $uid: {
+            '.write': or(
+              and(canRoom, 'auth.uid === $uid', member('$uid')),
+              and(google, 'auth.uid === $uid', '!newData.exists()'),
+              and(adminOver(channelVisible('$room')), '!newData.exists()'),
+            ),
+            $kind: {
+              '.validate': and(
+                "($kind === 'screen' || $kind === 'camera')",
+                'newData.isString()',
+                'newData.val().length <= 14000',
+                or(
+                  "newData.val().beginsWith('data:image/webp;base64,')",
+                  "newData.val().beginsWith('data:image/jpeg;base64,')",
+                ),
               ),
             },
           },

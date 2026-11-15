@@ -123,6 +123,10 @@ export function useLiveRoom(uid: string, handlers: Handlers) {
   }, []);
 
   const retry = useCallback((id: string) => current.current?.retry(id), []);
+  // Avisa ao canal quais lives esta sessão está assistindo.
+  const watch = useCallback((keys: string[]) => current.current?.setWatching(keys), []);
+  // Liga e desliga a leitura das prévias das lives (só enquanto elas aparecem na tela).
+  const previews = useCallback((on: boolean) => current.current?.watchPreviews(on), []);
 
   // Suporte no console: nimboDebug() mostra cada conexão P2P; nimboTurnTest() confere o TURN.
   useEffect(() => {
@@ -158,7 +162,7 @@ export function useLiveRoom(uid: string, handlers: Handlers) {
     };
   }, [uid]);
 
-  return { snapshot, busy, join, leave, start, stop, retry };
+  return { snapshot, busy, join, leave, start, stop, retry, watch, previews };
 }
 
 function keepDevParams(prefix = '?') {
