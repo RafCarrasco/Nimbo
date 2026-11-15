@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 # Login e banco em tempo real, sem interface (desktop/rust-core).
 nimbo-core = { path = "../rust-core" }
+# Motor (captura, codificação, envio) e player (receber, decodificar, tocar) das lives.
+nimbo-media = { path = "../rust-media" }
 # Janela e desenho. wgpu: a mesma placa que decodifica a live desenha a interface.
 eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts"] }
 egui = "0.37"

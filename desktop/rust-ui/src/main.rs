@@ -11,21 +11,35 @@
 //!     emuladores, com o login pelo navegador (`npm run dev:local` precisa estar no ar)
 //!   nimbo-native --production
 //!     Firebase de verdade, com a conta Google de quem usa. Ainda em validação.
+//!
+//! Para testar lives sem clicar (sempre com `--mute`: nenhum som audível em teste):
+//!   nimbo-native --dev-user a --join geral --broadcast <janela> [--sound] [--stats] [--exit-after 60]
+//!     transmite a janela (o identificador dela no Windows) assim que entra no canal
+//!   nimbo-native --dev-user b --join geral --watch-all --mute [--stats] [--shot-after 30 --screenshot foto.png]
+//!     abre no palco toda live do canal; `--cpu-video` troca o desenho pela conversão na CPU
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod live;
 // O login pelo navegador é o do app atual, sem cópia: mesma porta local, mesmo código de uso único.
 #[allow(dead_code)]
 #[path = "../../rust-app/src/login.rs"]
 mod login;
 mod session_store;
 mod sidebar;
+mod stage;
 mod theme;
+mod video;
 mod widgets;
 
 fn main() -> eframe::Result {
-    let mut args = app::Args { dev_user: None, screenshot: None, join: None, production: false, site: None, login: false };
+    let mut args = app::Args::default();
+    let (mut position, mut size) = (None, [1280.0, 800.0]);
+    let pair = |text: &str| -> Option<[f32; 2]> {
+        let (a, b) = text.split_once(',')?;
+        Some([a.trim().parse().ok()?, b.trim().parse().ok()?])
+    };
     let mut list = std::env::args().skip(1);
     while let Some(arg) = list.next() {
         match arg.as_str() {
@@ -34,7 +48,19 @@ fn main() -> eframe::Result {
             "--join" => args.join = list.next(),
             "--production" => args.production = true,
             "--login" => args.login = true,
+            "--broadcast" => args.broadcast = list.next().and_then(|window| window.parse().ok()),
+            "--sound" => args.sound = true,
+            "--mute" => args.mute = true,
+            "--watch-all" => args.watch_all = true,
+            "--stats" => args.stats = true,
+            "--exit-after" => args.exit_after = list.next().and_then(|seconds| seconds.parse().ok()),
+            "--shot-after" => args.shot_after = list.next().and_then(|seconds| seconds.parse().ok()),
+            "--cpu-video" => args.cpu_video = true,
             "--site" => args.site = list.next(),
+            // Onde abrir a janela ("x,y") e de que tamanho ("largura,altura"): os testes abrem fora da
+            // tela, para não aparecer para quem está usando o computador.
+            "--position" => position = list.next().and_then(|text| pair(&text)),
+            "--size" => size = list.next().and_then(|text| pair(&text)).unwrap_or(size),
             _ => {}
         }
     }
@@ -42,13 +68,14 @@ fn main() -> eframe::Result {
         .map(|img| img.to_rgba8())
         .map(|img| egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
         .unwrap_or_default();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Nimbo")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([760.0, 520.0])
-            .with_icon(icon),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Nimbo")
+        .with_inner_size(size)
+        .with_min_inner_size([760.0, 520.0])
+        .with_icon(icon);
+    if let Some(at) = position {
+        viewport = viewport.with_position(at).with_active(false);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("Nimbo", options, Box::new(|cc| Ok(Box::new(app::Nimbo::new(cc, args)))))
 }

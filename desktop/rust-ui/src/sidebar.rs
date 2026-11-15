@@ -7,6 +7,7 @@ use egui::{Align2, CursorIcon, Rect, Sense, TextureHandle, Ui, pos2, vec2};
 use lucide_icons::Icon;
 use nimbo_core::community::Snapshot;
 
+use crate::live::BroadcastState;
 use crate::theme;
 use crate::widgets::{avatar, icon, icon_button, icon_button_at, live_count, live_pill};
 
@@ -16,6 +17,11 @@ pub enum Action {
     Join(String),
     Watch(String, String),
     Leave,
+    /// Abre ou fecha uma live no palco (a chave é "uid:screen" ou "uid:camera").
+    ToggleLive(String),
+    /// "Tentar de novo" nas lives de uma pessoa.
+    RetryLive(String),
+    StopBroadcast,
     OpenAdmin,
     EditProfile,
     SignOut,
@@ -25,6 +31,8 @@ pub enum Action {
 pub struct Connection<'a> {
     pub online: bool,
     pub channel: &'a str,
+    /// Como está a transmissão desta pessoa, se houver.
+    pub broadcasting: Option<BroadcastState>,
 }
 
 pub struct Sidebar<'a> {
@@ -251,11 +259,14 @@ impl Sidebar<'_> {
     fn connection(&self, ui: &mut Ui, actions: &mut Vec<Action>, connection: &Connection<'_>) {
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::hover());
         let painter = ui.painter().clone();
-        painter.hline(rect.x_range(), rect.bottom() - 0.5, (1.0, theme::BORDER));
-        let (glyph, color, status) = if connection.online {
-            (Icon::Signal, theme::SUCCESS, "Conectado")
-        } else {
-            (Icon::WifiOff, theme::WARNING, "Reconectando…")
+        if !matches!(connection.broadcasting, Some(BroadcastState::Starting | BroadcastState::Live)) {
+            painter.hline(rect.x_range(), rect.bottom() - 0.5, (1.0, theme::BORDER));
+        }
+        let live = matches!(connection.broadcasting, Some(BroadcastState::Starting | BroadcastState::Live));
+        let (glyph, color, status) = match (connection.online, live) {
+            (false, _) => (Icon::WifiOff, theme::WARNING, "Reconectando…"),
+            (true, true) => (Icon::Signal, theme::LIVE, "Ao vivo"),
+            (true, false) => (Icon::Signal, theme::SUCCESS, "Conectado"),
         };
         icon(&painter, pos2(rect.left() + 10.0 + 15.0, rect.center().y), glyph, 16.0, color);
         let left = rect.left() + 10.0 + 30.0 + 8.0;
@@ -270,6 +281,24 @@ impl Sidebar<'_> {
         let response = ui.interact(button, ui.scope_id().with("sair-do-canal"), Sense::click());
         if icon_button_at(ui, button, response, Icon::PhoneOff, 16.0, "Sair do canal", true).clicked() {
             actions.push(Action::Leave);
+        }
+        // Com uma transmissão no ar: o botão de encerrar, como "Encerrar" no site.
+        if live {
+            ui.add_space(8.0);
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+            let button = Rect::from_min_max(pos2(row.left() + 10.0, row.top()), pos2(row.right() - 10.0, row.bottom()));
+            let response = ui.interact(button, ui.scope_id().with("encerrar-live"), Sense::click());
+            ui.painter().rect_filled(button, 8.0, if response.hovered() { theme::LIVE.gamma_multiply(0.85) } else { theme::LIVE });
+            let label = ui.painter().layout_no_wrap("Encerrar".to_owned(), theme::semibold(13.0), egui::Color32::WHITE);
+            let x = button.center().x - (18.0 + 6.0 + label.size().x) / 2.0;
+            icon(ui.painter(), pos2(x + 9.0, button.center().y), Icon::MonitorOff, 18.0, egui::Color32::WHITE);
+            ui.painter().galley(pos2(x + 24.0, button.center().y - label.size().y / 2.0), label, egui::Color32::WHITE);
+            if response.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Encerrar transmissão").clicked() {
+                actions.push(Action::StopBroadcast);
+            }
+            ui.add_space(8.0);
+            let line = ui.max_rect();
+            ui.painter().hline(line.x_range(), ui.cursor().top() - 0.5, (1.0, theme::BORDER));
         }
     }
 
