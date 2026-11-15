@@ -344,6 +344,10 @@ describe('salas', () => {
     await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, app: 51 }));
     await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, app: 'x'.repeat(33) }));
     await assertFails(set(ref(member(), 'rooms/geral/members/member'), { app: '0.5.1' }));
+    // Identificador da sessão: texto curto.
+    await assertSucceeds(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, app: 'navegador', sid: 'a1b2c3d4e5f6' }));
+    await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, sid: 12 }));
+    await assertFails(set(ref(member(), 'rooms/geral/members/member'), { joinedAt: 1, sid: 'x'.repeat(25) }));
   });
   test('sair é sempre permitido, mesmo após perder o acesso', async () => {
     await env.withSecurityRulesDisabled((ctx) =>
