@@ -1862,7 +1862,9 @@ mod tests {
         // Tela parada por 5 s; depois, quadros a cada 4 ms. Em 100 ms passam no máximo 8 (seis no
         // ritmo e a folga de um intervalo), não os 25 que chegaram.
         let resume = start + Duration::from_secs(5);
-        let passed = (0..25).filter(|i| pacer.accept(resume + Duration::from_millis(4 * i), 60)).count();
+        let passed = (0..25)
+            .filter(|i| pacer.accept(resume + Duration::from_millis(4 * i), 60))
+            .count();
         assert!((6..=8).contains(&passed), "{passed}");
     }
 
