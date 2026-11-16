@@ -7,3 +7,4 @@ pub mod loopback;
 pub mod policy;
 pub mod scheme;
 pub mod shell;
+pub mod sources;
