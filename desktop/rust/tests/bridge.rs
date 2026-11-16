@@ -1,7 +1,7 @@
 //! Portable bridge v1 dispatcher (CP2 S1). These drive the same pure dispatcher the Windows host
 //! uses; they are NOT evidence that WebView2 delivered, attributed or injected anything.
 use nimbo_desktop::bridge::*;
-use nimbo_desktop::login::{CallbackDecision, Caller, Credential, Hooks, LoginFlow};
+use nimbo_desktop::login::{CallbackDecision, Caller, Credential, Hooks, LoginFlow, Scheme};
 use nimbo_desktop::loopback::SecretBuf;
 use nimbo_desktop::policy::{
     BRIDGE_METHOD_NAMES, Config, Feature, HOSTED_URL, NativeRequest, feature_methods,
@@ -45,7 +45,7 @@ fn flow_with_rng(ok: Arc<AtomicBool>) -> LoginFlow {
         drop(job);
         Ok(())
     });
-    LoginFlow::new(hooks)
+    LoginFlow::new(hooks, Scheme::Release)
 }
 fn release(flow: LoginFlow) -> Dispatcher {
     Dispatcher::new(Rc::new(Config::release()), flow)

@@ -65,7 +65,7 @@ fn rig_with(run_real: bool, bind: Option<Bind>) -> Rig {
     if let Some(bind) = bind {
         hooks.bind = bind;
     }
-    let flow = LoginFlow::new(hooks);
+    let flow = LoginFlow::new(hooks, Scheme::Release);
     *flow_slot.lock().unwrap() = Some(flow.clone());
     Rig {
         flow,
@@ -542,6 +542,11 @@ fn host_source_wires_login_handoff_timer_shutdown_and_redaction() {
     assert!(flat.contains("BCryptGenRandom(None,buf,BCRYPT_USE_SYSTEM_PREFERRED_RNG)"));
     // Release limits only: the host never shrinks receiver limits.
     assert!(!src.contains("set_limits"));
+    // S3 (source-policy, not native): the second-instance link consumes the slot through
+    // instance_proc -> copydata -> activate_link -> LoginFlow::activate.
+    assert!(body("instance_proc").contains("copydata(lparam)"));
+    assert!(body("copydata").contains("activate_link(&link)"));
+    assert!(body("activate_link").contains(".activate(link,now_ms())"));
     let proc_ = body("main_proc");
     let login = proc_.find("WM_APP_LOGIN=>").expect("WM_APP_LOGIN handler");
     let timer = proc_.find("WM_TIMER").expect("WM_TIMER handler");

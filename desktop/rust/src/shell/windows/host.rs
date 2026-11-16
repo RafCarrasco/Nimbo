@@ -6,20 +6,24 @@
 //! WebMessageReceived. CP2 S2-core adds the browser-login receiver wiring: a `LoginFlow` whose
 //! receiver threads wake this UI thread with `WM_APP_LOGIN` (PostMessageW, never blocking), a
 //! 1 s `WM_TIMER` fallback, and bounded shutdown after the message loop. Execution of all of
-//! this is a Windows NATIVE-GATE. NOT here: deep-link/activation handling or protocol
-//! registration (S3), capture/audio/game watch, updater/installer.
+//! this is a Windows NATIVE-GATE. CP2 S3 adds the state-only activation link: a second instance
+//! forwards it as a bounded WM_COPYDATA decided from the header alone (`plan_copydata`), the
+//! first instance consumes the one-shot login slot and focuses; release builds conservatively
+//! self-register `HKCU\Software\Classes\golive` (`crate::scheme`). NOT here: capture/audio/
+//! game watch, updater/installer.
 //! A debug-only `test-host` build replaces the hosted URL with a loopback fixture, keeps every
 //! file under an owned scratch directory and records external opens instead of launching them.
 use crate::bridge::{self, Dispatcher, Outbound};
-use crate::login::{Hooks, LoginFlow, Notify};
+use crate::login::{Activation, ActivationLink, Hooks, LoginFlow, Notify, Scheme};
 use crate::policy::{
     BROWSER_ARGUMENTS, CaptureDecision, Config, KeyAction, KeyInput, MAIN_WINDOW, Navigation,
     Permission, PermissionDecision, accelerator, user_agent, webview2_permission,
     webview2_permission_kind,
 };
 use crate::shell::{
-    AsyncWaitEnd, Guards, InstanceIdentity, InstanceRequest, Rect, Startup, StartupFailure,
-    colorref, initial_window_rect, instance_request, min_track_size, window_title,
+    AsyncWaitEnd, FOCUS_REQUEST, Guards, InstanceIdentity, InstanceRequest, LINK_REQUEST, Rect,
+    Startup, StartupFailure, colorref, initial_window_rect, instance_request, min_track_size,
+    plan_copydata, window_title,
 };
 use std::{
     cell::RefCell,
@@ -89,6 +93,10 @@ struct State {
     /// receiver thread can never post to a destroyed (and possibly reused) handle.
     notify_target: Arc<Mutex<Option<isize>>>,
 }
+
+/// Activation scheme of this process (release `golive` or this test directory's isolated
+/// scheme); set once in `run` before any window exists.
+static LINK_SCHEME: OnceLock<Scheme> = OnceLock::new();
 
 /// One monotonic clock for the dispatcher and the login flow (`Instant`-based ms).
 fn now_ms() -> u64 {
@@ -167,15 +175,27 @@ struct Launch {
     identity: InstanceIdentity,
     user_data: PathBuf,
     test_host: bool,
+    scheme: Scheme,
+    /// A valid activation link argument (state only; never logged).
+    link: Option<ActivationLink>,
+    #[cfg(feature = "test-host")]
+    scheme_op: Option<crate::shell::SchemeOp>,
+    #[cfg(feature = "test-host")]
+    dir: PathBuf,
 }
 
 #[cfg(not(feature = "test-host"))]
 fn launch(args: &[OsString]) -> std::result::Result<Launch, &'static str> {
+    use crate::shell::LinkArg;
     let summary = crate::shell::classify_args(args);
-    if summary.link == crate::shell::LinkArg::GoliveDeferred {
-        // Recognized syntax only. Deep-link auth is a later, separately approved checkpoint.
-        event("deferred-golive-link", None);
-    }
+    let link = match summary.link {
+        LinkArg::Link(link) => Some(link),
+        LinkArg::Malformed => {
+            event("link-ignored", None);
+            None
+        }
+        LinkArg::None => None,
+    };
     for _ in 0..summary.ignored {
         event("ignored-argument", None);
     }
@@ -187,6 +207,8 @@ fn launch(args: &[OsString]) -> std::result::Result<Launch, &'static str> {
             .join("Nimbo")
             .join("WebView2"),
         test_host: false,
+        scheme: Scheme::Release,
+        link,
     })
 }
 
@@ -203,6 +225,10 @@ fn launch(args: &[OsString]) -> std::result::Result<Launch, &'static str> {
         user_data: parsed.dir.join("webview2"),
         config: Rc::new(parsed.config),
         test_host: true,
+        scheme: Scheme::test_host(&parsed.dir),
+        link: parsed.link,
+        scheme_op: parsed.scheme_op,
+        dir: parsed.dir,
     })
 }
 
@@ -366,23 +392,33 @@ fn acquire_instance(identity: &InstanceIdentity) -> Result<Option<InstanceLock>>
     }
 }
 
-/// Second instance: ask the first to focus itself (main.cjs:28-36), then quit.
-fn forward_focus(identity: &InstanceIdentity) {
+/// Second instance: ask the first to focus itself (main.cjs:28-36) and, with a valid link,
+/// forward the canonical link (UTF-16LE, at most 188 bytes) for the one-shot slot; then quit.
+fn forward_focus(identity: &InstanceIdentity, link: Option<&ActivationLink>) {
     let class = HSTRING::from(&identity.class);
+    // Owned buffer that outlives the synchronous send.
+    let payload: Vec<u8> = link.map(ActivationLink::utf16le).unwrap_or_default();
+    let data = match link {
+        Some(_) => COPYDATASTRUCT {
+            dwData: LINK_REQUEST,
+            cbData: u32::try_from(payload.len()).unwrap_or(0),
+            lpData: payload.as_ptr() as *mut _,
+        },
+        None => COPYDATASTRUCT {
+            dwData: FOCUS_REQUEST,
+            cbData: 0,
+            lpData: std::ptr::null_mut(),
+        },
+    };
     for _ in 0..50 {
-        // SAFETY: message-only window lookup and a bounded synchronous WM_COPYDATA without
-        // payload; the COPYDATASTRUCT outlives the call.
+        // SAFETY: message-only window lookup and a bounded synchronous WM_COPYDATA; the
+        // COPYDATASTRUCT and its payload buffer outlive the call.
         unsafe {
             if let Ok(target) = FindWindowExW(Some(HWND_MESSAGE), None, &class, PCWSTR::null()) {
                 let mut pid = 0;
                 GetWindowThreadProcessId(target, Some(&mut pid));
                 // Let the first instance take the foreground (as Chromium's singleton does).
                 let _ = AllowSetForegroundWindow(pid);
-                let data = COPYDATASTRUCT {
-                    dwData: crate::shell::FOCUS_REQUEST,
-                    cbData: 0,
-                    lpData: std::ptr::null_mut(),
-                };
                 SendMessageTimeoutW(
                     target,
                     WM_COPYDATA,
@@ -392,7 +428,11 @@ fn forward_focus(identity: &InstanceIdentity) {
                     5000,
                     None,
                 );
-                event("single-instance-forwarded", None);
+                if link.is_some() {
+                    event("single-instance-forwarded-link", None);
+                } else {
+                    event("single-instance-forwarded", None);
+                }
                 return;
             }
         }
@@ -525,22 +565,63 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
 
 extern "system" fn instance_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_COPYDATA {
-        // SAFETY: for WM_COPYDATA, lparam points to a COPYDATASTRUCT valid during the call.
-        let request = unsafe { (lparam.0 as *const COPYDATASTRUCT).as_ref() }
-            .and_then(|d| instance_request(d.dwData, d.cbData));
-        return match request {
-            Some(InstanceRequest::Focus) => {
-                focus_main();
-                LRESULT(1)
-            }
-            None => {
-                event("instance-message-ignored", None);
-                LRESULT(0)
-            }
-        };
+        return copydata(lparam);
     }
     // SAFETY: default processing of our own window's message.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// WM_COPYDATA from a second instance (UI thread, inside the sender's SendMessageTimeout). The
+/// header alone decides (`plan_copydata`) whether the payload may be read; the only read is one
+/// bounded byte copy inside the reader closure. No lock or RefCell borrow is held across COM,
+/// sockets or waits; a link is never queued (a second attempt would be a second activation).
+fn copydata(lparam: LPARAM) -> LRESULT {
+    if lparam.0 == 0 {
+        event("instance-message-ignored", None);
+        return LRESULT(0);
+    }
+    // SAFETY: for WM_COPYDATA, lparam points to a COPYDATASTRUCT valid during the call; only the
+    // header is copied by value (unaligned-safe), lpData is used as a pointer value only.
+    let header = unsafe { std::ptr::read_unaligned(lparam.0 as *const COPYDATASTRUCT) };
+    let source = header.lpData as *const u8;
+    let plan = plan_copydata(header.dwData, header.cbData, source.is_null());
+    let Some(scheme) = LINK_SCHEME.get().copied() else {
+        event("instance-message-ignored", None);
+        return LRESULT(0);
+    };
+    let request = instance_request(plan, scheme, |len| {
+        // SAFETY: `plan` admitted exactly this even 2..=512 byte length with a non-null pointer;
+        // the sender's buffer is valid and read-only for the duration of WM_COPYDATA. Bytes are
+        // decoded pairwise later: no u16 alignment is assumed.
+        let bytes = unsafe { std::slice::from_raw_parts(source, len) };
+        Some(bytes.to_vec())
+    });
+    match request {
+        Some(InstanceRequest::Focus) => {
+            focus_main();
+            LRESULT(1)
+        }
+        Some(InstanceRequest::Link(link)) => {
+            activate_link(&link);
+            focus_main();
+            LRESULT(1)
+        }
+        None => {
+            event("instance-message-ignored", None);
+            LRESULT(0)
+        }
+    }
+}
+
+/// One short borrow clones the flow handle (an Arc bump); the slot is consumed after the borrow
+/// ended. A missing flow/state (startup, re-entered borrow, shutdown) drops the link.
+fn activate_link(link: &ActivationLink) {
+    let login = with_state(|s| s.login.clone()).flatten();
+    let code = match login.map(|l| l.activate(link, now_ms())) {
+        Some(Activation::Activated) => "link-activated",
+        Some(Activation::Ignored) | None => "link-ignored",
+    };
+    event(code, None);
 }
 
 // ---------- window creation ----------
@@ -1126,10 +1207,15 @@ pub fn run(args: &[OsString]) -> ExitCode {
             return ExitCode::from(64);
         }
     };
+    let _ = LINK_SCHEME.set(launch.scheme);
+    #[cfg(feature = "test-host")]
+    if let Some(op) = launch.scheme_op {
+        return test_host_scheme(&launch, op);
+    }
     let lock = match acquire_instance(&launch.identity) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            forward_focus(&launch.identity);
+            forward_focus(&launch.identity, launch.link.as_ref());
             return ExitCode::SUCCESS;
         }
         Err(_) => {
@@ -1137,6 +1223,12 @@ pub fn run(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if launch.link.is_some() {
+        // Cold start through a link: normal start, the link is dropped (no slot exists yet).
+        event("link-cold-start", None);
+    }
+    #[cfg(not(feature = "test-host"))]
+    register_scheme();
     let result = run_window(&launch);
     drop(lock);
     match result {
@@ -1153,6 +1245,41 @@ pub fn run(args: &[OsString]) -> ExitCode {
             ExitCode::from(failure.exit_status())
         }
     }
+}
+
+/// Release first instance only: conservative per-user registration; never fatal, login does
+/// not depend on it.
+#[cfg(not(feature = "test-host"))]
+fn register_scheme() {
+    if let Some(code) = crate::scheme::native::register_release() {
+        event(code, None);
+    }
+}
+
+/// `--test-host-scheme register|unregister`: only this directory's isolated key, no window.
+#[cfg(feature = "test-host")]
+fn test_host_scheme(launch: &Launch, op: crate::shell::SchemeOp) -> ExitCode {
+    use crate::scheme::native;
+    let url = launch.config.start_url();
+    let (code, status) = match op {
+        crate::shell::SchemeOp::Register => {
+            match native::register_test_host(launch.scheme, url, &launch.dir) {
+                Ok(code) => (code, 0),
+                Err(code) => (Some(code), 65),
+            }
+        }
+        crate::shell::SchemeOp::Unregister => {
+            let code = native::unregister_test_host(launch.scheme, url, &launch.dir);
+            (
+                Some(code),
+                if code == "scheme-unregistered" { 0 } else { 65 },
+            )
+        }
+    };
+    if let Some(code) = code {
+        event(code, None);
+    }
+    ExitCode::from(status)
 }
 
 fn run_window(launch: &Launch) -> std::result::Result<(), StartupFailure> {
@@ -1232,11 +1359,14 @@ fn start_webview(launch: &Launch, main: HWND) -> std::result::Result<(), Startup
     // SAFETY: live controller on its UI thread.
     let core = unsafe { controller.CoreWebView2() }.map_err(|_| Fatal("webview2-core-failed"))?;
     let target = with_state(|s| s.notify_target.clone()).ok_or(Fatal("state-missing"))?;
-    let login = LoginFlow::new(Hooks::new(
-        Arc::new(bcrypt_rng),
-        login_notifier(target),
-        Arc::new(now_ms),
-    ));
+    let login = LoginFlow::new(
+        Hooks::new(
+            Arc::new(bcrypt_rng),
+            login_notifier(target),
+            Arc::new(now_ms),
+        ),
+        launch.scheme,
+    );
     let dispatcher = Rc::new(RefCell::new(Dispatcher::new(
         launch.config.clone(),
         login.clone(),

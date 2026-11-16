@@ -32,6 +32,22 @@ const DONE_PAGE = mainCjs.slice(mainCjs.indexOf('const LOGIN_DONE_PAGE = `') + 2
 const ALICE = 'alice@nimbo.test';
 const ALICE_ID_TOKEN = JSON.stringify({ sub: 'dev-alice', email: ALICE, email_verified: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/**
+ * S3 Deliver page (D1=B1): NOT the plain page; the login state exactly once, only inside the
+ * a#open href of this host's ISOLATED scheme; both Electron sentences; no token/identity data.
+ * Returns sanitized booleans only (the href/state is never retained in evidence).
+ */
+function assertActivationPage(body, html, state) {
+  assert.notEqual(body, DONE_PAGE, 'Deliver serves the S3 activation page, not the plain page');
+  const href = /<a id="open" href="([^"]+)" rel="noreferrer">Abrir o app<\/a>/.exec(body)?.[1] || '';
+  assert.ok(new RegExp(`^golive-testhost-[0-9a-f]{16}://auth\\?state=${state}$`).test(href), 'href is the isolated state-only activation link');
+  assert.equal(body.split(state).length - 1, 1, 'state exactly once in the response (inside href)');
+  assert.equal(html.split(state).length - 1, 1, 'state exactly once in the rendered document (inside href)');
+  assert.ok(!body.includes('golive://'), 'never the real scheme');
+  for (const text of ['Pronto, você entrou.', 'Pode fechar esta aba e voltar ao app Nimbo.', 'Abrir o app']) assert.ok(body.includes(text), text);
+  for (const secret of [ALICE_ID_TOKEN, 'alice@nimbo.test', 'idToken', 'dev-alice']) assert.ok(!body.includes(secret) && !html.includes(secret), 'page carries no token/identity');
+  return { activation_page: true, state_once_in_isolated_href: true };
+}
 async function until(test, what, ms = 15000) {
   for (const end = Date.now() + ms; !test(); await sleep(20)) if (Date.now() > end) throw new Error('timed out waiting for ' + what);
 }
@@ -130,7 +146,7 @@ function audit(label, required, { run = auditProc, into = ev.audits } = {}) {
   assert.equal(a.pass, true, `${label}: complete clean audit (no unread or unresolved live-process input)`);
 }
 
-describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outside the isolated network-none container: ' + GUARD.reasons.join('; ') }, () => {
+describe('S3 L5 consumer', { skip: GUARD.ok ? false : 'refused outside the isolated network-none container: ' + GUARD.reasons.join('; ') }, () => {
   before(async () => {
     assert.ok(fs.existsSync(path.join(DIST, 'index.html')), 'emulator-mode bundle prebuilt at ' + DIST);
     const ready = await (await fetch(AUTH + '/')).json();
@@ -207,14 +223,14 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
       const codesFrom = h.codes.length, credentialResults = h.toPage.filter((m) => m.value?.idToken).length;
       const r = await produce(login.url);
       assert.equal(r.req.status, 200);
-      assert.equal(r.body, DONE_PAGE);
+      assertActivationPage(r.body, r.html, login.state); // still Deliver at the receiver
       await h.waitCode('login-result-dropped-stale', codesFrom);
       await sleep(500);
       assert.equal(h.toPage.filter((m) => m.value?.idToken).length, credentialResults, 'no credential result posted to any document');
       assert.equal(await appEval(loginScreenIdle), true, 'still LoginScreen');
       assert.ok(!(await appText()).includes('Aguardando aprovação'));
       assert.deepEqual(await emulatorAccounts(), { status: 200, users: [] }, 'no Auth emulator account was created');
-      ev.steps.push({ step: 'reload-stale', login_url: redact(login.url), gen_before: genBefore, gen_after: h.gen, done_page: true,
+      ev.steps.push({ step: 'reload-stale', login_url: redact(login.url), gen_before: genBefore, gen_after: h.gen, activation_page: true,
         code: 'login-result-dropped-stale', accounts_after: 0 });
     });
 
@@ -234,8 +250,7 @@ describe('S2-integration L5 consumer', { skip: GUARD.ok ? false : 'refused outsi
       const good = await produce(login.url);
       assert.equal(good.req.status, 200);
       assert.equal(good.req.origin, ORIGIN);
-      assert.equal(good.body, DONE_PAGE);
-      for (const s of [login.state, ALICE_ID_TOKEN]) assert.ok(!good.html.includes(s), 'done page has no token/state');
+      assertActivationPage(good.body, good.html, login.state);
       await appHas('Aguardando aprovação', 30000);
       await appHas(ALICE);
       // Receiver codes reach stderr at the next drain (the success notify), not at the 403 itself.

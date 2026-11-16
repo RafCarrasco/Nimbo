@@ -5,6 +5,7 @@
 // Firebase sign-in: LOGIN NOT DELIVERED until the real producer/consumer proof (S2-integration).
 // Synthetic credentials only. Login URLs carry the single-use state: they are never printed.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
@@ -27,6 +28,19 @@ const DONE_PAGE = mainCjs.slice(mainCjs.indexOf('const LOGIN_DONE_PAGE = `') + 2
 const CANCELLED = 'Login cancelado.', EXPIRED = 'O login expirou. Tente de novo.';
 const MISSING = 'O Google não devolveu a credencial. Tente de novo.';
 const STATE = /^[0-9a-f]{48}$/;
+// S3: the example's isolated activation scheme, recomputed here (FNV-1a 64 of its fixed seed).
+function fnv1a64(seed) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of Buffer.from(seed)) h = ((h ^ BigInt(b)) * 0x100000001b3n) & 0xffffffffffffffffn;
+  return h.toString(16).padStart(16, '0');
+}
+const SCHEME = 'golive-testhost-' + fnv1a64('bridge-stdio');
+const SCRIPT = "(function(){var a=document.getElementById('open');if(a&&a.href){location.href=a.href;}})();";
+const CSP = `default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-${createHash('sha256').update(SCRIPT).digest('base64')}'; base-uri 'none'; form-action 'none'`;
+/** The activation page's anchor href (the state-only link); never printed. */
+const hrefOf = (body) => body.match(/<a id="open" href="([^"]+)" rel="noreferrer">Abrir o app<\/a>/)?.[1];
+/** Same link with one state hex digit changed. */
+const forge = (href) => href.replace(/state=(.)/, (_, c) => 'state=' + (c === 'a' ? 'b' : 'a'));
 
 // Prebuilt example binary: the override, else the debug example `buildExample` produced.
 const targetDir = process.env.CARGO_TARGET_DIR || fileURLToPath(new URL('../rust/target', import.meta.url));
@@ -56,7 +70,7 @@ function post(port, body, { method = 'POST', path: target = '/callback', headers
       let data = '';
       res.setEncoding('utf8');
       res.on('data', (c) => { data += c; });
-      res.on('end', () => resolve({ status: res.statusCode, type: res.headers['content-type'], body: data }));
+      res.on('end', () => resolve({ status: res.statusCode, type: res.headers['content-type'], headers: res.headers, body: data }));
     });
     req.on('error', reject);
     req.end(body);
@@ -118,15 +132,87 @@ test(LABEL + 'event-loop delivery: valid POST -> result with NO further host inp
   h.quiet = false;
   assert.equal(res.status, 200);
   assert.equal(res.type, 'text/html; charset=utf-8');
-  assert.equal(res.body, DONE_PAGE, 'done page byte-identical to main.cjs LOGIN_DONE_PAGE');
+  // S3 Deliver: the app-served activation page (D1=B1), not the plain Electron page.
+  assert.notEqual(res.body, DONE_PAGE, 'Deliver serves the activation page');
+  assert.equal(hrefOf(res.body), `${SCHEME}://auth?state=${login.state}`, 'href is the isolated state-only link');
+  assert.equal(res.body.split(login.state).length - 1, 1, 'state exactly once (inside href)');
+  for (const text of ['Pronto, você entrou.', 'Pode fechar esta aba e voltar ao app Nimbo.', 'Se o Nimbo não voltou para a frente, clique em Abrir o app.']) assert.ok(res.body.includes(text), text);
+  assert.equal(res.headers['content-security-policy'], CSP, 'CSP pins the sha256 of the inline script');
+  assert.equal(res.headers['referrer-policy'], 'no-referrer');
+  const scripts = [...res.body.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  assert.deepEqual(scripts, [SCRIPT], 'exactly the pinned script');
+  assert.ok(Buffer.byteLength(res.body) <= 4096, 'page within 4 KiB');
   assert.ok(!res.body.includes('synthetic'));
+  assert.ok(!res.body.includes('golive://'), 'never the real scheme in the test host');
   assert.deepEqual(plain(signIn.value), { ok: true, value: { idToken: 'synthetic-id', accessToken: 'synthetic-access' } });
   await refused(login.port);
   for (const code of ['login-begin', 'login-credential-delivered', 'login-result-posted']) assert.ok(h.codes.includes(code), code);
   assertPrivate(h, [login.state, 'synthetic-id', 'synthetic-access']);
   assertOneResultPerSignIn(h, page);
   const stats = await h.stats();
-  assert.equal(stats.activation, true, 'activation slot reserved (S3 consumer absent)');
+  assert.equal(stats.activation, true, 'activation slot reserved before activation');
+});
+
+test(LABEL + 'activation link: exactly one activation, replay and forged links are ignored, slot cleared', async (t) => {
+  const { h, bridge } = await ready(t);
+  const signIn = settled(bridge.signIn());
+  const login = await h.loginUrl(0);
+  const res = await post(login.port, form({ state: login.state, idToken: 'synthetic-id', accessToken: 'synthetic-access' }));
+  const href = hrefOf(res.body);
+  assert.ok(href, 'activation page href');
+  await waitFor(() => signIn.done, 'signIn result');
+  assert.equal((await h.stats()).activation, true);
+  const send = async (link, code) => {
+    const from = h.codes.length;
+    h.link(link);
+    await h.waitCode(code, from);
+    assert.ok(!h.codes.slice(from).includes(code === 'link-activated' ? 'link-ignored' : 'link-activated'));
+  };
+  await send(forge(href), 'link-ignored');
+  assert.equal((await h.stats()).activation, true, 'a forged link never consumes the slot');
+  await send(href.replace(SCHEME, 'golive'), 'link-ignored');
+  await send(href, 'link-activated');
+  assert.equal((await h.stats()).activation, false, 'slot consumed');
+  await send(href, 'link-ignored');
+  assertPrivate(h, [login.state, 'synthetic-id', 'synthetic-access']);
+  // A new signIn clears an unconsumed slot of the previous login.
+  const second = settled(bridge.signIn());
+  const login2 = await h.loginUrl(1);
+  const href2 = hrefOf((await post(login2.port, form({ state: login2.state, idToken: 'synthetic-id' }))).body);
+  await waitFor(() => second.done, 'second result');
+  assert.equal((await h.stats()).activation, true);
+  const third = settled(bridge.signIn());
+  await h.loginUrl(2);
+  assert.equal((await h.stats()).activation, false, 'new login cleared the slot');
+  await send(href2, 'link-ignored');
+  assert.equal(third.done, false);
+  assertPrivate(h, [login.state, login2.state, 'synthetic-id', 'synthetic-access']);
+});
+
+test(LABEL + 'non-Deliver 200 pages stay the plain Electron page (no link, no state)', async (t) => {
+  const { h, bridge } = await ready(t);
+  const signIn = settled(bridge.signIn());
+  const login = await h.loginUrl();
+  // A connection accepted BEFORE delivery, completed after it: login no longer pending.
+  const late = net.connect(login.port, '127.0.0.1');
+  const chunks = [];
+  late.on('data', (c) => chunks.push(c));
+  const closed = new Promise((resolve) => { late.on('close', resolve); late.on('error', resolve); });
+  late.write('POST /callback HTTP/1.1\r\n');
+  await sleep(150); // accepted and registered by the acceptor (20 ms poll) before delivery
+  const res = await post(login.port, form({ state: login.state, idToken: 'synthetic-id' }));
+  assert.ok(hrefOf(res.body), 'the delivering POST gets the activation page');
+  const body = form({ state: login.state, idToken: 'synthetic-second' });
+  late.end(`Host: 127.0.0.1:${login.port}\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+  await closed;
+  const text = Buffer.concat(chunks).toString('utf8');
+  assert.ok(text.startsWith('HTTP/1.1 200 OK\r\n'), 'late POST answered 200');
+  assert.ok(text.endsWith(DONE_PAGE), 'plain Electron page on the not-pending path');
+  assert.ok(!text.includes(login.state) && !text.includes('Content-Security-Policy'), 'no link on non-Deliver 200');
+  await waitFor(() => signIn.done, 'one result');
+  assert.deepEqual(plain(signIn.value), { ok: true, value: { idToken: 'synthetic-id', accessToken: '' } });
+  h.control('tick 1'); // receiver codes reach stderr at the next host drain
+  await h.waitCode('login-ignored-not-pending');
 });
 
 test(LABEL + 'contracts tests 3/4 equivalents: 404s, 403 invalid link, missing idToken', async (t) => {

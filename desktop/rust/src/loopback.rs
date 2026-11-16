@@ -4,7 +4,7 @@
 //! WHATWG form decoding, a constant-time state compare and fixed responses that never echo the
 //! request. Fail closed: anything unexpected gets a fixed error or a silent close. The 200 page
 //! means only "the receiver answered"; it is NOT Firebase sign-in success.
-use crate::login::{CallbackDecision, Credential, LoginFlow, Slot};
+use crate::login::{ActivationLink, CallbackDecision, Credential, LoginFlow, Slot};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -47,6 +47,57 @@ pub const LOGIN_DONE_PAGE: &str = concat!(
     "<p>Pode fechar esta aba e voltar ao app Nimbo.</p></div></body></html>",
 );
 const INVALID_LINK: &str = "Link de login inválido.";
+
+/// The pinned automatic attempt (plan §3.4, D3): one assignment after load, no timer, no
+/// retry, no fetch. Its sha256 is the only script the page's CSP allows.
+pub const ACTIVATION_SCRIPT: &str = activation_script!();
+macro_rules! activation_script {
+    () => {
+        "(function(){var a=document.getElementById('open');if(a&&a.href){location.href=a.href;}})();"
+    };
+}
+use activation_script;
+/// `sha256-<base64>` of `ACTIVATION_SCRIPT` (verified by tests with node:crypto).
+pub const ACTIVATION_SCRIPT_SHA256: &str = "6cCEyc9Ndvm2TD7IdRNHa5A+YZVh5ARQ/GN7l5azQA4=";
+pub const ACTIVATION_PAGE_CSP: &str = concat!(
+    "default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-",
+    "6cCEyc9Ndvm2TD7IdRNHa5A+YZVh5ARQ/GN7l5azQA4=",
+    "'; base-uri 'none'; form-action 'none'"
+);
+
+/// App-served completion page for the Deliver path (D1=B1): the Electron sentences, one
+/// visible "Abrir o app" anchor whose href is the state-only activation link, a hint and the
+/// pinned script. The canonical link is the ONLY substitution (lowercase scheme, `://auth?state=`
+/// and 48 lowercase hex), so no HTML escaping can be needed.
+pub fn activation_page(link: &ActivationLink) -> String {
+    let link = link.canonical();
+    debug_assert!(
+        link.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-:/?=".contains(&b)),
+        "canonical link needs no HTML escaping"
+    );
+    format!("{ACTIVATION_PAGE_HEAD}{link}{ACTIVATION_PAGE_TAIL}")
+}
+const ACTIVATION_PAGE_HEAD: &str = concat!(
+    "<!doctype html><html lang=\"pt-BR\"><head><meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Nimbo</title>\n",
+    "<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#eef1ff;\n",
+    "font-family:Inter,Segoe UI,system-ui,sans-serif}main{box-sizing:border-box;max-width:100%;padding:24px;text-align:center}\n",
+    "h1{font-size:22px;margin:0 0 8px}p{color:#9aa6c4;margin:0}\n",
+    "#open{display:inline-flex;align-items:center;justify-content:center;box-sizing:border-box;min-width:200px;\n",
+    "height:44px;margin:24px 0 12px;padding:0 20px;border-radius:10px;background:#1f2333;color:#fff;font-weight:600;\n",
+    "text-decoration:none;outline:none}#open:hover{background:#2a2f44}\n",
+    "#open:focus-visible{outline:2px solid #7c6cff;outline-offset:2px}.hint{font-size:14px}</style>\n",
+    "</head><body><main><h1>Pronto, você entrou.</h1>\n",
+    "<p>Pode fechar esta aba e voltar ao app Nimbo.</p>\n<a id=\"open\" href=\"",
+);
+const ACTIVATION_PAGE_TAIL: &str = concat!(
+    "\" rel=\"noreferrer\">Abrir o app</a>\n",
+    "<p class=\"hint\">Se o Nimbo não voltou para a frente, clique em Abrir o app.</p></main>\n",
+    "<script>",
+    activation_script!(),
+    "</script></body></html>",
+);
 
 // ---------- best-effort owned-buffer wiping ----------
 
@@ -357,13 +408,21 @@ pub fn check_form(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Response {
+    /// The plain Electron page (not pending, expired at callback).
     Done,
+    /// Deliver only: the activation page for the delivered login's state.
+    Activate(ActivationLink),
     Reject(Reject),
 }
 /// Fixed response bytes; empty means "close without a response".
 pub fn response_bytes(r: Response) -> Vec<u8> {
+    let page;
     let (status, content_type, body) = match r {
         Response::Done => ("200 OK", Some("text/html; charset=utf-8"), LOGIN_DONE_PAGE),
+        Response::Activate(link) => {
+            page = activation_page(&link);
+            ("200 OK", Some("text/html; charset=utf-8"), page.as_str())
+        }
         Response::Reject(Reject::StateRejected | Reject::OriginRejected) => (
             "403 Forbidden",
             Some("text/plain; charset=utf-8"),
@@ -378,8 +437,15 @@ pub fn response_bytes(r: Response) -> Vec<u8> {
     let content_type = content_type
         .map(|t| format!("Content-Type: {t}\r\n"))
         .unwrap_or_default();
+    let policy = if matches!(r, Response::Activate(_)) {
+        format!(
+            "Content-Security-Policy: {ACTIVATION_PAGE_CSP}\r\nReferrer-Policy: no-referrer\r\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "HTTP/1.1 {status}\r\n{content_type}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\n{content_type}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n{policy}\r\n{body}",
         body.len()
     )
     .into_bytes()
@@ -609,7 +675,23 @@ impl Worker {
             CallbackDecision::IgnoreNotPending => "login-ignored-not-pending",
             CallbackDecision::ExpiredAtCallback => "login-expired-at-callback",
         });
-        (Response::Done, Some(decision))
+        let response = match decision {
+            CallbackDecision::Deliver => self.deliver_page(),
+            CallbackDecision::IgnoreNotPending | CallbackDecision::ExpiredAtCallback => {
+                Response::Done
+            }
+        };
+        (response, Some(decision))
+    }
+
+    /// Deliver only: the page carries the state of the login just delivered (whose slot was
+    /// reserved under the same lock). Test-host builds never render the real `golive` scheme.
+    fn deliver_page(&self) -> Response {
+        let scheme = self.flow.scheme();
+        if cfg!(feature = "test-host") && !scheme.is_isolated() {
+            return Response::Done;
+        }
+        Response::Activate(ActivationLink::from_state(scheme, self.expected))
     }
 }
 

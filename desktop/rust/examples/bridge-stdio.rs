@@ -19,15 +19,17 @@
 //!   dump                         print dispatcher state
 //!   script                       print the injected script with the substituted origin
 //!   limits <key>=<n> ...         REAL receiver limits for later logins (test-only)
+//!   link <uri>                   second-instance activation link (S3): fixed code on stderr
 //!   stats                        print receiver counters
 //!   quit (or stdin EOF)          shutdown + bounded (2 s) wait, print the report, exit
 //! stdout: {"to":"page","msg":<json>} | {"login-url":<url>} | {"dump":{..}} | {"script":".."}
 //!         | {"stats":{..}} | {"shutdown":{"workers":N,"acceptors":M,"waited_ms":T}}
 //! stderr: nimbo-bridge: <fixed code> [count]
 use nimbo_desktop::bridge::{Dispatcher, DocumentState, Outbound, script};
-use nimbo_desktop::login::{Hooks, LoginFlow};
+use nimbo_desktop::login::{Activation, ActivationLink, Hooks, LoginFlow, Scheme};
 use nimbo_desktop::loopback::Limits;
 use nimbo_desktop::policy::{Config, NativeRequest};
+use nimbo_desktop::shell::test_host_hash;
 use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
@@ -38,6 +40,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const MAIN_FRAME: u32 = 7;
+/// Seed of this double's isolated activation scheme `golive-testhost-<FNV-1a(seed)>` (never the
+/// real `golive`); the Node tier recomputes the same hash.
+const STDIO_SCHEME_SEED: &[u8] = b"bridge-stdio";
 
 enum Event {
     Line(String),
@@ -93,6 +98,13 @@ fn urandom(buf: &mut [u8; 24]) -> bool {
         .is_ok()
 }
 
+fn link_code(flow: &LoginFlow, raw: &str, now: u64) -> &'static str {
+    match ActivationLink::parse(raw, flow.scheme()).map(|link| flow.activate(&link, now)) {
+        Ok(Activation::Activated) => "link-activated",
+        Ok(Activation::Ignored) | Err(_) => "link-ignored",
+    }
+}
+
 fn emit(out: &mut impl Write, results: Vec<Outbound>) {
     for result in results {
         match result {
@@ -133,11 +145,14 @@ fn main() -> ExitCode {
     let (tx, rx) = mpsc::channel::<Event>();
     let clock = Arc::new(AtomicU64::new(0));
     let (notify_tx, flow_clock) = (tx.clone(), clock.clone());
-    let flow = LoginFlow::new(Hooks::new(
-        Arc::new(urandom),
-        Arc::new(move || notify_tx.send(Event::Notify).is_ok()),
-        Arc::new(move || flow_clock.load(Ordering::SeqCst)),
-    ));
+    let flow = LoginFlow::new(
+        Hooks::new(
+            Arc::new(urandom),
+            Arc::new(move || notify_tx.send(Event::Notify).is_ok()),
+            Arc::new(move || flow_clock.load(Ordering::SeqCst)),
+        ),
+        Scheme::TestHost(test_host_hash(STDIO_SCHEME_SEED)),
+    );
     let mut d = Dispatcher::new(Rc::new(config), flow.clone());
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -194,6 +209,9 @@ fn main() -> ExitCode {
                 flow.set_limits(limits);
                 Vec::new()
             }),
+            // S3: the second-instance activation path through the REAL parser + LoginFlow slot.
+            // The link carries a state: stdin only, never echoed; stderr gets a fixed code.
+            ["link", raw] => Some(vec![Outbound::Code(link_code(&flow, raw, now))]),
             ["stats"] => {
                 let s = flow.stats();
                 let stats = json!({"workers": s.workers, "acceptors": s.acceptors,

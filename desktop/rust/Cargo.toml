@@ -4,7 +4,7 @@ version = "0.4.1"
 edition = "2024"
 rust-version = "1.99"
 publish = false
-description = "Nimbo Windows host shell (CP1 WebView2 window and policies; CP2 S1 bridge v1; CP2 S2-core loopback login receiver, not yet proven end to end; no capture/updater)"
+description = "Nimbo Windows host shell (CP1 WebView2 window and policies; CP2 S1 bridge v1; CP2 S2 loopback login receiver; CP2 S3 activation link, completion page and per-user scheme registration; Windows runtime not proven here; no capture/updater)"
 
 [features]
 # Debug-only isolated loopback test host. build.rs and a compile_error! reject release builds.
@@ -33,6 +33,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_Threading",
     "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_WinRT", "Win32_Security", "Win32_Security_Cryptography",
+    "Win32_System_Registry",
 ] }
 
 [build-dependencies]

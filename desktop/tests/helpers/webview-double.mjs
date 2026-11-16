@@ -134,6 +134,8 @@ export async function createBridgeHost(t, { bin = process.env.NIMBO_BRIDGE_STDIO
     await until(() => lastStats !== undefined, 'stats');
     return lastStats;
   };
+  // S3: forward an activation link as a second instance would (stdin only; never printed).
+  h.link = (uri) => h.control('link ' + uri);
   h.limits = (limits) => h.control('limits ' + Object.entries(limits).map(([k, v]) => `${k}=${v}`).join(' '));
   h.quit = async () => {
     h.control('quit');

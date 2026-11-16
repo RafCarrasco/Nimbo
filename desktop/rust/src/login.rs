@@ -14,6 +14,7 @@ use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 
 pub const TEXT_CANCELLED: &str = "Login cancelado.";
 pub const TEXT_EXPIRED: &str = "O login expirou. Tente de novo.";
@@ -142,6 +143,102 @@ pub fn redact_login_url(url: &str) -> String {
     }
 }
 
+/// Longest raw activation link ever examined (a guard before any byte matching).
+pub const MAX_LINK_CHARS: usize = 256;
+const RELEASE_SCHEME: &str = "golive";
+const TEST_HOST_PREFIX: &str = "golive-testhost-";
+
+/// URI scheme of the activation link: the real `golive` handler (release) or an isolated
+/// per-test-directory `golive-testhost-<16 hex>` scheme (same FNV-1a hash as the test-host
+/// instance identity). Rendered lowercase only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    Release,
+    TestHost(u64),
+}
+impl Scheme {
+    pub fn test_host(dir: &std::path::Path) -> Self {
+        Self::TestHost(crate::shell::test_host_hash(
+            dir.as_os_str().as_encoded_bytes(),
+        ))
+    }
+    pub fn name(&self) -> String {
+        match self {
+            Self::Release => RELEASE_SCHEME.to_owned(),
+            Self::TestHost(hash) => format!("{TEST_HOST_PREFIX}{hash:016x}"),
+        }
+    }
+    /// Only an isolated test scheme may ever be registered/unregistered by test-host code.
+    pub fn is_isolated(&self) -> bool {
+        self.name().starts_with(TEST_HOST_PREFIX)
+    }
+}
+
+/// Test-host builds never put the real `golive` scheme in a page or the registry.
+#[cfg(feature = "test-host")]
+pub fn assert_isolated_for_registry(scheme: &Scheme) -> Result<(), &'static str> {
+    if scheme.is_isolated() {
+        Ok(())
+    } else {
+        Err("test-host-scheme-not-isolated")
+    }
+}
+
+/// `<scheme>://auth[/]?state=<48 lowercase hex>`, validated by a hand-written byte matcher.
+/// Debug never shows the state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ActivationLink {
+    scheme: Scheme,
+    state: [u8; 48],
+}
+impl std::fmt::Debug for ActivationLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ActivationLink(..)")
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkError;
+impl ActivationLink {
+    pub(crate) fn from_state(scheme: Scheme, state: [u8; 48]) -> Self {
+        Self { scheme, state }
+    }
+    /// Parses a link for exactly `scheme` (scheme text compared ASCII-case-insensitively).
+    pub fn parse(raw: &str, scheme: Scheme) -> Result<Self, LinkError> {
+        if raw.len() > MAX_LINK_CHARS {
+            return Err(LinkError);
+        }
+        let name = scheme.name();
+        let bytes = raw.as_bytes();
+        let rest = bytes
+            .get(..name.len())
+            .filter(|p| p.eq_ignore_ascii_case(name.as_bytes()))
+            .and_then(|_| bytes[name.len()..].strip_prefix(b"://auth"))
+            .ok_or(LinkError)?;
+        let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+        let hex = rest.strip_prefix(b"?state=").ok_or(LinkError)?;
+        let state: [u8; 48] = hex.try_into().map_err(|_| LinkError)?;
+        if !state.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(LinkError);
+        }
+        Ok(Self { scheme, state })
+    }
+    pub fn scheme(&self) -> Scheme {
+        self.scheme
+    }
+    /// The only text ever placed in a page or on the wire: `<scheme>://auth?state=<hex>`.
+    pub fn canonical(&self) -> String {
+        let hex = std::str::from_utf8(&self.state).unwrap_or_default();
+        format!("{}://auth?state={hex}", self.scheme.name())
+    }
+    /// UTF-16LE bytes of `canonical()` (at most 2 * MAX_LINK_CHARS bytes by construction).
+    pub fn utf16le(&self) -> Vec<u8> {
+        self.canonical()
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+}
+
 pub struct Begin {
     pub started: Result<LoginUrl, Failure>,
     /// Settlements of a replaced caller, returned for immediate delivery (never also queued).
@@ -153,6 +250,12 @@ pub enum CallbackDecision {
     IgnoreNotPending,
     /// The login was past its deadline: expired here, under the lock; credential discarded.
     ExpiredAtCallback,
+}
+/// Result of a second-instance activation link against the one-shot slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    Activated,
+    Ignored,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Stats {
@@ -179,12 +282,9 @@ enum State {
         deadline: u64,
     },
 }
-/// S3 activation slot: S2 only reserves (before any response byte), expires and clears it.
+/// S3 activation slot: reserved on Deliver (before any response byte), consumed once by
+/// `activate`, expired by TTL and cleared by `begin`/`cancel`/`shutdown`.
 struct Reserved {
-    #[expect(
-        dead_code,
-        reason = "consumed by the S3 activation link, not part of S2"
-    )]
     state_hex: [u8; 48],
     deadline: u64,
 }
@@ -213,6 +313,7 @@ struct Shared {
     shutdown: AtomicBool,
     limits: Mutex<Limits>,
     hooks: Hooks,
+    scheme: Scheme,
 }
 
 /// RAII budget reservation (acceptor or worker); released on drop, including on spawn failure.
@@ -283,7 +384,7 @@ impl std::fmt::Debug for LoginFlow {
 }
 
 impl LoginFlow {
-    pub fn new(hooks: Hooks) -> Self {
+    pub fn new(hooks: Hooks, scheme: Scheme) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner {
@@ -303,6 +404,7 @@ impl LoginFlow {
                 shutdown: AtomicBool::new(false),
                 limits: Mutex::new(Limits::RELEASE),
                 hooks,
+                scheme,
             }),
         }
     }
@@ -582,6 +684,35 @@ impl LoginFlow {
             deadline: now.saturating_add(ACTIVATION_MS),
         });
         CallbackDecision::Deliver
+    }
+
+    /// The activation scheme of this flow (page link and second-instance parsing).
+    pub fn scheme(&self) -> Scheme {
+        self.shared.scheme
+    }
+
+    /// UI thread, inside WM_COPYDATA: one short lock. Consumes the one-shot slot only for an
+    /// exact (constant-time) state match of this flow's scheme within the TTL. Never reads or
+    /// changes the login state, never settles a caller, never touches sockets, never waits.
+    pub fn activate(&self, link: &ActivationLink, now: u64) -> Activation {
+        if link.scheme != self.shared.scheme {
+            return Activation::Ignored;
+        }
+        let mut g = self.lock();
+        let Some(reserved) = g.activation.as_ref() else {
+            return Activation::Ignored;
+        };
+        if now > reserved.deadline {
+            g.activation = None;
+            drop(g);
+            self.push_code("activation-expired");
+            return Activation::Ignored;
+        }
+        if !bool::from(reserved.state_hex.ct_eq(&link.state)) {
+            return Activation::Ignored;
+        }
+        g.activation = None;
+        Activation::Activated
     }
 
     /// UI thread: drains queued settlements, then claims a delivered credential (once).

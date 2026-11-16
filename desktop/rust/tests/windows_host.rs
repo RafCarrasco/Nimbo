@@ -21,7 +21,7 @@ use windows::Win32::{
     Foundation::{HWND, LPARAM, WPARAM},
     UI::WindowsAndMessaging::*,
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 const EXE: &str = env!("CARGO_BIN_EXE_nimbo-desktop");
@@ -884,7 +884,12 @@ fn synthetic_browser_login_round_trip() -> TestResult<()> {
     let mut response = String::new();
     socket.read_to_string(&mut response)?;
     assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(response.ends_with(nimbo_desktop::loopback::LOGIN_DONE_PAGE));
+    // S3 Deliver: the activation page of THIS login, with this directory's isolated scheme.
+    let scheme = nimbo_desktop::login::Scheme::test_host(&dir).name();
+    assert!(response.contains(&format!(
+        "<a id=\"open\" href=\"{scheme}://auth?state={state}\""
+    )));
+    assert!(!response.contains("golive://"));
     let first = wait_until("signIn result", || report("signin1"))?;
     assert_eq!(
         first,
@@ -930,5 +935,361 @@ fn synthetic_browser_login_round_trip() -> TestResult<()> {
     drop(fixture);
     remove_scratch(&dir);
     println!("SYNTHETIC_LOGIN_ROUND_TRIP_OK pid={pid} (NOT a Firebase sign-in)");
+    Ok(())
+}
+
+// ---------- CP2 S3 NATIVE-GATE (user-run on Windows; never executed in this pipeline) ----------
+
+fn isolated_scheme(dir: &Path) -> String {
+    nimbo_desktop::login::Scheme::test_host(dir).name()
+}
+fn scheme_key(dir: &Path) -> String {
+    format!("HKCU\\Software\\Classes\\{}", isolated_scheme(dir))
+}
+/// `reg.exe query <key> /s` text, or `None` when the key does not exist.
+fn reg_query(key: &str) -> TestResult<Option<String>> {
+    let out = Command::new("reg").args(["query", key, "/s"]).output()?;
+    Ok(out
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+/// `exe --test-host-url U --test-host-dir D --test-host-scheme <op>`: (exit code, events added).
+fn scheme_op(url: &str, dir: &Path, op: &str) -> TestResult<(i32, String)> {
+    let before = events(dir).len();
+    let status = Command::new(EXE)
+        .args(["--test-host-url", url, "--test-host-dir"])
+        .arg(dir)
+        .args(["--test-host-scheme", op])
+        .status()?;
+    Ok((
+        status.code().unwrap_or(-1),
+        events(dir)[before..].to_owned(),
+    ))
+}
+/// Drop guard: re-runs `unregister` (expected refused once gone); never names `golive`.
+struct SchemeGuard {
+    url: String,
+    dir: PathBuf,
+}
+impl Drop for SchemeGuard {
+    fn drop(&mut self) {
+        let _ = scheme_op(&self.url, &self.dir, "unregister");
+    }
+}
+
+/// Synthetic login up to the Deliver response; returns (state, full HTTP response).
+fn deliver_synthetic(fixture: &Fixture, dir: &Path, widget: HWND) -> TestResult<(String, String)> {
+    let origin = fixture.url.trim_end_matches('/').to_owned();
+    wait_until("started", || events(dir).contains("started").then_some(()))?;
+    click(widget);
+    let url_file = dir.join("login-url.txt");
+    let url = wait_until("login-url.txt", || std::fs::read_to_string(&url_file).ok())?;
+    let rest = url
+        .strip_prefix(&format!("{origin}/desktop-login?port="))
+        .ok_or("login URL shape")?;
+    let (port, state) = rest.split_once("&state=").ok_or("login URL state")?;
+    let port: u16 = port.parse()?;
+    let body = format!("state={state}&idToken=synthetic-id&accessToken=synthetic-access");
+    let mut socket = std::net::TcpStream::connect(("127.0.0.1", port))?;
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    write!(
+        socket,
+        "POST /callback HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut response = String::new();
+    socket.read_to_string(&mut response)?;
+    Ok((state.to_owned(), response))
+}
+fn count(log: &str, code: &str) -> usize {
+    log.lines().filter(|l| *l == code).count()
+}
+/// Raw WM_COPYDATA from this test process with a VALID sender-owned buffer for every
+/// advertised byte; returns the receiver's LRESULT.
+fn send_raw(target: HWND, data: usize, payload: &[u8]) -> TestResult<isize> {
+    use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+    let copy = COPYDATASTRUCT {
+        dwData: data,
+        cbData: u32::try_from(payload.len())?,
+        lpData: payload.as_ptr() as *mut _,
+    };
+    let mut result = 0usize;
+    // SAFETY: synchronous bounded send; `copy` and `payload` outlive the call.
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            target,
+            WM_COPYDATA,
+            WPARAM(0),
+            LPARAM(&copy as *const _ as isize),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            5000,
+            Some(&mut result),
+        )
+    };
+    if sent.0 == 0 {
+        return Err("WM_COPYDATA send timed out".into());
+    }
+    Ok(result as isize)
+}
+
+/// W1: second instance forwards the link, the first activates once and focuses; replay and a
+/// wrong state are ignored; raw malformed COPYDATA headers (valid buffers) are ignored with a
+/// receiver-side witness while the app stays alive. Whole test <= 60 s.
+#[test]
+#[ignore = "interactive Windows WebView2 host test; run with --ignored --nocapture --test-threads=1"]
+fn second_instance_forwards_link_and_first_instance_activates() -> TestResult<()> {
+    use nimbo_desktop::shell::{FOCUS_REQUEST, InstanceIdentity, LINK_REQUEST};
+    let started = Instant::now();
+    let dir = owned_scratch("nimbo-s3-link")?;
+    let fixture = Fixture::serve(LOGIN_PAGE, CSP)?;
+    let mut app = App(launch(&fixture, &dir)?);
+    let pid = app.0.id();
+    let main = wait_until("main window", || main_window(pid))?;
+    let widget = wait_until("renderer", || render_widget(main))?;
+    let (state, response) = deliver_synthetic(&fixture, &dir, widget)?;
+    let scheme = isolated_scheme(&dir);
+    let link = format!("{scheme}://auth?state={state}");
+    assert!(response.contains(&format!("href=\"{link}\"")) && !response.contains("golive://"));
+    // SAFETY: test-owned window of the child process.
+    unsafe {
+        let _ = ShowWindow(main, SW_MINIMIZE);
+    }
+    let second = |link: &str| -> TestResult<i32> {
+        let status = Command::new(EXE)
+            .args(["--test-host-url", &fixture.url, "--test-host-dir"])
+            .arg(&dir)
+            .args(["--test-host-link", link])
+            .status()?;
+        Ok(status.code().unwrap_or(-1))
+    };
+    assert_eq!(second(&link)?, 0);
+    wait_until("link-activated", || {
+        (count(&events(&dir), "link-activated") == 1).then_some(())
+    })?;
+    let log = events(&dir);
+    assert!(log.contains("single-instance-forwarded-link") && log.contains("focus-request"));
+    // SAFETY: test-owned window of the child process.
+    assert!(
+        !unsafe { IsIconic(main) }.as_bool(),
+        "restored from minimized"
+    );
+    assert_eq!(second(&link)?, 0);
+    wait_until("replay ignored", || {
+        (count(&events(&dir), "link-ignored") == 1).then_some(())
+    })?;
+    let wrong = format!(
+        "{scheme}://auth?state={}{}",
+        if state.starts_with('a') { "b" } else { "a" },
+        &state[1..]
+    );
+    assert_eq!(second(&wrong)?, 0);
+    wait_until("wrong state ignored", || {
+        (count(&events(&dir), "link-ignored") == 2).then_some(())
+    })?;
+    assert_eq!(
+        count(&events(&dir), "link-activated"),
+        1,
+        "exactly one activation"
+    );
+    // Raw header rows: every advertised byte is backed by a valid sender buffer.
+    let class = HSTRING::from(InstanceIdentity::test_host(&dir).class);
+    // SAFETY: message-only window lookup.
+    let target = unsafe { FindWindowExW(Some(HWND_MESSAGE), None, &class, PCWSTR::null()) }?;
+    let garbage: Vec<u8> = "x"
+        .repeat(94)
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let rows: [(&str, usize, Vec<u8>); 6] = [
+        ("FOCUS with 2 bytes", FOCUS_REQUEST, vec![0; 2]),
+        ("LINK odd 3", LINK_REQUEST, vec![0x41; 3]),
+        ("LINK 514", LINK_REQUEST, vec![0x41; 514]),
+        ("unknown magic 2", 0x1234, vec![0; 2]),
+        ("unknown magic 4096", 0x1234, vec![0; 4096]),
+        ("valid-length garbage", LINK_REQUEST, garbage),
+    ];
+    for (what, data, payload) in rows {
+        let before = count(&events(&dir), "instance-message-ignored");
+        let sent = Instant::now();
+        assert_eq!(send_raw(target, data, &payload)?, 0, "{what}: ignored");
+        assert!(
+            sent.elapsed() < Duration::from_secs(5),
+            "{what}: bounded sender"
+        );
+        wait_until(what, || {
+            (count(&events(&dir), "instance-message-ignored") == before + 1).then_some(())
+        })?;
+        assert!(main_window(pid).is_some(), "{what}: app alive");
+    }
+    // SAFETY: test-owned window.
+    unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
+    let exit = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    assert!(exit.success());
+    let log = events(&dir);
+    for secret in [state.as_str(), link.as_str(), "synthetic-id"] {
+        assert!(!log.contains(secret), "events.log leaked the link/state");
+    }
+    assert!(started.elapsed() < Duration::from_secs(60));
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
+    println!("S3_W1_LINK_FORWARD_OK pid={pid}");
+    Ok(())
+}
+
+/// W2: register/unregister ONLY this directory's isolated key; the real `golive` key (if any)
+/// is byte-unchanged.
+#[test]
+#[ignore = "interactive Windows registry test (HKCU isolated test key only); run with --ignored --nocapture --test-threads=1"]
+fn isolated_test_scheme_registers_and_unregisters() -> TestResult<()> {
+    let dir = owned_scratch("nimbo-s3-scheme")?;
+    let url = "http://127.0.0.1:9/".to_owned();
+    let key = scheme_key(&dir);
+    let real = reg_query("HKCU\\Software\\Classes\\golive")?;
+    assert!(
+        reg_query(&key)?.is_none(),
+        "fresh isolated key must not exist (never deleted here)"
+    );
+    let _guard = SchemeGuard {
+        url: url.clone(),
+        dir: dir.clone(),
+    };
+    let (code, log) = scheme_op(&url, &dir, "register")?;
+    assert_eq!(code, 0);
+    assert!(log.contains("scheme-registered"), "{log}");
+    let values = reg_query(&key)?.ok_or("registered key")?;
+    for needle in [
+        "URL:Nimbo Test Host",
+        "URL Protocol",
+        "DefaultIcon",
+        "--test-host-url \"http://127.0.0.1:9/\"",
+        "--test-host-link \"%1\"",
+    ] {
+        assert!(values.contains(needle), "missing {needle}");
+    }
+    assert!(values.contains(&format!("--test-host-dir \"{}\"", dir.display())));
+    let (code, log) = scheme_op(&url, &dir, "register")?;
+    assert_eq!(code, 0);
+    assert!(
+        !log.contains("scheme-registered"),
+        "second register is a Noop"
+    );
+    assert_eq!(
+        reg_query(&key)?.as_deref(),
+        Some(values.as_str()),
+        "values unchanged"
+    );
+    let (code, log) = scheme_op(&url, &dir, "unregister")?;
+    assert_eq!(code, 0);
+    assert!(log.contains("scheme-unregistered"));
+    assert!(reg_query(&key)?.is_none(), "key gone");
+    let (code, log) = scheme_op(&url, &dir, "unregister")?;
+    assert_eq!(code, 65);
+    assert!(log.contains("scheme-unregister-refused"));
+    assert_eq!(
+        reg_query("HKCU\\Software\\Classes\\golive")?,
+        real,
+        "real golive unchanged"
+    );
+    remove_scratch(&dir);
+    Ok(())
+}
+
+/// W2b: a pre-existing foreign/collided isolated key is never overwritten or deleted.
+#[test]
+#[ignore = "interactive Windows registry test (HKCU isolated test key only); run with --ignored --nocapture --test-threads=1"]
+fn unregister_refuses_foreign_or_collided_key() -> TestResult<()> {
+    struct Created(String);
+    impl Drop for Created {
+        fn drop(&mut self) {
+            // The test created this key itself.
+            let _ = Command::new("reg").args(["delete", &self.0, "/f"]).status();
+        }
+    }
+    let dir = owned_scratch("nimbo-s3-foreign")?;
+    let url = "http://127.0.0.1:9/";
+    let key = scheme_key(&dir);
+    assert!(
+        reg_query(&key)?.is_none(),
+        "fresh isolated key must not exist"
+    );
+    let status = Command::new("reg")
+        .args(["add", &format!("{key}\\shell\\open\\command"), "/ve", "/d"])
+        .arg("\"C:\\Windows\\System32\\notepad.exe\" \"%1\"")
+        .arg("/f")
+        .status()?;
+    assert!(status.success());
+    let _created = Created(key.clone());
+    let before = reg_query(&key)?.ok_or("pre-created key")?;
+    let (code, log) = scheme_op(url, &dir, "register")?;
+    assert_eq!(code, 0);
+    assert!(log.contains("scheme-foreign"), "{log}");
+    let (code, log) = scheme_op(url, &dir, "unregister")?;
+    assert_eq!(code, 65);
+    assert!(log.contains("scheme-unregister-refused"));
+    assert_eq!(
+        reg_query(&key)?.as_deref(),
+        Some(before.as_str()),
+        "foreign key unchanged"
+    );
+    remove_scratch(&dir);
+    Ok(())
+}
+
+/// W3: the OS launches the handler through this test's OWN isolated registration.
+#[test]
+#[ignore = "interactive Windows shell/registry test (HKCU isolated test key only); run with --ignored --nocapture --test-threads=1"]
+fn shell_open_isolated_scheme_launches_handler_and_activates() -> TestResult<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    let dir = owned_scratch("nimbo-s3-shell")?;
+    let fixture = Fixture::serve(LOGIN_PAGE, CSP)?;
+    assert!(reg_query(&scheme_key(&dir))?.is_none());
+    let _guard = SchemeGuard {
+        url: fixture.url.clone(),
+        dir: dir.clone(),
+    };
+    let (code, _) = scheme_op(&fixture.url, &dir, "register")?;
+    assert_eq!(code, 0);
+    let mut app = App(launch(&fixture, &dir)?);
+    let pid = app.0.id();
+    let main = wait_until("main window", || main_window(pid))?;
+    let widget = wait_until("renderer", || render_widget(main))?;
+    let (state, _) = deliver_synthetic(&fixture, &dir, widget)?;
+    let link = format!("{}://auth?state={state}", isolated_scheme(&dir));
+    // SAFETY: valid NUL-terminated strings for the duration of the call.
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            w!("open"),
+            &HSTRING::from(&link),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    assert!(
+        result.0 as isize > 32,
+        "ShellExecuteW launched the registered handler"
+    );
+    wait_until("link-activated", || {
+        events(&dir).contains("link-activated").then_some(())
+    })?;
+    // Received-argv evidence is the activation itself (the handler parsed the link it got);
+    // only the redacted shape/status is retained.
+    println!(
+        "S3_W3_SHELL_OPEN_OK pid={pid} argv=<{}://auth?state=<redacted>>",
+        isolated_scheme(&dir)
+    );
+    // SAFETY: test-owned window.
+    unsafe { PostMessageW(Some(main), WM_CLOSE, WPARAM(0), LPARAM(0))? };
+    let _ = wait_until("app exit", || app.0.try_wait().ok().flatten())?;
+    assert!(
+        !events(&dir).contains(&state),
+        "events.log never carries the state"
+    );
+    drop(app);
+    drop(fixture);
+    remove_scratch(&dir);
     Ok(())
 }

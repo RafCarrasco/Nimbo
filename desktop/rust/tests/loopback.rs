@@ -36,20 +36,23 @@ fn flow_notifying(limits: Limits, notify: Notify) -> (LoginFlow, Arc<AtomicU64>)
     let clock = Arc::new(AtomicU64::new(5));
     let c = clock.clone();
     let seed = Arc::new(AtomicU64::new(0x1234_5678));
-    let flow = LoginFlow::new(Hooks::new(
-        Arc::new(move |buf: &mut [u8; 24]| {
-            let mut x = seed.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::SeqCst);
-            for b in buf.iter_mut() {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                *b = x as u8;
-            }
-            true
-        }),
-        notify,
-        Arc::new(move || c.load(Ordering::SeqCst)),
-    ));
+    let flow = LoginFlow::new(
+        Hooks::new(
+            Arc::new(move |buf: &mut [u8; 24]| {
+                let mut x = seed.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::SeqCst);
+                for b in buf.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *b = x as u8;
+                }
+                true
+            }),
+            notify,
+            Arc::new(move || c.load(Ordering::SeqCst)),
+        ),
+        Scheme::TestHost(nimbo_desktop::shell::test_host_hash(b"loopback-tests")),
+    );
     flow.set_limits(limits);
     (flow, clock)
 }
@@ -565,11 +568,25 @@ fn valid_post_scenario(l: &Observed) {
     let resp = form(l.port, &body);
     let text = String::from_utf8(resp).unwrap();
     assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(text.ends_with(LOGIN_DONE_PAGE));
+    // S3 Deliver: the activation page for the SAME state the test posted (exactly once, only
+    // in the anchor href), never the posted tokens.
+    let scheme = l.flow.scheme();
+    assert!(scheme.is_isolated());
+    let link = format!("{}://auth?state={}", scheme.name(), l.state);
     assert!(
-        !text.contains("synthetic") && !text.contains(&l.state),
-        "no echo"
+        !text.ends_with(LOGIN_DONE_PAGE),
+        "Deliver serves the activation page"
     );
+    assert!(
+        text.contains(&format!("<a id=\"open\" href=\"{link}\"")),
+        "href is the link"
+    );
+    assert_eq!(text.matches(&l.state).count(), 1, "state exactly once");
+    assert!(text.contains(&format!(
+        "\r\nContent-Security-Policy: {ACTIVATION_PAGE_CSP}\r\n"
+    )));
+    assert!(text.contains("\r\nReferrer-Policy: no-referrer\r\n"));
+    assert!(!text.contains("synthetic"), "no echo");
     wait_notified(&l.notified, 1);
     assert!(l.flow.activation_reserved());
     let s = l.flow.take_settlements(5);
@@ -700,6 +717,10 @@ fn not_pending_scenario(l: &Observed) {
     let _ = late.read_to_end(&mut resp);
     let text = String::from_utf8(resp).unwrap();
     assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with(LOGIN_DONE_PAGE));
+    assert!(
+        !text.contains(&l.state),
+        "no link on the not-pending 200 (positive control)"
+    );
     let s = l.flow.take_settlements(5);
     assert_eq!(s.len(), 1);
     let Outcome::Credential(c) = &s[0].outcome else {
@@ -712,6 +733,21 @@ fn not_pending_scenario(l: &Observed) {
     assert_exactly_one_notification(&l.notified);
     let (codes, _) = l.flow.take_codes();
     assert!(codes.contains(&"login-ignored-not-pending"), "{codes:?}");
+}
+
+#[test]
+fn expired_at_callback_post_gets_the_plain_page_without_a_link() {
+    let l = live(small());
+    l.clock.store(5 + PENDING_MS + 1, Ordering::SeqCst);
+    let resp = form(l.port, &format!("state={}&idToken=late", l.state));
+    let text = String::from_utf8(resp).unwrap();
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n") && text.ends_with(LOGIN_DONE_PAGE));
+    assert!(!text.contains(&l.state) && !text.contains("Content-Security-Policy"));
+    assert!(!l.flow.activation_reserved(), "no slot without Deliver");
+    let st = l.flow.wait_idle(Duration::from_secs(2));
+    assert_eq!((st.workers, st.acceptors), (0, 0));
+    let (codes, _) = l.flow.take_codes();
+    assert!(codes.contains(&"login-expired-at-callback"), "{codes:?}");
 }
 
 #[test]
@@ -1210,19 +1246,26 @@ fn never_reading_peer_with_tiny_receive_buffer_is_bounded_and_delivers_exactly_o
     assert_eq!(delivered, 1, "{codes:?}");
     let timeout_code = codes.contains(&"callback-response-timeout");
     // Only now, after teardown, does the test read what reached the peer: a prefix of the exact
-    // fixed Done response (the whole response when it fit the buffers), never an echo.
+    // fixed Deliver response (S3: the activation page of THIS login; the whole response when it
+    // fit the buffers), never an echo of the posted tokens.
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut got = Vec::new();
     let _ = peer.read_to_end(&mut got);
-    let fixed = response_bytes(Response::Done);
+    let scheme = l.flow.scheme();
+    let link = ActivationLink::parse(
+        &format!("{}://auth?state={}", scheme.name(), l.state),
+        scheme,
+    )
+    .unwrap();
+    let fixed = response_bytes(Response::Activate(link));
     assert!(
         !got.is_empty() && fixed.starts_with(&got),
         "not the fixed response"
     );
     let text = String::from_utf8_lossy(&got);
     assert!(
-        !text.contains("nonreader") && !text.contains(&l.state),
-        "no echo"
+        !text.contains("nonreader") && text.matches(&l.state).count() <= 1,
+        "no echo; the state at most once (inside the page href)"
     );
     eprintln!(
         "NONREADER_OBSERVED rcvbuf_effective={rcvbuf} delivered_ms={delivered_ms} \

@@ -5,7 +5,8 @@
 // injected bridge script runs in the vm transport double (stdio instead of WebView2). Runs ONLY
 // inside the approved network-none container (isolationGuard); refused anywhere else. Emulator
 // mode: the "Google" credential is the synthetic devUser JSON — no Google, no real credential.
-// The done page is the existing fixed response; it is NOT a Firebase sign-in (that is L5).
+// S3: the Deliver response is the app-served activation page (state only in a#open href, isolated
+// test scheme); it is NOT a Firebase sign-in (that is L5).
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -32,6 +33,22 @@ const DONE_PAGE = mainCjs.slice(mainCjs.indexOf('const LOGIN_DONE_PAGE = `') + 2
 const ALICE_ID_TOKEN = JSON.stringify({ sub: 'dev-alice', email: 'alice@nimbo.test', email_verified: true });
 const INVALID_LINK = 'Link de login inválido.';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/**
+ * S3 Deliver page (D1=B1): NOT the plain page; the login state exactly once, only inside the
+ * a#open href of this host's ISOLATED scheme; both Electron sentences; no token/identity data.
+ * Returns sanitized booleans only (the href/state is never retained in evidence).
+ */
+function assertActivationPage(body, html, state) {
+  assert.notEqual(body, DONE_PAGE, 'Deliver serves the S3 activation page, not the plain page');
+  const href = /<a id="open" href="([^"]+)" rel="noreferrer">Abrir o app<\/a>/.exec(body)?.[1] || '';
+  assert.ok(new RegExp(`^golive-testhost-[0-9a-f]{16}://auth\\?state=${state}$`).test(href), 'href is the isolated state-only activation link');
+  assert.equal(body.split(state).length - 1, 1, 'state exactly once in the response (inside href)');
+  assert.equal(html.split(state).length - 1, 1, 'state exactly once in the rendered document (inside href)');
+  assert.ok(!body.includes('golive://'), 'never the real scheme');
+  for (const text of ['Pronto, você entrou.', 'Pode fechar esta aba e voltar ao app Nimbo.', 'Abrir o app']) assert.ok(body.includes(text), text);
+  for (const secret of [ALICE_ID_TOKEN, 'alice@nimbo.test', 'idToken', 'dev-alice']) assert.ok(!body.includes(secret) && !html.includes(secret), 'page carries no token/identity');
+  return { activation_page: true, state_once_in_isolated_href: true };
+}
 const plain = (v) => JSON.parse(JSON.stringify(v));
 const settled = (p) => { const s = { done: false }; p.then((value) => Object.assign(s, { done: true, value }), (error) => Object.assign(s, { done: true, error })); return s; };
 const gitBlob = (buf) => createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex');
@@ -41,6 +58,7 @@ async function until(test, what, ms = 15000) {
 
 const ev = { label: LABEL.slice(0, -3), guard: GUARD, scenarios: [], audits: [], secrets_seen: [] };
 let chrome, server, urlLog, sessions, callbackRequests;
+let protocolNavigations = 0;
 
 /** Bundle provenance: exact source blobs, mode markers, manifest hash (values of keys never kept). */
 function provenance() {
@@ -106,7 +124,7 @@ function audit(label, required, { run = auditProc, into = ev.audits } = {}) {
   assert.equal(a.pass, true, `${label}: complete clean audit (no unread or unresolved live-process input)`);
 }
 
-describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outside the isolated network-none container: ' + GUARD.reasons.join('; ') }, () => {
+describe('S3 L2 producer', { skip: GUARD.ok ? false : 'refused outside the isolated network-none container: ' + GUARD.reasons.join('; ') }, () => {
   before(async () => {
     assert.ok(fs.existsSync(path.join(DIST, 'index.html')), 'emulator-mode bundle prebuilt at ' + DIST);
     ev.provenance = provenance();
@@ -120,6 +138,8 @@ describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outsi
     ev.chrome = { browser: chrome.browser, flags: chrome.flags };
     sessions = await autoAttachAll(chrome.cdp, { onEvent: (method, p, sessionId) => {
       urlLog.record(method, p, sessionId);
+      // Observation only (count, never the URL): the page's automatic activation attempt.
+      if (method === 'Page.frameRequestedNavigation' && /^golive-testhost-[0-9a-f]{16}:/.test(p.url || '')) protocolNavigations++;
       if (method === 'Network.requestWillBeSent' && /^http:\/\/127\.0\.0\.1:\d+\/callback$/.test(p.request?.url || '')) {
         callbackRequests.push({ sessionId, requestId: p.requestId, url: p.request.url, method: p.request.method,
           origin: p.request.headers?.Origin ?? p.request.headers?.origin ?? null, type: p.type, status: null });
@@ -149,10 +169,9 @@ describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outsi
     assert.equal(r.req.type, 'Document', 'top-level form navigation');
     assert.equal(r.req.status, 200);
     assert.equal(r.req.origin, ORIGIN, 'browser sent Origin = app origin (http -> http same scheme)');
-    assert.equal(r.body, DONE_PAGE, 'response is the existing fixed done page, byte-identical to main.cjs');
+    const checked = assertActivationPage(r.body, r.page.html, login.state);
     assert.equal(r.page.title, 'Nimbo');
     assert.equal(r.page.h1, 'Pronto, você entrou.');
-    for (const secret of [login.state, ALICE_ID_TOKEN, 'alice@nimbo.test', 'idToken']) assert.ok(!r.page.html.includes(secret), 'done page source carries no token/state');
     await until(() => signIn.done, 'signIn result in the vm double');
     assert.deepEqual(plain(signIn.value), { ok: true, value: { idToken: ALICE_ID_TOKEN, accessToken: '' } });
     for (const code of ['login-begin', 'login-credential-delivered', 'login-result-posted']) assert.ok(h.codes.includes(code), code);
@@ -162,8 +181,8 @@ describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outsi
     assert.equal(results.length, 1, 'exactly one credential result');
     audit('L2 valid (end)', ['chrome', 'node', 'bridge-stdio']);
     ev.scenarios.push({ name: 'valid', login_url: redact(login.url), callback_status: r.req.status, origin_header: r.req.origin,
-      done_page_identical: true, title: r.page.title, h1: r.page.h1, result: 'ok:true idToken=<alice synthetic JSON> accessToken=""',
-      codes: [...h.codes] });
+      ...checked, protocol_navigation_events_observed: protocolNavigations, title: r.page.title, h1: r.page.h1,
+      result: 'ok:true idToken=<alice synthetic JSON> accessToken=""', codes: [...h.codes] });
   });
 
   test(LABEL + 'wrong state -> page posts -> 403 body shown, double receives nothing; correct POST later still succeeds', { timeout: 120000 }, async (t) => {
@@ -187,7 +206,7 @@ describe('S2-integration L2 producer', { skip: GUARD.ok ? false : 'refused outsi
     assert.equal((await h.stats()).active, true);
     const good = await produce(login.url, {});
     assert.equal(good.req.status, 200);
-    assert.equal(good.body, DONE_PAGE);
+    assertActivationPage(good.body, good.page.html, login.state);
     await until(() => signIn.done, 'signIn result after the correct POST');
     assert.deepEqual(plain(signIn.value), { ok: true, value: { idToken: ALICE_ID_TOKEN, accessToken: '' } });
     // Receiver codes reach stderr at the next drain (the success notify), not at the 403 itself.

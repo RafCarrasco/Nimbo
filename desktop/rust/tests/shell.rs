@@ -1,3 +1,4 @@
+use nimbo_desktop::login::{ActivationLink, Scheme};
 use nimbo_desktop::shell::*;
 use std::ffi::OsString;
 
@@ -74,28 +75,69 @@ fn background_is_electron_color_as_colorref() {
 
 #[test]
 fn argv_accepts_only_first_golive_link_and_never_keeps_payload() {
+    const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let link = format!("golive://auth?state={HEX}");
+    let parsed = ActivationLink::parse(&link, Scheme::Release).unwrap();
     assert_eq!(classify_args(&os(&[])), ArgSummary::default());
     assert_eq!(
         classify_args(&os(&["golive://auth/complete?state=x"])),
         ArgSummary {
-            link: LinkArg::GoliveDeferred,
+            link: LinkArg::Malformed,
             ignored: 0
         }
     );
     assert_eq!(
-        classify_args(&os(&["GOLIVE://auth", "--flag", "x"])),
+        classify_args(&os(&[&link])),
         ArgSummary {
-            link: LinkArg::GoliveDeferred,
+            link: LinkArg::Link(parsed),
+            ignored: 0
+        }
+    );
+    assert_eq!(
+        classify_args(&os(&[
+            &format!("GOLIVE://auth/?state={HEX}"),
+            "--flag",
+            "x"
+        ])),
+        ArgSummary {
+            link: LinkArg::Link(parsed),
             ignored: 2
         }
+    );
+    // Plan §3.3.5: a first argument starting with `golive://` that fails the grammar is
+    // Malformed (fixed code `link-ignored`), never retained.
+    for malformed in [
+        "golive://user:pw@auth",
+        "golive://auth\n",
+        "GOLIVE://auth",
+        "golive://auth?state=0",
+        "golive://secret-state",
+        "golive://auth?state=0123456789ABCDEF0123456789abcdef0123456789abcdef",
+    ] {
+        assert_eq!(
+            classify_args(&os(&[malformed])).link,
+            LinkArg::Malformed,
+            "{malformed}"
+        );
+    }
+    // A valid link that is not the FIRST argument is only an ignored argument.
+    assert_eq!(
+        classify_args(&os(&["x", &link])),
+        ArgSummary {
+            link: LinkArg::None,
+            ignored: 2
+        }
+    );
+    let text = format!("{:?}", classify_args(&os(&[&link])));
+    assert!(
+        !text.contains(&HEX[..8]),
+        "Debug of ArgSummary carries no state"
     );
     for args in [
         &["https://golive-ad118.web.app/"][..],
         &["--test-host-url", "http://127.0.0.1:1/"],
         &["golive:auth"],
-        &["golive://user:pw@auth"],
         &[" golive://auth"],
-        &["golive://auth\n"],
         &["--", "golive://auth"],
         &["nimbo://auth"],
         &["C:\\file.txt"],
@@ -128,13 +170,15 @@ fn single_instance_identity_and_focus_message() {
     let id = InstanceIdentity::release();
     assert_eq!(id.mutex, "Local\\app.nimbo.desktop");
     assert_eq!(id.class, "NimboDeepLink");
-    assert_eq!(
-        instance_request(FOCUS_REQUEST, 0),
-        Some(InstanceRequest::Focus)
-    );
+    assert_eq!(plan_copydata(FOCUS_REQUEST, 0, true), CopyDataPlan::Focus);
     for (data, len) in [(FOCUS_REQUEST, 1), (FOCUS_REQUEST + 1, 0), (0, 0)] {
-        assert_eq!(instance_request(data, len), None, "{data:x} {len}");
+        assert_eq!(
+            plan_copydata(data, len, true),
+            CopyDataPlan::Reject,
+            "{data:x} {len}"
+        );
     }
+    assert_ne!(LINK_REQUEST, FOCUS_REQUEST);
 }
 
 /// Review F2: a WebView2 startup wait that ends because the startup pump retrieved WM_QUIT
@@ -441,6 +485,71 @@ fn test_host_identity_and_args_are_isolated() {
     .unwrap();
     assert_eq!(ok.config.start_url(), "http://127.0.0.1:4000/");
     assert_eq!(ok.dir, Path::new(abs));
+    assert_eq!((ok.link, ok.scheme_op), (None, None));
+
+    // S3: an isolated link of THIS directory's scheme and the registry operation flags.
+    const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    let scheme = Scheme::test_host(Path::new(abs));
+    let iso_link = format!("{}://auth?state={HEX}", scheme.name());
+    let base = [
+        "--test-host-url",
+        "http://127.0.0.1:4000/",
+        "--test-host-dir",
+        abs,
+    ];
+    let with = |extra: &[&str]| parse_test_host_args(&os(&[&base[..], extra].concat()));
+    let linked = with(&["--test-host-link", &iso_link]).unwrap();
+    assert_eq!(
+        linked.link,
+        Some(ActivationLink::parse(&iso_link, scheme).unwrap())
+    );
+    assert_eq!(
+        with(&["--test-host-scheme", "register"]).unwrap().scheme_op,
+        Some(SchemeOp::Register)
+    );
+    assert_eq!(
+        with(&["--test-host-scheme", "unregister"])
+            .unwrap()
+            .scheme_op,
+        Some(SchemeOp::Unregister)
+    );
+    let other = Scheme::test_host(Path::new("/scratch/other")).name();
+    for bad in [
+        vec![
+            "--test-host-link".to_owned(),
+            format!("golive://auth?state={HEX}"),
+        ],
+        vec![
+            "--test-host-link".to_owned(),
+            format!("{other}://auth?state={HEX}"),
+        ],
+        vec![
+            "--test-host-link".to_owned(),
+            format!("{}://auth?state=0", scheme.name()),
+        ],
+        vec!["--test-host-scheme".to_owned(), "other".to_owned()],
+        vec!["--test-host-scheme".to_owned(), "Register".to_owned()],
+        vec![
+            "--test-host-link".to_owned(),
+            iso_link.clone(),
+            "--test-host-link".to_owned(),
+            iso_link.clone(),
+        ],
+    ] {
+        let extra: Vec<&str> = bad.iter().map(String::as_str).collect();
+        assert!(with(&extra).is_err(), "{extra:?}");
+    }
+    // The flag order does not matter: the link is checked against the FINAL directory.
+    let reordered = parse_test_host_args(&os(&[
+        "--test-host-link",
+        &iso_link,
+        "--test-host-url",
+        "http://127.0.0.1:4000/",
+        "--test-host-dir",
+        abs,
+    ]))
+    .unwrap();
+    assert!(reordered.link.is_some());
     for bad in [
         &[][..],
         &["--test-host-url", "http://127.0.0.1:4000/"],
@@ -487,4 +596,102 @@ fn test_host_identity_and_args_are_isolated() {
     ] {
         assert!(parse_test_host_args(&os(bad)).is_err(), "{bad:?}");
     }
+}
+
+/// SOURCE-POLICY PROBE: text match on host.rs, NOT native evidence (plan §6.3). The WM_COPYDATA
+/// handler decides from the header alone (plan_copydata) before its single bounded payload copy,
+/// which lives only inside the reader closure handed to instance_request; link/scheme codes never
+/// carry a detail; the release scheme registration runs only outside test-host builds, after the
+/// single-instance lock; the slot is consumed outside any `with_state` borrow.
+#[test]
+fn host_source_plans_copydata_before_any_payload_read_and_never_logs_link() {
+    let src = include_str!("../src/shell/windows/host.rs");
+    let body = |name: &str| {
+        let start = src
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} missing"));
+        let end = src[start..].find("\n}\n").map_or(src.len(), |e| start + e);
+        src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<String>()
+    };
+    let flat: String = src
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    // instance_proc delegates WM_COPYDATA to copydata().
+    assert!(body("instance_proc").contains("ifmsg==WM_COPYDATA{returncopydata(lparam);}"));
+    let cd = body("copydata");
+    let null = cd.find("iflparam.0==0{").expect("null lparam guard");
+    let header = cd.find("read_unaligned(").expect("header read by value");
+    let plan = cd.find("plan_copydata(").expect("plan from the header");
+    let request = cd.find("instance_request(plan,").expect("plan applied");
+    let raw = cd.find("from_raw_parts(").expect("single bounded copy");
+    assert!(null < header && header < plan && plan < request && request < raw);
+    assert_eq!(cd.matches("from_raw_parts(").count(), 1);
+    assert_eq!(
+        flat.matches("from_raw_parts(").count(),
+        1,
+        "no other payload read"
+    );
+    assert!(
+        cd[request..].starts_with("instance_request(plan,scheme,|len|"),
+        "read inside the reader closure"
+    );
+    assert!(
+        cd[raw..].starts_with("from_raw_parts(source,len)"),
+        "length from the plan"
+    );
+    assert!(
+        !cd[..plan].contains("lpData.") && !cd[..plan].contains("cbData/"),
+        "nothing derived before the plan"
+    );
+    // Link/scheme codes never carry a detail.
+    for prefix in [
+        "event(\"link-",
+        "event(\"scheme-",
+        "event(\"single-instance-forwarded",
+    ] {
+        for (i, _) in flat.match_indices(prefix) {
+            let call = &flat[i..i + flat[i..].find(')').unwrap() + 1];
+            assert!(call.ends_with(",None)"), "{call}");
+        }
+    }
+    let activate = body("activate_link");
+    assert!(activate.contains("event(code,None);"));
+    // forward_focus sends the link request only with the owned buffer.
+    let forward = body("forward_focus");
+    assert!(forward.contains("LINK_REQUEST") && forward.contains("FOCUS_REQUEST"));
+    assert!(forward.contains("\"single-instance-forwarded-link\""));
+    assert!(
+        forward.find("AllowSetForegroundWindow(").unwrap()
+            < forward.find("SendMessageTimeoutW(").unwrap()
+    );
+    // Registration: release only, after the single-instance lock, before the window.
+    let run = body("run");
+    let lock = run.find("acquire_instance(").expect("lock");
+    let register = run
+        .find("#[cfg(not(feature=\"test-host\"))]register_scheme();")
+        .expect("release-only registration call");
+    let window = run.find("run_window(").expect("window");
+    assert!(lock < register && register < window);
+    assert!(run[lock..register].contains("forward_focus(&launch.identity,launch.link.as_ref())"));
+    assert_eq!(flat.matches("register_release(").count(), 1);
+    assert!(body("register_scheme").contains("event(code,None)"));
+    assert!(!flat.contains("deferred-golive-link"));
+    // The slot is consumed after a single short borrow cloned the flow, never inside it.
+    let borrow = activate
+        .find("letlogin=with_state(|s|s.login.clone()).flatten();")
+        .expect("clone-then-release borrow");
+    let consume = activate.find(".activate(link,now_ms())").expect("activate");
+    assert!(borrow < consume);
+    assert_eq!(activate.matches("with_state(").count(), 1);
+    assert!(
+        body("copydata")
+            .find("activate_link(&link);focus_main();")
+            .is_some()
+    );
 }

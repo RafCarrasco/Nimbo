@@ -162,9 +162,11 @@ pub fn colorref(rgb: [u8; 3]) -> u32 {
 pub enum LinkArg {
     #[default]
     None,
-    /// A syntactically valid `golive://` first argument. Recognized for a later checkpoint only:
-    /// the payload is deliberately NOT retained, acted on or logged in checkpoint 1.
-    GoliveDeferred,
+    /// A valid release activation link (state only; Debug never shows it).
+    Link(crate::login::ActivationLink),
+    /// A first argument starting with `golive://` that fails the activation grammar: logged as
+    /// the fixed code `link-ignored`, never retained.
+    Malformed,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArgSummary {
@@ -173,18 +175,18 @@ pub struct ArgSummary {
     pub ignored: usize,
 }
 
-fn is_golive_link(raw: &str) -> bool {
-    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) || raw.contains('\\') {
-        return false;
-    }
-    raw.get(..9)
+fn classify_first(raw: &str) -> LinkArg {
+    use crate::login::{ActivationLink, Scheme};
+    if !raw
+        .get(..9)
         .is_some_and(|p| p.eq_ignore_ascii_case("golive://"))
-        && url::Url::parse(raw).is_ok_and(|u| {
-            u.scheme() == "golive"
-                && u.has_host()
-                && u.username().is_empty()
-                && u.password().is_none()
-        })
+    {
+        return LinkArg::None;
+    }
+    match ActivationLink::parse(raw, Scheme::Release) {
+        Ok(link) => LinkArg::Link(link),
+        Err(_) => LinkArg::Malformed,
+    }
 }
 
 /// Release argv (after the executable): only the FIRST argument may be a `golive://` link;
@@ -192,10 +194,14 @@ fn is_golive_link(raw: &str) -> bool {
 pub fn classify_args(args: &[OsString]) -> ArgSummary {
     let mut summary = ArgSummary::default();
     for (i, arg) in args.iter().enumerate() {
-        if i == 0 && arg.to_str().is_some_and(is_golive_link) {
-            summary.link = LinkArg::GoliveDeferred;
-        } else {
+        let link = match arg.to_str() {
+            Some(raw) if i == 0 => classify_first(raw),
+            _ => LinkArg::None,
+        };
+        if link == LinkArg::None {
             summary.ignored += 1;
+        } else {
+            summary.link = link;
         }
     }
     summary
@@ -204,14 +210,82 @@ pub fn classify_args(args: &[OsString]) -> ArgSummary {
 /// `dwData` of the WM_COPYDATA a second instance sends to the first one's message window.
 pub const FOCUS_REQUEST: usize = 0x4E49_4D42;
 
+/// `dwData` of a second instance forwarding an activation link (UTF-16LE in `lpData`).
+pub const LINK_REQUEST: usize = 0x4E49_4D4C;
+/// 256 UTF-16 units: the largest link payload ever copied.
+pub const MAX_LINK_BYTES: u32 = 512;
+pub const MIN_LINK_BYTES: u32 = 2;
+
+/// Decision taken from the three WM_COPYDATA header fields alone, BEFORE `lpData` is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyDataPlan {
+    Focus,
+    /// Read exactly `len` bytes (even, `MIN_LINK_BYTES..=MAX_LINK_BYTES`, non-null pointer).
+    CopyLink {
+        len: usize,
+    },
+    Reject,
+}
+/// Total table over (dwData, cbData, lpData null?). `cbData` is only compared, never
+/// transformed, before the decision.
+pub fn plan_copydata(data: usize, len: u32, lp_data_is_null: bool) -> CopyDataPlan {
+    match data {
+        FOCUS_REQUEST if len == 0 => CopyDataPlan::Focus,
+        LINK_REQUEST
+            if (MIN_LINK_BYTES..=MAX_LINK_BYTES).contains(&len)
+                && len.is_multiple_of(2)
+                && !lp_data_is_null =>
+        {
+            CopyDataPlan::CopyLink { len: len as usize }
+        }
+        _ => CopyDataPlan::Reject,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceRequest {
     Focus,
+    /// Debug prints `Link(ActivationLink(..))`: no state.
+    Link(crate::login::ActivationLink),
 }
-/// Only the exact empty focus request is accepted; anything else is ignored (no payload
-/// channel exists in checkpoint 1).
-pub fn instance_request(data: usize, len: u32) -> Option<InstanceRequest> {
-    (data == FOCUS_REQUEST && len == 0).then_some(InstanceRequest::Focus)
+/// Applies a plan: `read` (the single bounded copy of the sender's buffer) is called exactly
+/// once, and only for `CopyLink`; the bytes must be lossless UTF-16LE without NUL/BOM and a
+/// valid link of `scheme`.
+pub fn instance_request(
+    plan: CopyDataPlan,
+    scheme: crate::login::Scheme,
+    read: impl FnOnce(usize) -> Option<Vec<u8>>,
+) -> Option<InstanceRequest> {
+    let len = match plan {
+        CopyDataPlan::Focus => return Some(InstanceRequest::Focus),
+        CopyDataPlan::Reject => return None,
+        CopyDataPlan::CopyLink { len } => len,
+    };
+    let bytes = read(len).filter(|b| b.len() == len)?;
+    // Pairwise little-endian decode: no u16 alignment assumption on the sender's buffer.
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| u16::from_le_bytes(*p));
+    let text: String = char::decode_utf16(units).collect::<Result<_, _>>().ok()?;
+    if text.contains(['\0', '\u{feff}']) {
+        return None;
+    }
+    crate::login::ActivationLink::parse(&text, scheme)
+        .ok()
+        .map(InstanceRequest::Link)
+}
+
+/// FNV-1a 64 over `seed`: stable within this binary, no hashing dependency. Shared by the
+/// test-host instance identity and its isolated activation scheme.
+pub fn test_host_hash(seed: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,12 +303,7 @@ impl InstanceIdentity {
     /// Isolated per test directory so a test host never focuses (or is focused by) a real app.
     #[cfg(feature = "test-host")]
     pub fn test_host(dir: &std::path::Path) -> Self {
-        // FNV-1a: stable within this binary, no hashing dependency.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in dir.as_os_str().as_encoded_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        let hash = test_host_hash(dir.as_os_str().as_encoded_bytes());
         Self {
             mutex: format!("Local\\{}.test-host.{hash:016x}", crate::policy::APP_ID),
             class: format!("NimboDeepLink.TestHost.{hash:016x}"),
@@ -249,18 +318,32 @@ impl InstanceIdentity {
 pub struct TestHostArgs {
     pub config: crate::policy::Config,
     pub dir: std::path::PathBuf,
+    /// `--test-host-link <uri>`: must parse with this directory's isolated scheme.
+    pub link: Option<crate::login::ActivationLink>,
+    /// `--test-host-scheme register|unregister`: registry operation, then exit (no window).
+    pub scheme_op: Option<SchemeOp>,
+}
+#[cfg(feature = "test-host")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemeOp {
+    Register,
+    Unregister,
 }
 
 #[cfg(feature = "test-host")]
 pub fn parse_test_host_args(args: &[OsString]) -> Result<TestHostArgs, &'static str> {
     let mut url = None;
     let mut dir = None;
+    let mut link = None;
+    let mut op = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         let value = it.next().ok_or("test-host flag without value")?;
         let slot = match flag.to_str() {
             Some("--test-host-url") => &mut url,
             Some("--test-host-dir") => &mut dir,
+            Some("--test-host-link") => &mut link,
+            Some("--test-host-scheme") => &mut op,
             _ => return Err("unknown test-host argument"),
         };
         if slot.replace(value).is_some() {
@@ -274,9 +357,26 @@ pub fn parse_test_host_args(args: &[OsString]) -> Result<TestHostArgs, &'static 
     if !dir.is_absolute() {
         return Err("--test-host-dir must be absolute");
     }
+    let scheme = crate::login::Scheme::test_host(&dir);
+    let link = match link {
+        None => None,
+        Some(raw) => Some(
+            raw.to_str()
+                .and_then(|raw| crate::login::ActivationLink::parse(raw, scheme).ok())
+                .ok_or("--test-host-link must be this directory's isolated link")?,
+        ),
+    };
+    let scheme_op = match op.map(|o| o.to_str()) {
+        None => None,
+        Some(Some("register")) => Some(SchemeOp::Register),
+        Some(Some("unregister")) => Some(SchemeOp::Unregister),
+        Some(_) => return Err("--test-host-scheme must be register or unregister"),
+    };
     Ok(TestHostArgs {
         config: crate::policy::Config::test_host(url)?,
         dir,
+        link,
+        scheme_op,
     })
 }
 
