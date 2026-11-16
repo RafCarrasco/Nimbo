@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::Duration;
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -274,7 +275,6 @@ pub struct SharedFrameSink {
     core: ICoreWebView2_17,
     route: FrameRoute,
     buffers: [Option<Shared>; 2],
-    last_publish_ms: Option<u64>,
 }
 impl SharedFrameSink {
     /// # Safety
@@ -293,18 +293,18 @@ impl SharedFrameSink {
             core,
             route,
             buffers: [None, None],
-            last_publish_ms: None,
         }
     }
     /// One bounded capture-to-WebView step. Call even under backpressure to enforce ACK timeout.
     /// Returns false when no frame/credit exists, not a claim that a script rendered a frame.
+    /// `now` is monotonic elapsed time from the native owner, not a script clock.
     pub fn pump(
         &mut self,
         config: &Config,
         request: &NativeRequest<'_>,
-        now_ms: u64,
+        now: Duration,
     ) -> Result<bool> {
-        let outcome = self.pump_inner(config, request, now_ms);
+        let outcome = self.pump_inner(config, request, now);
         if outcome.is_err() {
             self.stop()?;
         }
@@ -314,26 +314,19 @@ impl SharedFrameSink {
         &mut self,
         config: &Config,
         request: &NativeRequest<'_>,
-        now_ms: u64,
+        now: Duration,
     ) -> Result<bool> {
         if self.capture.layout() != self.route.layout() {
             return Err(invalid("source/route size mismatch"));
         }
         let Some(ticket) = self
             .route
-            .reserve(config, request, now_ms)
+            .reserve_due(config, request, now)
             .map_err(invalid)?
         else {
             return Ok(false);
         };
-        // At most one publication every 17 ms (<60 fps). Still reserve/check deadlines above.
-        if self
-            .last_publish_ms
-            .is_some_and(|last| now_ms.saturating_sub(last) < 17)
-        {
-            self.route.cancel_unposted(ticket);
-            return Ok(false);
-        }
+
         let Some(pixels) = self.capture.next_rgba()? else {
             // Unposted reservation is local only; no page ACK is required.
             // Use a separate cancellation path rather than accepting a synthetic page response.
@@ -357,7 +350,7 @@ impl SharedFrameSink {
                 &metadata,
             )?;
             self.buffers[ticket.slot()] = Some(shared);
-            self.last_publish_ms = Some(now_ms);
+            self.route.mark_published(ticket, now).map_err(invalid)?;
         }
         Ok(true)
     }

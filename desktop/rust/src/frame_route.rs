@@ -1,5 +1,8 @@
 //! Bounded real-frame layout and native-owned delivery state. No pixels travel in JSON.
 use crate::policy::{Config, NativeRequest};
+use cadence::FrameCadence;
+
+pub mod cadence;
 
 const JS_MAX: u64 = (1 << 53) - 1;
 const ACK_TIMEOUT_MS: u64 = 2000;
@@ -59,6 +62,7 @@ impl FrameLayout {
 pub struct DeliveryTicket {
     slot: usize,
     sequence: u64,
+    reserved_at: std::time::Duration,
 }
 impl DeliveryTicket {
     pub fn slot(self) -> usize {
@@ -82,10 +86,12 @@ pub struct FrameRoute {
     frame: u32,
     source: String,
     layout: FrameLayout,
+    cadence: FrameCadence,
     slots: [Option<(u64, u64)>; 2],
     sequence: u64,
     stopped: bool,
     last_time: u64,
+    last_due_time: Option<std::time::Duration>,
 }
 impl FrameRoute {
     /// Identity MUST come from host ownership, never fields deserialized from page messages.
@@ -109,11 +115,79 @@ impl FrameRoute {
             frame: request.frame_id.ok_or("unknown frame")?,
             source: request.source.to_owned(),
             layout,
+            cadence: FrameCadence::new(60)?,
             slots: [None, None],
             sequence: 0,
             stopped: false,
             last_time: 0,
+            last_due_time: None,
         })
+    }
+    /// Native-owned settings only. This does not grant capture permission or select a source.
+    pub fn at_frame_rate(
+        config: &Config,
+        request: &NativeRequest<'_>,
+        generation: u64,
+        session: u64,
+        layout: FrameLayout,
+        frame_rate: u32,
+    ) -> Result<Self, &'static str> {
+        let mut route = Self::new(config, request, generation, session, layout)?;
+        route.cadence = FrameCadence::new(frame_rate)?;
+        Ok(route)
+    }
+    /// Use monotonic elapsed time. Authorization and ACK expiry still run while throttled.
+    /// A reservation is not a publication: an empty capture must cancel it without spending fps.
+    pub fn reserve_due(
+        &mut self,
+        config: &Config,
+        request: &NativeRequest<'_>,
+        now: std::time::Duration,
+    ) -> Result<Option<DeliveryTicket>, &'static str> {
+        if self.last_due_time.is_some_and(|last| now < last) {
+            self.stop();
+            return Err("capture publication clock rolled back");
+        }
+        let Ok(now_ms) = u64::try_from(now.as_millis()) else {
+            self.stop();
+            return Err("capture clock exceeds acknowledgment range");
+        };
+        let mut ticket = self.reserve(config, request, now_ms)?;
+        self.last_due_time = Some(now);
+        if !self.cadence.is_due(now) {
+            if let Some(ticket) = ticket {
+                self.cancel_unposted(ticket);
+            }
+            return Ok(None);
+        }
+        if let Some(ticket) = ticket.as_mut() {
+            ticket.reserved_at = now;
+        }
+        Ok(ticket)
+    }
+    /// Commit only AFTER successful native posting, using the exact reservation timestamp.
+    /// Never substitute an ACK or a fabricated frame for a successful PostSharedBufferToScript.
+    pub fn mark_published(
+        &mut self,
+        ticket: DeliveryTicket,
+        now: std::time::Duration,
+    ) -> Result<(), &'static str> {
+        if self.stopped {
+            return Err("capture route stopped before publication");
+        }
+        if ticket.reserved_at != now
+            || self
+                .slots
+                .get(ticket.slot)
+                .copied()
+                .flatten()
+                .map(|(seq, _)| seq)
+                != Some(ticket.sequence)
+        {
+            self.stop();
+            return Err("capture publication has no matching reservation");
+        }
+        self.cadence.published(now)
     }
     fn authorized(&self, config: &Config, request: &NativeRequest<'_>) -> bool {
         !self.stopped
@@ -151,6 +225,7 @@ impl FrameRoute {
         Ok(Some(DeliveryTicket {
             slot,
             sequence: self.sequence,
+            reserved_at: std::time::Duration::from_millis(now_ms),
         }))
     }
     pub fn acknowledge_at(
@@ -186,7 +261,6 @@ impl FrameRoute {
         self.slots[ack.slot] = None;
         true
     }
-    #[cfg(windows)]
     fn cancel_unposted(&mut self, ticket: DeliveryTicket) {
         if self
             .slots

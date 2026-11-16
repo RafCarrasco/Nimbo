@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 const source = readFileSync(new URL('../rust/bridge/capture.js', import.meta.url), 'utf8')
 
-function harness({ subframe = false } = {}) {
+function harness({ subframe = false, frameRate } = {}) {
   const listeners = new Map(), messages = [], released = [], pixels = [], tracks = []
   class Track extends EventTarget {
     constructor() { super(); this.kind = 'video'; this.readyState = 'live'; tracks.push(this) }
@@ -24,13 +24,32 @@ function harness({ subframe = false } = {}) {
   const canvas = { getContext: () => ({ putImageData: image => pixels.push([...image.data]) }), captureStream: fps => { assert.equal(fps, 0); const track = new Track(); return { getVideoTracks: () => [track], getTracks: () => [track] } } }
   const context = vm.createContext({ window, navigator: { mediaDevices }, document: { createElement: n => { assert.equal(n, 'canvas'); return canvas } }, DOMException, Event, Uint8ClampedArray, ImageData: class { constructor(data) { this.data = data } }, setTimeout, clearTimeout })
   const install = vm.runInContext(source, context)
-  const dispose = install(webview, { generation: 3, session: 17, width: 2, height: 1 })
+  const dispose = install(webview, { generation: 3, session: 17, width: 2, height: 1, frameRate })
   const frame = (overrides = {}, bytes = new Uint8Array([1,2,3,255,4,5,6,255]).buffer) => {
     listeners.get('sharedbufferreceived')({ source: webview, getBuffer: () => bytes, additionalData: { kind: 'nimbo-frame', format: 'RGBA8', generation: 3, session: 17, slot: 0, sequence: 1, width: 2, height: 1, ...overrides } })
     return bytes
   }
   return { mediaDevices, original, dispose, frame, pixels, messages, released, tracks, listeners }
 }
+
+test('unsupported native frame-rate configuration is refused at installation', () => {
+  for (const frameRate of [0, 1, 29, 31, 59, 61, 30.5, NaN, Infinity, '30', null]) {
+    assert.throws(() => harness({ frameRate }), { name: 'SecurityError' })
+  }
+})
+
+test('a native-configured 30 fps route accepts the unchanged consumer constraint shape', async () => {
+  const h = harness({ frameRate: 30 })
+  try {
+    const pending = h.mediaDevices.getDisplayMedia({ video: {
+      width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 },
+    }, audio: false })
+    h.frame()
+    const stream = await pending
+    assert.equal(stream.getVideoTracks()[0], h.tracks[0])
+    assert.equal(h.tracks[0].frames, 1)
+  } finally { h.dispose() }
+})
 
 test('first validated frame resolves stream, copies before release/ACK, and never uses picker', async () => {
   const h = harness()

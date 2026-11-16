@@ -6,6 +6,8 @@
   if (window.top !== window || !webview ||
       !['generation', 'session', 'width', 'height'].every(k => Number.isSafeInteger(config[k]) && config[k] > 0) ||
       config.width > 3840 || config.height > 2160) throw new DOMException('Unattributed capture', 'SecurityError')
+  const frameRate = config.frameRate === undefined ? 60 : config.frameRate
+  if (![30, 60].includes(frameRate)) throw new DOMException('Unattributed capture rate', 'SecurityError')
   const devices = navigator.mediaDevices
   const original = devices.getDisplayMedia
   let pending, stream, canvas, context, timer, closed = false, sequence = 0
@@ -40,7 +42,7 @@
     if (!options.video || options.audio ||
         (typeof options.video === 'object' && Object.entries(options.video).some(([key, v]) =>
           v && typeof v === 'object' && ('exact' in v || 'min' in v ||
-            ('max' in v && (key !== 'frameRate' || !Number.isFinite(v.max) || v.max < 60)))))) {
+            ('max' in v && (key !== 'frameRate' || !Number.isFinite(v.max) || v.max < frameRate)))))) {
       throw new DOMException('Only diagnostic video with ideal constraints is available', 'NotSupportedError')
     }
     // No native picker fallback. The host has already chosen its OWN diagnostic window.

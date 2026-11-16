@@ -145,6 +145,16 @@ impl Drop for Fixture {
 #[test]
 #[ignore = "real interactive Windows WGC + WebView2 media test; run with --ignored --nocapture --test-threads=1"]
 fn own_window_reaches_real_webview_video_track() -> TestResult<()> {
+    real_webview_video_track(60)
+}
+
+#[test]
+#[ignore = "interactive Windows WGC + WebView2 at configured 30 fps; not a throughput benchmark"]
+fn own_window_at_thirty_fps_reaches_real_webview_video_track() -> TestResult<()> {
+    real_webview_video_track(30)
+}
+
+fn real_webview_video_track(frame_rate: u32) -> TestResult<()> {
     // This fixed loopback document is the ONLY page allowed. No host WebMessageReceived handler
     // exists: test ACKs are read via host ExecuteScript in the known main frame, not page IPC.
     unsafe {
@@ -334,7 +344,7 @@ fn own_window_reaches_real_webview_video_track() -> TestResult<()> {
         parent_frame_id: None,
         document_generation: 1,
     };
-    let route = FrameRoute::new(&config, &request, 1, 1, layout)?;
+    let route = FrameRoute::at_frame_rate(&config, &request, 1, 1, layout, frame_rate)?;
     // Inject the real adapter, then call the same getDisplayMedia API as the unchanged consumer.
     // ACK mailbox is test-owned main-frame JS ONLY; it grants no native command to any page.
     script(
@@ -343,9 +353,10 @@ fn own_window_reaches_real_webview_video_track() -> TestResult<()> {
             r#"
       window.__acks = []; window.__videoFrames = 0;
       window.__dispose = ({CANVAS_ADAPTER})(chrome.webview,
-        {{generation:1,session:1,width:{},height:{}}},
+        {{generation:1,session:1,frameRate:{frame_rate},width:{},height:{}}},
         m => {{ if(m.kind === 'nimbo-frame-ack') window.__acks.push([m.slot,m.sequence]); }});
-      navigator.mediaDevices.getDisplayMedia({{video:true,audio:false}}).then(stream => {{
+      const requestedVideo = {{width:{{ideal:1920}},height:{{ideal:1080}},frameRate:{{ideal:{frame_rate},max:{frame_rate}}}}};
+      navigator.mediaDevices.getDisplayMedia({{video:requestedVideo,audio:false}}).then(stream => {{
         window.__stream = stream;
         const video = document.createElement('video'); video.muted = true; video.autoplay = true;
         video.srcObject = stream; document.body.append(video);
@@ -381,7 +392,7 @@ fn own_window_reaches_real_webview_video_track() -> TestResult<()> {
                 &HSTRING::from(format!("Nimbo live source {}", start.elapsed().as_millis())),
             )?;
         }
-        sink.pump(&config, &request, start.elapsed().as_millis().try_into()?)?;
+        sink.pump(&config, &request, start.elapsed())?;
         let ack = script(&core, "window.__acks.shift()?.join(':') ?? ''")?;
         if let Some(value) = ack
             .strip_prefix('"')
@@ -416,7 +427,7 @@ fn own_window_reaches_real_webview_video_track() -> TestResult<()> {
         std::thread::sleep(Duration::from_millis(34));
     }
     println!(
-        "REAL_WEBVIEW_MEDIASTREAM rendered_frames={} native_source_pid={} main_frame={frame}",
+        "REAL_WEBVIEW_MEDIASTREAM configured_fps={frame_rate} rendered_frames={} native_source_pid={} main_frame={frame}",
         script(&core, "window.__videoFrames")?,
         std::process::id()
     );
@@ -432,7 +443,7 @@ fn own_window_reaches_real_webview_video_track() -> TestResult<()> {
         "true"
     );
     sink.stop()?;
-    assert!(sink.pump(&config, &request, 0).is_err());
+    assert!(sink.pump(&config, &request, Duration::ZERO).is_err());
     drop(sink); // native producer/mappings closed BEFORE controller/window/apartment drop
     Ok(())
 }
