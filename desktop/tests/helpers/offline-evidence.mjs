@@ -4,6 +4,7 @@
 // a CDP URL log (Network.* events, masked) and a /proc socket audit of every process at the end
 // of a tier. Any non-loopback entry fails the tier even though the namespace made it unroutable.
 // Nothing here opens a socket. Recorded URLs never carry the login state, tokens or keys.
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -277,7 +278,52 @@ const LOGGED_EVENTS = new Set([...URL_EVENTS, 'Network.loadingFailed', 'Network.
 
 /** Masked, ordered network evidence from every attached CDP session. */
 export class UrlLog {
-  constructor() { this.entries = []; this.urls = new Map(); }
+  /** Expected-activation capability; null (the default) = disabled. Raw state never leaves it. */
+  #activation = null;
+  constructor(options = {}) {
+    this.entries = []; this.urls = new Map();
+    if (options.activation !== undefined) this.#activation = activationCapability(options.activation);
+  }
+  /**
+   * Arms ONE expected activation context, BEFORE the real action, for a known login state, the
+   * main-document CDP session that will POST to `callbackUrl`, and this capability's scheme and
+   * app origin. Returns the context index. At most ACTIVATION_MAX_CONTEXTS; one per session.
+   */
+  armActivation({ state, sessionId, callbackUrl } = {}) {
+    const cap = this.#activation;
+    if (!cap) throw new Error('activation capability disabled');
+    if (cap.contexts.length >= ACTIVATION_MAX_CONTEXTS) throw new Error('activation context bound reached');
+    if (typeof state !== 'string' || !ACTIVATION_STATE.test(state)) throw new Error('activation state malformed');
+    if (typeof sessionId !== 'string' || !sessionId) throw new Error('activation session malformed');
+    if (typeof callbackUrl !== 'string' || !ACTIVATION_CALLBACK.test(callbackUrl)) throw new Error('activation callback malformed');
+    if (cap.contexts.some((c) => c.sessionId === sessionId)) throw new Error('activation session already armed');
+    cap.contexts.push({ index: cap.contexts.length, sessionId, callbackUrl, state, canonical: `${cap.scheme}://auth?state=${state}`,
+      armed_seq: this.entries.length, source: null, attempt: null, failure: null, errors: [] });
+    return cap.contexts.length - 1;
+  }
+  /** True once the attempt and its failure (or any context error) were observed. */
+  activationSettled(index) {
+    const c = this.#activation?.contexts[index];
+    return !!c && (c.errors.length > 0 || (!!c.attempt && !!c.failure));
+  }
+  /** Retained, secret-free proof per context (commitments only, URLs masked); null when disabled. */
+  activationEvidence() {
+    const cap = this.#activation;
+    if (!cap) return null;
+    return { capability: 'expected-activation', scheme: cap.scheme, origin: cap.origin, max_contexts: ACTIVATION_MAX_CONTEXTS,
+      contexts: cap.contexts.map((c) => {
+        const reasons = activationReasons(c);
+        return { index: c.index, sessionId: c.sessionId, callback: c.callbackUrl, armed_seq: c.armed_seq, state_commitment: activationCommitment(c.state),
+          source: c.source && { ...c.source }, attempt: c.attempt && { ...c.attempt }, failure: c.failure && { ...c.failure },
+          errors: [...c.errors], reasons, proven: reasons.length === 0 };
+      }) };
+  }
+  /** Every armed context must be proven; zero armed contexts is not a vacuous pass. */
+  reconcileActivations() {
+    const cs = this.#activation?.contexts ?? [];
+    const unproven = cs.filter((c) => activationReasons(c).length).map((c) => c.index);
+    return { ok: cs.length > 0 && unproven.length === 0, armed: cs.length, proven: cs.length - unproven.length, unproven };
+  }
   record(method, params = {}, sessionId = null) {
     if (!LOGGED_EVENTS.has(method)) return;
     const raw = method === 'Network.webSocketCreated' ? params.url
@@ -293,13 +339,103 @@ export class UrlLog {
     if (method === 'Network.responseReceived') Object.assign(e, { status: params.response?.status ?? null, remoteIPAddress: params.response?.remoteIPAddress ?? null });
     if (method === 'Network.webSocketHandshakeResponseReceived') e.status = params.response?.status ?? null;
     this.entries.push(e);
+    if (this.#activation) observeActivation(this.#activation, e, params, raw);
   }
   count(method) { return this.entries.filter((e) => e.method === method).length; }
   /** URL-bearing events whose URL is not loopback/internal, plus responses from a non-loopback IP. */
   violations() {
-    return this.entries.filter((e) => (URL_EVENTS.has(e.method) && e.url_class === 'external')
-      || (e.method === 'Network.responseReceived' && e.remoteIPAddress && !loopbackHostname(e.remoteIPAddress.includes(':') ? `[${e.remoteIPAddress}]` : e.remoteIPAddress)));
+    const proven = new Set((this.#activation?.contexts ?? []).filter((c) => !activationReasons(c).length).map((c) => c.attempt.seq));
+    return this.entries.filter((e) => ((URL_EVENTS.has(e.method) && e.url_class === 'external')
+      || (e.method === 'Network.responseReceived' && e.remoteIPAddress && !loopbackHostname(e.remoteIPAddress.includes(':') ? `[${e.remoteIPAddress}]` : e.remoteIPAddress)))
+      && !(e.method === 'Network.requestWillBeSent' && proven.has(e.seq)));
   }
+}
+
+// ---------------------------------------------------------------- expected activation (fix6, opt-in)
+// The S3 Deliver page necessarily makes ONE automatic main-document navigation to the isolated
+// test-host scheme; Chrome reports it as requestWillBeSent(Document GET) then loadingFailed and
+// never as network traffic. classifyUrl stays fail closed ('external'); an ARMED context only
+// excuses that single request after the complete ordered proof below. Anything else in the armed
+// session that does not fit invalidates the context (and the request stays a violation).
+const ACTIVATION_MAX_CONTEXTS = 16;
+const ACTIVATION_SCHEME = /^golive-testhost-[0-9a-f]{16}$/;
+const ACTIVATION_STATE = /^[0-9a-f]{48}$/;
+const ACTIVATION_CALLBACK = /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/callback$/;
+const ACTIVATION_ORIGIN = /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/;
+const ACTIVATION_URI = /^(golive-testhost-[0-9a-f]{16}):\/\/auth\?state=([0-9a-f]{48})$/;
+
+/** Domain-separated SHA-256 commitment of a login state (retained instead of the 48-hex value). */
+export const activationCommitment = (state) => createHash('sha256').update('nimbo-s3-activation-state\0').update(String(state)).digest('hex');
+
+function activationCapability(o) {
+  if (!o || typeof o.scheme !== 'string' || !ACTIVATION_SCHEME.test(o.scheme)) throw new Error('activation scheme must be an isolated test-host scheme');
+  if (typeof o.origin !== 'string' || !ACTIVATION_ORIGIN.test(o.origin)) throw new Error('activation origin must be a loopback app origin');
+  return { scheme: o.scheme, origin: o.origin, contexts: [] };
+}
+
+function observeActivation(cap, e, params, raw) {
+  const c = cap.contexts.find((x) => x.sessionId === e.sessionId);
+  if (!c) return; // unarmed sessions: unchanged guard only
+  const err = (code) => { if (c.errors.length < 16) c.errors.push(code); };
+  const rid = e.requestId;
+  if (e.method === 'Network.requestWillBeSent') {
+    if (raw === c.callbackUrl) {
+      if (c.source) return err('source-duplicate');
+      const h = params.request?.headers || {};
+      c.source = { requestId: rid, frameId: params.frameId ?? null, seq: e.seq, http_method: e.http_method, type: e.type,
+        origin_ok: (h.Origin ?? h.origin) === cap.origin, redirect: !!params.redirectResponse, status: null, response_seq: null };
+      return;
+    }
+    if (c.attempt && rid === c.attempt.requestId) return err('attempt-redirect');
+    if (c.source && rid === c.source.requestId) return err('source-redirect');
+    if (e.url_class !== 'external') return;
+    if (c.attempt) return err('attempt-duplicate');
+    const m = ACTIVATION_URI.exec(typeof raw === 'string' ? raw : '');
+    c.attempt = { requestId: rid, frameId: params.frameId ?? null, seq: e.seq, http_method: e.http_method, type: e.type, redirect: !!params.redirectResponse,
+      url: e.url, canonical: raw === c.canonical, scheme_match: !!m && m[1] === cap.scheme, observed_state_commitment: m ? activationCommitment(m[2]) : null,
+      after_source_response: !!c.source && c.source.response_seq !== null };
+    return;
+  }
+  if (e.method === 'Network.responseReceived') {
+    if (c.attempt && rid === c.attempt.requestId) return err('attempt-response');
+    if (c.source && rid === c.source.requestId) {
+      if (c.source.response_seq !== null) return err('source-response-duplicate');
+      Object.assign(c.source, { status: params.response?.status ?? null, response_seq: e.seq });
+    }
+    return;
+  }
+  if (e.method === 'Network.loadingFailed') {
+    if (c.attempt && rid === c.attempt.requestId) {
+      if (c.failure) return err('failure-duplicate');
+      c.failure = { seq: e.seq, errorText: typeof params.errorText === 'string' ? params.errorText.slice(0, 64) : null, canceled: !!params.canceled };
+    } else if (c.source && rid === c.source.requestId) err('source-failed');
+    return;
+  }
+  // WebSocket events in an armed session: never part of an activation.
+  if (c.attempt && rid === c.attempt.requestId) return err('attempt-websocket');
+  if (e.url_class === 'external') err('external-websocket');
+}
+
+/** Empty when the context is fully proven; otherwise fixed reason codes. */
+function activationReasons(c) {
+  const r = [...c.errors];
+  const s = c.source, a = c.attempt;
+  if (!s) r.push('source-missing');
+  else {
+    if (s.http_method !== 'POST' || s.type !== 'Document' || s.redirect) r.push('source-not-document-post');
+    if (!s.origin_ok) r.push('source-origin');
+    if (s.status !== 200 || s.response_seq === null) r.push('source-not-200');
+    if (typeof s.frameId !== 'string' || !s.frameId) r.push('source-frame');
+  }
+  if (!a) r.push('attempt-missing');
+  else {
+    if (a.http_method !== 'GET' || a.type !== 'Document' || a.redirect) r.push('attempt-not-document-get');
+    if (!a.canonical || !a.scheme_match || a.observed_state_commitment !== activationCommitment(c.state)) r.push('attempt-uri');
+    if (!a.after_source_response || !s || s.response_seq === null || s.response_seq > a.seq) r.push('attempt-order');
+    if (!s || a.frameId !== s.frameId) r.push('attempt-frame');
+    if (!c.failure || c.failure.seq <= a.seq) r.push('failure-missing');
+  }
+  return r;
 }
 
 // ---------------------------------------------------------------- retained-evidence scan

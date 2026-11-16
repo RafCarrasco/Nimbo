@@ -34,6 +34,17 @@ const ALICE_ID_TOKEN = JSON.stringify({ sub: 'dev-alice', email: 'alice@nimbo.te
 const INVALID_LINK = 'Link de login inválido.';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /**
+ * fix6: the bridge-stdio fixture's isolated activation scheme, derived independently from its seed
+ * (`golive-testhost-<FNV-1a 64("bridge-stdio")>`, examples/bridge-stdio.rs STDIO_SCHEME_SEED). The
+ * UrlLog expected-activation capability is armed per successful Deliver tab with this exact scheme.
+ */
+function fnv1a64Hex(seed) {
+  let h = 0xcbf29ce484222325n;
+  for (const b of Buffer.from(seed)) h = BigInt.asUintN(64, (h ^ BigInt(b)) * 0x100000001b3n);
+  return h.toString(16).padStart(16, '0');
+}
+const ACTIVATION_SCHEME = 'golive-testhost-' + fnv1a64Hex('bridge-stdio');
+/**
  * S3 Deliver page (D1=B1): NOT the plain page; the login state exactly once, only inside the
  * a#open href of this host's ISOLATED scheme; both Electron sentences; no token/identity data.
  * Returns sanitized booleans only (the href/state is never retained in evidence).
@@ -80,13 +91,15 @@ function provenance() {
 }
 
 /** Drives the producer page for one login URL; returns the callback page observations. */
-async function produce(loginUrl, { state }) {
+async function produce(loginUrl, { state, activate }) {
   const tab = await openTab(chrome.cdp, sessions);
   const url = new URL(loginUrl);
   if (state) url.searchParams.set('state', state);
   url.searchParams.set('devUser', 'alice');
   const port = Number(url.searchParams.get('port'));
   const callback = `http://127.0.0.1:${port}/callback`;
+  // fix6: armed BEFORE the real action, only for an expected successful Deliver of this login.
+  const activation = activate ? urlLog.armActivation({ state: activate, sessionId: tab.sessionId, callbackUrl: callback }) : null;
   const from = callbackRequests.length;
   await chrome.cdp.send('Page.navigate', { url: url.href }, tab.sessionId);
   await waitForPage(chrome.cdp, tab.sessionId, `document.readyState === 'complete' && [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Continuar com Google'))`, 'producer page');
@@ -98,8 +111,12 @@ async function produce(loginUrl, { state }) {
   const body = await chrome.cdp.send('Network.getResponseBody', { requestId: req.requestId }, tab.sessionId);
   const page = await evaluate(chrome.cdp, tab.sessionId, `({ title: document.title, h1: document.querySelector('h1')?.textContent ?? null,
     text: document.body ? document.body.innerText : '', html: document.documentElement.outerHTML, top: window.top === window })`);
+  if (activation !== null) {
+    await until(() => urlLog.activationSettled(activation), 'the Deliver page activation attempt and its loadingFailed');
+    assert.equal(urlLog.activationEvidence().contexts[activation].proven, true, 'exactly one proven non-network activation attempt for this Deliver page');
+  }
   await chrome.cdp.send('Target.closeTarget', { targetId: tab.targetId });
-  return { req, body: body.base64Encoded ? Buffer.from(body.body, 'base64').toString('utf8') : body.body, page, callback };
+  return { req, body: body.base64Encoded ? Buffer.from(body.body, 'base64').toString('utf8') : body.body, page, callback, activation };
 }
 
 /**
@@ -132,7 +149,8 @@ describe('S3 L2 producer', { skip: GUARD.ok ? false : 'refused outside the isola
     assert.deepEqual(ev.provenance.markers, { 'demo-nimbo': true, '127.0.0.1:9099': true, production_apiKey_extracted: true, production_apiKey_absent: true });
     server = await startStaticServer({ root: DIST, port: Number(new URL(ORIGIN).port) });
     assert.equal(server.origin, ORIGIN);
-    urlLog = new UrlLog();
+    assert.equal(ACTIVATION_SCHEME, 'golive-testhost-2e6f92e8f8cf4af8', 'fixture scheme as observed in the run1 trace');
+    urlLog = new UrlLog({ activation: { scheme: ACTIVATION_SCHEME, origin: ORIGIN } });
     callbackRequests = [];
     chrome = await launchChrome({ chrome: process.env.NIMBO_CHROME, userDataDir: path.resolve(ROOT, '..', 'chrome-l2'), flags: DEFENSE_FLAGS });
     ev.chrome = { browser: chrome.browser, flags: chrome.flags };
@@ -164,7 +182,7 @@ describe('S3 L2 producer', { skip: GUARD.ok ? false : 'refused outside the isola
     ev.secrets_seen.push(login.state);
     assert.equal(login.origin, ORIGIN, 'login URL already targets the static origin');
     assert.equal(login.path, '/desktop-login');
-    const r = await produce(login.url, {});
+    const r = await produce(login.url, { activate: login.state });
     assert.equal(r.req.method, 'POST');
     assert.equal(r.req.type, 'Document', 'top-level form navigation');
     assert.equal(r.req.status, 200);
@@ -204,7 +222,7 @@ describe('S3 L2 producer', { skip: GUARD.ok ? false : 'refused outside the isola
     assert.equal(signIn.done, false, 'login stays pending');
     assert.equal(h.toPage.length, before, 'double received nothing');
     assert.equal((await h.stats()).active, true);
-    const good = await produce(login.url, {});
+    const good = await produce(login.url, { activate: login.state });
     assert.equal(good.req.status, 200);
     assertActivationPage(good.body, good.page.html, login.state);
     await until(() => signIn.done, 'signIn result after the correct POST');
@@ -218,13 +236,16 @@ describe('S3 L2 producer', { skip: GUARD.ok ? false : 'refused outside the isola
 
   test(LABEL + 'offline EVIDENCE: CDP URL log loopback-only, /proc audit clean, retained evidence scanned', async () => {
     const violations = urlLog.violations();
+    const reconciled = urlLog.reconcileActivations();
     ev.url_log = { entries: urlLog.entries, requestWillBeSent: urlLog.count('Network.requestWillBeSent'), loadingFailed: urlLog.count('Network.loadingFailed'),
-      webSocketCreated: urlLog.count('Network.webSocketCreated'), violations, sessions: [...sessions.values()].map((s) => ({ type: s.type, detached: !!s.detached })) };
+      webSocketCreated: urlLog.count('Network.webSocketCreated'), violations, sessions: [...sessions.values()].map((s) => ({ type: s.type, detached: !!s.detached })),
+      activation: urlLog.activationEvidence(), activation_reconcile: reconciled };
     ev.callback_requests = callbackRequests.map((r) => ({ url: maskUrl(r.url), method: r.method, origin: r.origin, status: r.status, type: r.type, remoteIPAddress: r.remoteIPAddress }));
     ev.static_requests = server.requests.slice();
     assert.ok(ev.static_requests.length > 0 && ev.static_requests.every((r) => r.method === 'GET' && [200, 404].includes(r.status)), 'static server served GETs only');
     assert.ok(ev.url_log.requestWillBeSent >= 6, 'non-empty URL log');
-    assert.deepEqual(violations, [], 'every URL is loopback/internal');
+    assert.deepEqual(violations, [], 'every URL is loopback/internal (except proven activation attempts)');
+    assert.deepEqual(reconciled, { ok: true, armed: 2, proven: 2, unproven: [] }, 'one proven activation attempt per successful Deliver page (valid, good-after-wrong)');
     audit('L2 final', ['chrome', 'node']);
     fs.mkdirSync(EVIDENCE, { recursive: true });
     const { secrets_seen: seen, ...kept } = ev;
