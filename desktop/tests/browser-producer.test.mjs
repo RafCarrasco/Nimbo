@@ -90,6 +90,14 @@ function provenance() {
     fixture_sha256: createHash('sha256').update(fs.readFileSync(process.env.NIMBO_BRIDGE_STDIO_BIN)).digest('hex') };
 }
 
+/** revision1 R1: the attached tab's root frame id from its own session (read-only; no page change). */
+async function mainFrameId(sessionId) {
+  const { frameTree } = await chrome.cdp.send('Page.getFrameTree', {}, sessionId);
+  const root = frameTree?.frame;
+  assert.ok(root && typeof root.id === 'string' && root.id && root.parentId === undefined, 'attached tab root frame');
+  return root.id;
+}
+
 /** Drives the producer page for one login URL; returns the callback page observations. */
 async function produce(loginUrl, { state, activate }) {
   const tab = await openTab(chrome.cdp, sessions);
@@ -99,7 +107,9 @@ async function produce(loginUrl, { state, activate }) {
   const port = Number(url.searchParams.get('port'));
   const callback = `http://127.0.0.1:${port}/callback`;
   // fix6: armed BEFORE the real action, only for an expected successful Deliver of this login.
-  const activation = activate ? urlLog.armActivation({ state: activate, sessionId: tab.sessionId, callbackUrl: callback }) : null;
+  // revision1 R1: pinned to the attached tab's actual ROOT frame (read-only Page.getFrameTree, before
+  // navigation) — never inferred from a later event, assumed equal to the targetId, or a child frame.
+  const activation = activate ? urlLog.armActivation({ state: activate, sessionId: tab.sessionId, frameId: await mainFrameId(tab.sessionId), callbackUrl: callback }) : null;
   const from = callbackRequests.length;
   await chrome.cdp.send('Page.navigate', { url: url.href }, tab.sessionId);
   await waitForPage(chrome.cdp, tab.sessionId, `document.readyState === 'complete' && [...document.querySelectorAll('button')].some((b) => b.textContent.includes('Continuar com Google'))`, 'producer page');

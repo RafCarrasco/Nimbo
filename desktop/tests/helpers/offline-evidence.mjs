@@ -288,16 +288,19 @@ export class UrlLog {
    * Arms ONE expected activation context, BEFORE the real action, for a known login state, the
    * main-document CDP session that will POST to `callbackUrl`, and this capability's scheme and
    * app origin. Returns the context index. At most ACTIVATION_MAX_CONTEXTS; one per session.
+   * `frameId` is the MANDATORY expected main frame: the caller reads it from the attached tab's
+   * Page.getFrameTree root before navigating; both the source POST and the attempt must be in it.
    */
-  armActivation({ state, sessionId, callbackUrl } = {}) {
+  armActivation({ state, sessionId, frameId, callbackUrl } = {}) {
     const cap = this.#activation;
     if (!cap) throw new Error('activation capability disabled');
     if (cap.contexts.length >= ACTIVATION_MAX_CONTEXTS) throw new Error('activation context bound reached');
     if (typeof state !== 'string' || !ACTIVATION_STATE.test(state)) throw new Error('activation state malformed');
     if (typeof sessionId !== 'string' || !sessionId) throw new Error('activation session malformed');
+    if (typeof frameId !== 'string' || !ACTIVATION_FRAME.test(frameId)) throw new Error('activation frame malformed');
     if (typeof callbackUrl !== 'string' || !ACTIVATION_CALLBACK.test(callbackUrl)) throw new Error('activation callback malformed');
     if (cap.contexts.some((c) => c.sessionId === sessionId)) throw new Error('activation session already armed');
-    cap.contexts.push({ index: cap.contexts.length, sessionId, callbackUrl, state, canonical: `${cap.scheme}://auth?state=${state}`,
+    cap.contexts.push({ index: cap.contexts.length, sessionId, frameId, callbackUrl, state, canonical: `${cap.scheme}://auth?state=${state}`,
       armed_seq: this.entries.length, source: null, attempt: null, failure: null, errors: [] });
     return cap.contexts.length - 1;
   }
@@ -313,7 +316,8 @@ export class UrlLog {
     return { capability: 'expected-activation', scheme: cap.scheme, origin: cap.origin, max_contexts: ACTIVATION_MAX_CONTEXTS,
       contexts: cap.contexts.map((c) => {
         const reasons = activationReasons(c);
-        return { index: c.index, sessionId: c.sessionId, callback: c.callbackUrl, armed_seq: c.armed_seq, state_commitment: activationCommitment(c.state),
+        return { index: c.index, sessionId: c.sessionId, frameId: c.frameId, callback: c.callbackUrl, armed_seq: c.armed_seq, state_commitment: activationCommitment(c.state),
+          expected_uri_commitment: activationUriCommitment(c.canonical),
           source: c.source && { ...c.source }, attempt: c.attempt && { ...c.attempt }, failure: c.failure && { ...c.failure },
           errors: [...c.errors], reasons, proven: reasons.length === 0 };
       }) };
@@ -338,6 +342,7 @@ export class UrlLog {
     if (method === 'Network.loadingFailed') Object.assign(e, { errorText: params.errorText ?? null, canceled: !!params.canceled });
     if (method === 'Network.responseReceived') Object.assign(e, { status: params.response?.status ?? null, remoteIPAddress: params.response?.remoteIPAddress ?? null });
     if (method === 'Network.webSocketHandshakeResponseReceived') e.status = params.response?.status ?? null;
+    if (this.#activation && method === 'Network.requestWillBeSent') Object.assign(e, observedRequestFields(params, raw, e.url_class));
     this.entries.push(e);
     if (this.#activation) observeActivation(this.#activation, e, params, raw);
   }
@@ -361,11 +366,37 @@ const ACTIVATION_MAX_CONTEXTS = 16;
 const ACTIVATION_SCHEME = /^golive-testhost-[0-9a-f]{16}$/;
 const ACTIVATION_STATE = /^[0-9a-f]{48}$/;
 const ACTIVATION_CALLBACK = /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/callback$/;
-const ACTIVATION_ORIGIN = /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/;
+const ACTIVATION_ORIGIN = /^http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})$/;
 const ACTIVATION_URI = /^(golive-testhost-[0-9a-f]{16}):\/\/auth\?state=([0-9a-f]{48})$/;
+/** A CDP frame id (opaque token; Chrome uses 32 upper-case hex). Never inferred from events. */
+const ACTIVATION_FRAME = /^[A-Za-z0-9._-]{1,128}$/;
 
 /** Domain-separated SHA-256 commitment of a login state (retained instead of the 48-hex value). */
 export const activationCommitment = (state) => createHash('sha256').update('nimbo-s3-activation-state\0').update(String(state)).digest('hex');
+/** Domain-separated SHA-256 commitment of a complete RAW URI (taken before any normalization/masking). */
+export const activationUriCommitment = (uri) => createHash('sha256').update('nimbo-s3-activation-uri\0').update(String(uri)).digest('hex');
+
+/**
+ * revision1 R2: SAFE independently observed request fields, retained in the ordered log only when
+ * the capability is opted in. frameId: the CDP frame (null when absent, a fixed marker when not a
+ * frame token). origin: the request's Origin header only as a canonical loopback origin (null when
+ * absent, a fixed marker otherwise; never the raw header). For external (non-network candidate)
+ * requests: commitments of the RAW URI and, when it has the activation grammar, of its state.
+ * No other header, body or raw value is retained.
+ */
+function observedRequestFields(params, raw, urlClass) {
+  const f = params.frameId;
+  const h = params.request?.headers || {};
+  const o = Object.hasOwn(h, 'Origin') ? h.Origin : Object.hasOwn(h, 'origin') ? h.origin : undefined;
+  const m = typeof o === 'string' ? ACTIVATION_ORIGIN.exec(o) : null;
+  const out = { frameId: f === undefined || f === null ? null : typeof f === 'string' && ACTIVATION_FRAME.test(f) ? f : '<invalid-frame>',
+    origin: o === undefined ? null : m && Number(m[1]) <= 65535 ? o : '<invalid-origin>' };
+  if (urlClass === 'external') {
+    const sm = ACTIVATION_URI.exec(typeof raw === 'string' ? raw : '');
+    Object.assign(out, { uri_commitment: typeof raw === 'string' ? activationUriCommitment(raw) : null, state_commitment: sm ? activationCommitment(sm[2]) : null });
+  }
+  return out;
+}
 
 function activationCapability(o) {
   if (!o || typeof o.scheme !== 'string' || !ACTIVATION_SCHEME.test(o.scheme)) throw new Error('activation scheme must be an isolated test-host scheme');
@@ -381,9 +412,9 @@ function observeActivation(cap, e, params, raw) {
   if (e.method === 'Network.requestWillBeSent') {
     if (raw === c.callbackUrl) {
       if (c.source) return err('source-duplicate');
-      const h = params.request?.headers || {};
-      c.source = { requestId: rid, frameId: params.frameId ?? null, seq: e.seq, http_method: e.http_method, type: e.type,
-        origin_ok: (h.Origin ?? h.origin) === cap.origin, redirect: !!params.redirectResponse, status: null, response_seq: null };
+      // revision1 R2: frame and Origin come from the SAFE observed event fields retained in the log.
+      c.source = { requestId: rid, frameId: e.frameId, seq: e.seq, http_method: e.http_method, type: e.type, origin: e.origin,
+        origin_ok: e.origin === cap.origin, redirect: !!params.redirectResponse, status: null, response_seq: null };
       return;
     }
     if (c.attempt && rid === c.attempt.requestId) return err('attempt-redirect');
@@ -391,8 +422,9 @@ function observeActivation(cap, e, params, raw) {
     if (e.url_class !== 'external') return;
     if (c.attempt) return err('attempt-duplicate');
     const m = ACTIVATION_URI.exec(typeof raw === 'string' ? raw : '');
-    c.attempt = { requestId: rid, frameId: params.frameId ?? null, seq: e.seq, http_method: e.http_method, type: e.type, redirect: !!params.redirectResponse,
+    c.attempt = { requestId: rid, frameId: e.frameId, seq: e.seq, http_method: e.http_method, type: e.type, redirect: !!params.redirectResponse,
       url: e.url, canonical: raw === c.canonical, scheme_match: !!m && m[1] === cap.scheme, observed_state_commitment: m ? activationCommitment(m[2]) : null,
+      observed_uri_commitment: e.uri_commitment,
       after_source_response: !!c.source && c.source.response_seq !== null };
     return;
   }
@@ -425,14 +457,15 @@ function activationReasons(c) {
     if (s.http_method !== 'POST' || s.type !== 'Document' || s.redirect) r.push('source-not-document-post');
     if (!s.origin_ok) r.push('source-origin');
     if (s.status !== 200 || s.response_seq === null) r.push('source-not-200');
-    if (typeof s.frameId !== 'string' || !s.frameId) r.push('source-frame');
+    if (typeof s.frameId !== 'string' || !s.frameId || s.frameId !== c.frameId) r.push('source-frame');
   }
   if (!a) r.push('attempt-missing');
   else {
     if (a.http_method !== 'GET' || a.type !== 'Document' || a.redirect) r.push('attempt-not-document-get');
-    if (!a.canonical || !a.scheme_match || a.observed_state_commitment !== activationCommitment(c.state)) r.push('attempt-uri');
+    if (!a.canonical || !a.scheme_match || a.observed_state_commitment !== activationCommitment(c.state)
+      || a.observed_uri_commitment !== activationUriCommitment(c.canonical)) r.push('attempt-uri');
     if (!a.after_source_response || !s || s.response_seq === null || s.response_seq > a.seq) r.push('attempt-order');
-    if (!s || a.frameId !== s.frameId) r.push('attempt-frame');
+    if (!s || a.frameId !== s.frameId || a.frameId !== c.frameId) r.push('attempt-frame');
     if (!c.failure || c.failure.seq <= a.seq) r.push('failure-missing');
   }
   return r;

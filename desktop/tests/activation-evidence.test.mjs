@@ -41,7 +41,8 @@ function flow(o = {}) {
 const replay = (log, events) => { for (const [m, p, s] of events) log.record(m, p, s); return log; };
 const armed = (opts = {}) => {
   const log = new UrlLog({ activation: { scheme: SCHEME, origin: ORIGIN } });
-  const ctx = log.armActivation({ state: opts.state ?? STATE, sessionId: opts.sessionId ?? SID, callbackUrl: opts.callbackUrl ?? CALLBACK });
+  // revision1 R1: the expected MAIN frame is pinned explicitly (callers read it from Page.getFrameTree).
+  const ctx = log.armActivation({ state: opts.state ?? STATE, sessionId: opts.sessionId ?? SID, frameId: opts.frameId ?? FRAME, callbackUrl: opts.callbackUrl ?? CALLBACK });
   return { log, ctx };
 };
 const activationEntries = (log) => log.violations().filter((e) => e.requestId === 'ACT' || e.url?.startsWith('golive'));
@@ -87,9 +88,13 @@ describe('PURE UrlLog expected-activation: genuine Deliver attempt (B1 reproduct
     assert.equal(c.sessionId, SID);
     assert.equal(c.callback, CALLBACK);
     assert.equal(c.state_commitment, commit(STATE));
-    assert.deepEqual(c.source, { requestId: 'SRC', frameId: FRAME, seq: 2, http_method: 'POST', type: 'Document', origin_ok: true, redirect: false, status: 200, response_seq: 3 });
+    // revision1 R2: exact shapes strengthened with the observed Origin and the URI commitments.
+    assert.deepEqual(c.source, { requestId: 'SRC', frameId: FRAME, seq: 2, http_method: 'POST', type: 'Document', origin: ORIGIN, origin_ok: true, redirect: false, status: 200, response_seq: 3 });
     assert.deepEqual(c.attempt, { requestId: 'ACT', frameId: FRAME, seq: 4, http_method: 'GET', type: 'Document', redirect: false,
-      url: `${SCHEME}://auth?state=<masked>`, canonical: true, scheme_match: true, observed_state_commitment: commit(STATE), after_source_response: true });
+      url: `${SCHEME}://auth?state=<masked>`, canonical: true, scheme_match: true, observed_state_commitment: commit(STATE),
+      observed_uri_commitment: createHash('sha256').update('nimbo-s3-activation-uri\0').update(ACTIVATION).digest('hex'), after_source_response: true });
+    assert.equal(c.frameId, FRAME);
+    assert.equal(c.expected_uri_commitment, c.attempt.observed_uri_commitment);
     assert.deepEqual(c.failure, { seq: 5, errorText: 'net::ERR_ABORTED', canceled: true });
     const text = JSON.stringify({ entries: log.entries, activation: ev, log });
     assert.deepEqual(scanForSecrets(text, [STATE]), [], 'retained evidence never carries the raw state');
@@ -104,7 +109,7 @@ describe('PURE UrlLog expected-activation: default and classification preserved 
     assert.equal(log.violations()[0].requestId, 'ACT');
   });
   test('D2 arming without the explicit opt-in capability is refused', () => {
-    assert.throws(() => new UrlLog().armActivation({ state: STATE, sessionId: SID, callbackUrl: CALLBACK }), /activation capability disabled/);
+    assert.throws(() => new UrlLog().armActivation({ state: STATE, sessionId: SID, frameId: FRAME, callbackUrl: CALLBACK }), /activation capability disabled/);
   });
   test('D3 classifyUrl/maskUrl unchanged: unknown and custom protocols are external; loopback/internal positives', () => {
     assert.equal(classifyUrl(ACTIVATION), 'external');
@@ -199,26 +204,135 @@ describe('PURE UrlLog expected-activation: bounded, validated arming', () => {
   test('B2 arm rejects malformed state, session or callback', () => {
     for (const bad of [{ state: STATE.toUpperCase() }, { state: STATE.slice(1) }, { state: 'g'.repeat(48) }, { sessionId: '' }, { sessionId: null },
       { callbackUrl: 'http://example.test/callback' }, { callbackUrl: `http://127.0.0.1:${PORT}/callback?x=1` }, { callbackUrl: `https://127.0.0.1:${PORT}/callback` }]) {
-      assert.throws(() => make().armActivation({ state: STATE, sessionId: SID, callbackUrl: CALLBACK, ...bad }), /activation/);
+      assert.throws(() => make().armActivation({ state: STATE, sessionId: SID, frameId: FRAME, callbackUrl: CALLBACK, ...bad }), /activation/);
     }
   });
   test('B3 at most 16 contexts; one context per session', () => {
     const log = make();
-    for (let i = 0; i < 16; i++) assert.equal(log.armActivation({ state: STATE, sessionId: 'S' + i, callbackUrl: CALLBACK }), i);
-    assert.throws(() => log.armActivation({ state: STATE, sessionId: 'S16', callbackUrl: CALLBACK }), /activation/);
+    for (let i = 0; i < 16; i++) assert.equal(log.armActivation({ state: STATE, sessionId: 'S' + i, frameId: FRAME, callbackUrl: CALLBACK }), i);
+    assert.throws(() => log.armActivation({ state: STATE, sessionId: 'S16', frameId: FRAME, callbackUrl: CALLBACK }), /activation/);
     const one = make();
-    one.armActivation({ state: STATE, sessionId: SID, callbackUrl: CALLBACK });
-    assert.throws(() => one.armActivation({ state: OTHER, sessionId: SID, callbackUrl: CALLBACK }), /activation/);
+    one.armActivation({ state: STATE, sessionId: SID, frameId: FRAME, callbackUrl: CALLBACK });
+    assert.throws(() => one.armActivation({ state: OTHER, sessionId: SID, frameId: FRAME, callbackUrl: CALLBACK }), /activation/);
   });
   test('B4 two genuine flows in two armed sessions -> both proven, per-success count 2', () => {
     const log = make();
-    log.armActivation({ state: STATE, sessionId: 'S-A', callbackUrl: CALLBACK });
-    log.armActivation({ state: OTHER, sessionId: 'S-B', callbackUrl: CALLBACK });
+    log.armActivation({ state: STATE, sessionId: 'S-A', frameId: FRAME, callbackUrl: CALLBACK });
+    log.armActivation({ state: OTHER, sessionId: 'S-B', frameId: FRAME, callbackUrl: CALLBACK });
     replay(log, [...flow({ sid: 'S-A' }), ...flow({ sid: 'S-B', url: `${SCHEME}://auth?state=${OTHER}` })]);
     assert.deepEqual(log.violations(), []);
     assert.deepEqual(log.reconcileActivations(), { ok: true, armed: 2, proven: 2, unproven: [] });
   });
   test('B5 no context armed -> reconcile is not ok (an expected success cannot be vacuous)', () => {
     assert.equal(make().reconcileActivations().ok, false);
+  });
+});
+
+// revision1 R1 (correction7): the caller-pinned expected MAIN frame is a mandatory, enforced field of
+// each armed context. Matching source and attempt frames are not proof that either is the root frame.
+describe('PURE UrlLog expected-activation: caller-pinned main frame (revision1 R1)', () => {
+  const make = () => new UrlLog({ activation: { scheme: SCHEME, origin: ORIGIN } });
+  test('R1a identical valid source + attempt in a wrong (child) frame -> unproven; the attempt stays a violation', () => {
+    const { log } = armed();
+    replay(log, flow({ srcFrame: 'FRAME-CHILD', actFrame: 'FRAME-CHILD' }));
+    assert.equal(log.activationEvidence().contexts[0].proven, false, 'a matching child frame must not replace the pinned main frame');
+    assert.equal(log.reconcileActivations().ok, false);
+    assert.ok(log.violations().some((e) => e.method === 'Network.requestWillBeSent' && e.requestId === 'ACT'));
+  });
+  test('R1b positive control: source + attempt in the actual pinned main frame -> proven', () => {
+    const { log } = armed();
+    replay(log, flow());
+    assert.equal(log.activationEvidence().contexts[0].proven, true);
+    assert.deepEqual(log.violations(), []);
+  });
+  test('R1c the expected main-frame pin is mandatory and validated', () => {
+    for (const frameId of [undefined, null, '', 42, 'a b', 'x'.repeat(129), '<script>', 'FRAME\n1']) {
+      assert.throws(() => make().armActivation({ state: STATE, sessionId: SID, frameId, callbackUrl: CALLBACK }), /activation frame/, String(frameId));
+    }
+  });
+  test('R1d the expected frame identity is retained in the context evidence', () => {
+    const { log } = armed();
+    replay(log, flow());
+    assert.equal(log.activationEvidence().contexts[0].frameId, FRAME);
+  });
+  test('R1e only the source in a child frame, or only the attempt -> unproven', () => {
+    for (const o of [{ srcFrame: 'FRAME-CHILD' }, { actFrame: 'FRAME-CHILD' }]) {
+      const { log } = armed();
+      replay(log, flow(o));
+      assert.equal(log.reconcileActivations().ok, false, JSON.stringify(o));
+    }
+  });
+});
+
+// revision1 R2 (correction7): with the capability opted in, the ordered log itself retains the SAFE
+// independently observed fields the verifier needs (CDP frameId, canonical loopback Origin or a fixed
+// marker, and domain-separated URI/state commitments computed from the raw URI BEFORE masking), so
+// E1/T2 never have to trust mutable context booleans. The default log shape is unchanged.
+describe('PURE UrlLog expected-activation: independently observed event fields (revision1 R2)', () => {
+  const uriCommit = (u) => createHash('sha256').update('nimbo-s3-activation-uri\0').update(u).digest('hex');
+  const rws = (log, id) => log.entries.find((e) => e.method === 'Network.requestWillBeSent' && e.requestId === id);
+  test('R2a default (disabled) log entries keep their exact original shape (characterization)', () => {
+    const log = replay(new UrlLog(), flow());
+    for (const e of log.entries.filter((x) => x.method === 'Network.requestWillBeSent')) {
+      assert.deepEqual(Object.keys(e), ['seq', 'method', 'sessionId', 'requestId', 'url', 'url_class', 'http_method', 'type', 'redirect_from']);
+    }
+  });
+  test('R2b opted in: the source request event carries its frame and safe Origin; the attempt event its frame and commitments', () => {
+    const { log } = armed();
+    replay(log, flow());
+    const src = rws(log, 'SRC'), act = rws(log, 'ACT');
+    assert.equal(src.frameId, FRAME);
+    assert.equal(src.origin, ORIGIN);
+    assert.equal(act.frameId, FRAME);
+    assert.equal(act.uri_commitment, uriCommit(ACTIVATION));
+    assert.equal(act.state_commitment, commit(STATE));
+  });
+  test('R2c context evidence carries the expected canonical-URI commitment, bound to the observed event', () => {
+    const { log } = armed();
+    replay(log, flow());
+    const c = log.activationEvidence().contexts[0];
+    assert.equal(c.expected_uri_commitment, uriCommit(ACTIVATION));
+    assert.equal(c.attempt.observed_uri_commitment, rws(log, 'ACT').uri_commitment);
+    assert.equal(c.source.origin, ORIGIN);
+    assert.equal(c.proven, true);
+  });
+  test('R2d malformed or non-loopback Origin -> fixed nonsecret marker (never the raw header) and unproven', () => {
+    for (const bad of ['https://evil.test', `${ORIGIN}/`, 'http://127.0.0.1:99999', 'null', 'http://localhost:4173', `${ORIGIN}\r\nX-Evil: 1`, 'http://127.0.0.1:04173', 7]) {
+      const { log } = armed();
+      replay(log, flow({ srcHeaders: { Origin: bad } }));
+      assert.equal(rws(log, 'SRC').origin, '<invalid-origin>', String(bad));
+      assert.equal(log.reconcileActivations().ok, false, String(bad));
+      const text = JSON.stringify({ entries: log.entries, a: log.activationEvidence() });
+      assert.ok(!text.includes('evil') && !text.includes('X-Evil') && !text.includes('localhost'), 'raw header never retained');
+    }
+    const { log } = armed();
+    replay(log, flow({ srcHeaders: {} }));
+    assert.equal(rws(log, 'SRC').origin, null);
+    assert.equal(log.reconcileActivations().ok, false);
+  });
+  test('R2e missing or malformed event frameId -> null/marker and unproven', () => {
+    for (const [f, want] of [[undefined, null], ['bad frame', '<invalid-frame>'], [42, '<invalid-frame>']]) {
+      const { log } = armed();
+      replay(log, flow({ srcFrame: f, actFrame: f }).map(([m, p, s]) => [m, f === undefined && p.frameId !== undefined && m === 'Network.requestWillBeSent' && p.requestId !== 'LOGIN' ? (({ frameId, ...rest }) => rest)(p) : p, s]));
+      assert.equal(rws(log, 'SRC').frameId, want);
+      assert.equal(rws(log, 'ACT').frameId, want);
+      assert.equal(log.reconcileActivations().ok, false);
+    }
+  });
+  test('R2f a noncanonical raw URI with the same masked shape gets a different event commitment and stays unproven', () => {
+    const raw = `${SCHEME.toUpperCase()}://auth?state=${STATE}`;
+    const { log } = armed();
+    replay(log, flow({ url: raw }));
+    const act = rws(log, 'ACT');
+    assert.equal(act.url, maskUrl(ACTIVATION), 'masked shape looks plausible');
+    assert.notEqual(act.uri_commitment, uriCommit(ACTIVATION));
+    assert.equal(act.uri_commitment, uriCommit(raw));
+    assert.equal(log.reconcileActivations().ok, false);
+  });
+  test('R2g retained opted-in log + evidence scan clean; no raw state anywhere', () => {
+    const { log } = armed();
+    replay(log, flow());
+    const text = JSON.stringify({ entries: log.entries, a: log.activationEvidence() });
+    assert.deepEqual(scanForSecrets(text, [STATE]), []);
   });
 });
