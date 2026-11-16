@@ -2,6 +2,11 @@
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
+mod enumeration;
+pub use enumeration::{DesktopRect, NativeMonitor};
+#[cfg(windows)]
+pub mod windows;
+
 #[derive(Debug, Clone)]
 pub struct NativeWindow {
     pub hwnd: String,
