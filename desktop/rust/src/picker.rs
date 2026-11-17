@@ -1,6 +1,45 @@
 //! Attributed picker lifecycle. Portable host core, not a WebView controller or capture grant.
 use crate::policy::{Config, NativeRequest};
+mod protocol;
+#[cfg(windows)]
+pub mod windows;
+pub use protocol::{WireAction, WireMethod};
 pub const PICKER_URL: &str = "https://nimbo-picker.invalid/";
+pub const PICKER_SCRIPT: &str = include_str!("../bridge/picker.js");
+pub fn document_resource(uri: &str, method: &str) -> Option<&'static [u8]> {
+    (uri == PICKER_URL && method == "GET")
+        .then_some(include_str!("../../capture-picker.html").as_bytes())
+}
+pub fn minimum_size(work: crate::shell::Rect, dpi: u32) -> Result<(i32, i32), &'static str> {
+    let bounds = initial_bounds(work, dpi)?;
+    Ok((
+        crate::shell::scale(680, dpi).min(bounds.right - bounds.left),
+        crate::shell::scale(500, dpi).min(bounds.bottom - bounds.top),
+    ))
+}
+pub fn initial_bounds(
+    work: crate::shell::Rect,
+    dpi: u32,
+) -> Result<crate::shell::Rect, &'static str> {
+    let width = i64::from(work.right) - i64::from(work.left);
+    let height = i64::from(work.bottom) - i64::from(work.top);
+    let margin = i64::from(crate::shell::scale(40, dpi));
+    if width <= margin || height <= margin {
+        return Err("picker-workarea-too-small");
+    }
+    let w = i64::from(crate::shell::scale(880, dpi)).min(width - margin);
+    let h = i64::from(crate::shell::scale(640, dpi)).min(height - margin);
+    let left = i64::from(work.left) + (width - w) / 2;
+    let top = i64::from(work.top) + (height - h) / 2;
+    Ok(crate::shell::Rect {
+        left: left.try_into().map_err(|_| "picker-bounds-overflow")?,
+        top: top.try_into().map_err(|_| "picker-bounds-overflow")?,
+        right: (left + w)
+            .try_into()
+            .map_err(|_| "picker-bounds-overflow")?,
+        bottom: (top + h).try_into().map_err(|_| "picker-bounds-overflow")?,
+    })
+}
 /// Host-populated event attribution; never deserialize these fields from JavaScript.
 /// `window` is a unique, non-reused host controller instance id, not a raw/reusable HWND.
 pub struct PickerRequest<'a> {
@@ -17,6 +56,8 @@ pub struct RefreshTicket {
     sequence: u64,
 }
 pub struct PickerSession {
+    wire_ready: bool,
+    last_wire_id: u32,
     closed: bool,
     window: u64,
     owner_generation: u64,
@@ -93,6 +134,8 @@ impl PickerSession {
             return Err("picker-unauthorized");
         }
         Ok(Self {
+            wire_ready: false,
+            last_wire_id: 0,
             closed: false,
             window,
             owner_generation: main.document_generation,
@@ -166,6 +209,8 @@ impl PickerSession {
         if self.closed {
             return Err("picker-closed");
         }
+        self.wire_ready = false;
+        self.last_wire_id = 0;
         self.catalog = None;
         self.pending = None;
         self.frame = None;

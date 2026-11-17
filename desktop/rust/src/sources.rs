@@ -76,6 +76,12 @@ pub fn game_name(exe: &str) -> Option<&'static str> {
     }
 }
 
+pub(super) fn is_game_like(w: &NativeWindow) -> bool {
+    game_name(w.path.rsplit(['\\', '/']).next().unwrap_or("")).is_some()
+        || w.class_name.to_ascii_lowercase().contains("unrealwindow")
+        || (w.fullscreen && w.visible && !w.cloaked && !w.tool)
+}
+
 pub fn missing_sources(
     known: &[String],
     windows: &[NativeWindow],
@@ -113,9 +119,7 @@ pub fn missing_sources(
     };
     let mut best: Vec<&NativeWindow> = Vec::new();
     for w in all.iter().copied() {
-        let game_like = game_name(w.path.rsplit(['\\', '/']).next().unwrap_or("")).is_some()
-            || w.class_name.to_ascii_lowercase().contains("unrealwindow")
-            || (w.fullscreen && w.visible && !w.cloaked && !w.tool);
+        let game_like = is_game_like(w);
         if listed.contains(w.hwnd.as_str())
             || listed_pids.contains(&w.pid)
             || !game_like

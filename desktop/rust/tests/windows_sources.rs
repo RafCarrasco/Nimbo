@@ -22,6 +22,19 @@ fn native_provider_builds_a_catalog_with_real_screen_entries() {
 }
 
 #[test]
+fn native_os_build_is_queried_instead_of_inferred_from_package_or_browser_versions() {
+    let version = nimbo_desktop::picker::windows::native_os_version()
+        .expect("native OS version query failed");
+    let parts = version
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(parts.len(), 3);
+    assert!(parts[0] > 0 && parts[2] > 0);
+}
+
+#[test]
 fn process_snapshot_contains_the_current_process_without_an_exe_suffix() -> windows::core::Result<()>
 {
     let rows = enumerate_processes()?;

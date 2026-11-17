@@ -26,6 +26,7 @@ required-features = ["test-host"]
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.39.1"
 windows = { version = "=0.62.2", features = [
+    "Wdk_System_SystemServices", "Win32_System_SystemInformation",
     "Win32_UI_Shell", "Win32_System_Com", "Foundation", "Graphics_Capture",
     "Graphics_DirectX_Direct3D11", "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Gdi",

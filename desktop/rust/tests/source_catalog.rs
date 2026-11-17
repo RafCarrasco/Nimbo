@@ -103,6 +103,34 @@ fn provider_failure_never_produces_a_partial_catalog_or_runs_later_queries() {
     assert_eq!(fail.calls.get(), 2);
 }
 #[test]
+fn diagnostics_report_native_flags_and_games_without_own_window_titles() {
+    let mut game = window("12", 3, "Hidden game");
+    game.visible = false;
+    game.minimized = true;
+    game.path = "C:\\cs2.exe".into();
+    let c = Catalog::from_native(
+        &[],
+        &[
+            window("10", 1, "Private Nimbo title"),
+            window("11", 2, "Editor 東京"),
+            game,
+        ],
+        &[NativeProcess {
+            pid: 8,
+            name: "cs2".into(),
+        }],
+        &[1],
+    )
+    .unwrap();
+    let d = c.diagnostics("fixture-build");
+    assert!(d.contains("Windows fixture-build"));
+    assert!(d.contains("Jogos em execução: cs2 (8)"));
+    assert!(d.contains("Janelas: 2 (mostrando 2)"));
+    assert!(d.contains("Editor 東京 | Editor.exe | Editor | visible"));
+    assert!(d.contains("Hidden game | cs2.exe | Editor | minimized | JOGO"));
+    assert!(!d.contains("Private Nimbo title"));
+}
+#[test]
 fn native_catalog_combines_screens_and_legacy_rules_without_leaking_own_windows() {
     let c = Catalog::from_native(
         &[monitor()],

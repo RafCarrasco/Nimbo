@@ -5,6 +5,7 @@ use std::collections::HashMap;
 #[derive(Clone)]
 pub struct Catalog {
     entries: Vec<Value>,
+    diagnostics_body: String,
     identities: HashMap<String, Vec<String>>,
 }
 /// A metadata candidate, NOT permission to open a source. Revalidate against the OS before capture.
@@ -33,6 +34,15 @@ pub enum CollectError<E> {
     Invalid(&'static str),
 }
 impl Catalog {
+    /// Explicit local diagnostics only; never log this title-bearing text automatically.
+    pub fn diagnostics(&self, windows_version: &str) -> String {
+        format!(
+            "Nimbo {} · Windows {}\nEnumeração: Win32/Rust\n{}",
+            crate::policy::APP_VERSION,
+            windows_version,
+            self.diagnostics_body
+        )
+    }
     pub fn collect<P: MetadataProvider>(
         provider: &P,
         own: &[u32],
@@ -87,9 +97,66 @@ impl Catalog {
                 return Err("duplicate source identity");
             }
         }
+        let windows: Vec<_> = windows.iter().filter(|w| !own.contains(&w.pid)).collect();
+        let relevant: Vec<_> = windows
+            .iter()
+            .copied()
+            .filter(|w| w.visible || super::is_game_like(w) || w.minimized)
+            .collect();
+        let games: Vec<_> = processes
+            .iter()
+            .filter(|p| !own.contains(&p.pid) && super::game_name(&p.name).is_some())
+            .map(|p| format!("{} ({})", p.name, p.pid))
+            .collect();
+        let mut lines = vec![
+            format!(
+                "Jogos em execução: {}",
+                if games.is_empty() {
+                    "nenhum".into()
+                } else {
+                    games.join(", ")
+                }
+            ),
+            format!("Janelas: {} (mostrando {})", windows.len(), relevant.len()),
+        ];
+        for w in relevant {
+            let flags: Vec<_> = [
+                ("visible", w.visible),
+                ("owned", w.owned),
+                ("tool", w.tool),
+                ("cloaked", w.cloaked),
+                ("minimized", w.minimized),
+                ("fullscreen", w.fullscreen),
+            ]
+            .into_iter()
+            .filter_map(|(name, yes)| yes.then_some(name))
+            .collect();
+            let basename = if w.path.is_empty() {
+                "?"
+            } else {
+                w.path.rsplit(['\\', '/']).next().unwrap_or("?")
+            };
+            lines.push(format!(
+                "- {} | {} | {} | {}{}",
+                w.title,
+                basename,
+                w.class_name,
+                if flags.is_empty() {
+                    "-".into()
+                } else {
+                    flags.join(",")
+                },
+                if super::is_game_like(w) {
+                    " | JOGO"
+                } else {
+                    ""
+                }
+            ));
+        }
         Ok(Self {
             entries,
             identities,
+            diagnostics_body: lines.join("\n"),
         })
     }
     pub fn list(&self) -> Value {
