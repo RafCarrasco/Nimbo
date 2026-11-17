@@ -7,6 +7,21 @@ use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
 use windows::core::w;
 
 #[test]
+#[ignore = "native catalog provider; run on interactive Windows at final validation"]
+fn native_provider_builds_a_catalog_with_real_screen_entries() {
+    use nimbo_desktop::sources::{Catalog, windows::Win32Metadata};
+    let catalog = Catalog::collect(&Win32Metadata, &[std::process::id()])
+        .expect("native catalog collection failed");
+    let list = catalog.list();
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["type"] == "screen")
+    );
+}
+
+#[test]
 fn process_snapshot_contains_the_current_process_without_an_exe_suffix() -> windows::core::Result<()>
 {
     let rows = enumerate_processes()?;

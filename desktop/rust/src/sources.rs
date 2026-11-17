@@ -2,7 +2,10 @@
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
+mod catalog;
 mod enumeration;
+pub mod worker;
+pub use catalog::{Candidate, Catalog, CollectError, MetadataProvider};
 pub use enumeration::{DesktopRect, NativeMonitor};
 #[cfg(windows)]
 pub mod windows;

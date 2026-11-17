@@ -4,6 +4,7 @@ pub mod capture;
 pub mod frame_route;
 pub mod login;
 pub mod loopback;
+pub mod picker;
 pub mod policy;
 pub mod scheme;
 pub mod shell;

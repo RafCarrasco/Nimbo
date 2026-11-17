@@ -19,6 +19,22 @@ use windows::Win32::{
 };
 use windows::core::{BOOL, Error, HRESULT, PWSTR, Result};
 
+/// Real OS implementation of the same provider consumed/tested by Catalog::collect.
+/// Run on the host metadata worker under the initialized per-monitor-v2 DPI context.
+pub struct Win32Metadata;
+impl super::MetadataProvider for Win32Metadata {
+    type Error = Error;
+    fn monitors(&self) -> Result<Vec<NativeMonitor>> {
+        enumerate_monitors()
+    }
+    fn windows(&self, own: &[u32]) -> Result<Vec<NativeWindow>> {
+        enumerate_windows(own)
+    }
+    fn processes(&self) -> Result<Vec<NativeProcess>> {
+        enumerate_processes()
+    }
+}
+
 fn failure(message: &'static str) -> Error {
     Error::new(E_FAIL, message)
 }
