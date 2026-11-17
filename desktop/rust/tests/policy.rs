@@ -505,8 +505,9 @@ fn user_agent_carries_nimbo_version_token_once() {
     let base = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0";
     let ua = user_agent(base);
     assert_eq!(ua, format!("{base} Nimbo/{}", env!("CARGO_PKG_VERSION")));
-    assert_eq!(APP_VERSION, "0.4.1");
-    assert!(ua.ends_with(" Nimbo/0.4.1"));
+    // User-approved first Rust version (distribution decision D1); hosted package stays unchanged.
+    assert_eq!(APP_VERSION, "0.5.0");
+    assert!(ua.ends_with(" Nimbo/0.5.0"));
     assert_eq!(user_agent(&ua), ua, "idempotent");
 }
 
