@@ -94,7 +94,8 @@ fn main() -> ExitCode {
             sources::media_thumbnail,
             sources::media_icon,
             update::watch_update,
-            update::install_update
+            update::install_update,
+            update::check_update
         ])
         .setup(|app| {
             open_main_window(app.handle())?;
@@ -135,7 +136,8 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
             .permission("allow-media-thumbnail")
             .permission("allow-media-icon")
             .permission("allow-watch-update")
-            .permission("allow-install-update"),
+            .permission("allow-install-update")
+            .permission("allow-check-update"),
     )?;
 
     let selftest = selftest::requested();

@@ -2,6 +2,8 @@
 //!
 //!   nimbo-audio include <pid> [segundos] [arquivo.wav]   só o processo e seus filhos
 //!   nimbo-audio exclude <pid> [segundos] [arquivo.wav]   tudo menos o processo e seus filhos
+//!   nimbo-audio system <pid> [segundos] [arquivo.wav]    tudo menos o processo, os apps de
+//!                                                        chamada de voz e os filhos deles
 //!
 //! Captura pelo tempo pedido (padrão 5 s), grava um WAV (padrão `nimbo-audio.wav`) e escreve uma
 //! linha em JSON com o que capturou. Erro sai como `ERROR ...` na saída de erro, com código 1,
@@ -15,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use nimbo_audio::{BITS_PER_SAMPLE, CHANNELS, Capture, FRAME_BYTES, Mode, SAMPLE_RATE};
 
-const USAGE: &str = "uso: nimbo-audio include|exclude <pid> [segundos] [arquivo.wav]";
+const USAGE: &str = "uso: nimbo-audio include|exclude|system <pid> [segundos] [arquivo.wav]";
 /// Quanto esperar além do tempo pedido antes de desistir (o fluxo deveria andar com o relógio).
 const GRACE: Duration = Duration::from_secs(3);
 const WAV_HEADER: usize = 44;
@@ -34,6 +36,7 @@ fn parse(args: &[String]) -> Result<Job, String> {
     let mode = match args[0].as_str() {
         "include" => Mode::Include(pid),
         "exclude" => Mode::Exclude(pid),
+        "system" => Mode::SystemExcept { own: pid },
         _ => return Err("modo inválido".into()),
     };
     let seconds = match args.get(2) {
@@ -171,12 +174,13 @@ fn run(job: &Job) -> Result<String, String> {
     let (mode, pid) = match job.mode {
         Mode::Include(pid) => ("include", pid),
         Mode::Exclude(pid) => ("exclude", pid),
+        Mode::SystemExcept { own } => ("system", own),
     };
     // `frames` é o que foi para o arquivo; `silence_frames` conta a captura inteira, que anda
     // alguns milissegundos a mais até a parada.
     Ok(format!(
         "{{\"mode\":\"{mode}\",\"pid\":{pid},\"frames\":{},\"duration_s\":{:.3},\"elapsed_s\":{:.3},\
-         \"peak\":{:.6},\"rms\":{:.6},\"silence_frames\":{},\
+         \"peak\":{:.6},\"rms\":{:.6},\"silence_frames\":{},\"discontinuities\":{},         \"streams_opened\":{},\"gap_frames\":{},\
          \"format\":{{\"encoding\":\"pcm_s16le\",\"sample_rate\":{SAMPLE_RATE},\
          \"channels\":{CHANNELS},\"bits_per_sample\":{BITS_PER_SAMPLE}}},\"wav\":{}}}",
         sink.frames,
@@ -185,6 +189,9 @@ fn run(job: &Job) -> Result<String, String> {
         f64::from(sink.peak) / 32768.0,
         rms,
         stats.silence_frames,
+        stats.discontinuities,
+        stats.streams_opened,
+        stats.gap_frames,
         json_string(&job.path),
     ))
 }

@@ -69,6 +69,8 @@ export function UpdateBanner({ live }: { live: boolean }) {
   const failed = false;
   const [progress, setProgress] = useState(0);
   const [updating, setUpdating] = useState('');
+  // A atualização não começou (o app continuou aberto ou a página não recarregou): o que fazer.
+  const [problem, setProblem] = useState('');
   // App em Rust mais velho que o site e sem atualização chegando: o app só procura atualização ao
   // abrir e de tempos em tempos, então quem está com ele aberto há horas precisa fechar e abrir.
   const [stale, setStale] = useState(false);
@@ -105,6 +107,10 @@ export function UpdateBanner({ live }: { live: boolean }) {
     if (fake === 'outdated') setOutdated('0.2.0');
     if (fake === 'progress') setProgress(45);
     if (fake === 'stale') setStale(true);
+    if (fake === 'problem') {
+      setAppVersion('9.9.9');
+      setProblem('A atualização não começou. Feche e abra o Nimbo: ela instala ao abrir.');
+    }
     const offProgress = desktop?.onUpdateProgress?.(setProgress);
     if (!desktop?.watchUpdate) return offProgress;
     void desktop.watchUpdate((info) => setAppVersion(info.version)).then((r) => {
@@ -115,9 +121,17 @@ export function UpdateBanner({ live }: { live: boolean }) {
 
   useEffect(() => {
     if (desktop?.engine !== 'rust' || !APP_VERSION || !newer(SITE_VERSION, APP_VERSION)) return;
+    let stopped = false;
+    // App 0.5.7+: pede a atualização dele agora, em vez de esperar a rotina de 30 minutos.
+    void desktop.checkUpdate?.().then((r) => {
+      if (!stopped && r.ok && r.value) setAppVersion(r.value.version);
+    });
     // Um tempo para a atualização do próprio app chegar: se chegar, o aviso dela basta.
     const timer = setTimeout(() => setStale(true), 20 * 1000);
-    return () => clearTimeout(timer);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -133,9 +147,18 @@ export function UpdateBanner({ live }: { live: boolean }) {
       void siteUpdateAvailable()
         .then((available) => {
           if (stopped || !available) return;
-          // No app, um site novo quase sempre vem junto com um app novo: espera 2 minutos para
-          // a atualização do app chegar e mostrar um aviso só. Sem ela, mostra o do site.
-          if (desktop?.watchUpdate) waiting ??= setTimeout(() => setSite(true), 2 * 60 * 1000);
+          // No app, um site novo quase sempre vem junto com um app novo. O app 0.5.7+ confere na hora:
+          // se houver versão dele, o aviso é o de reiniciar o app (o site novo dentro do app velho
+          // deixava coisas sem funcionar até fechar e abrir). App mais antigo: espera 2 minutos a
+          // atualização dele chegar sozinha e, sem ela, mostra a do site.
+          const check = desktop?.checkUpdate;
+          if (check)
+            void check().then((r) => {
+              if (stopped) return;
+              if (r.ok && r.value) setAppVersion(r.value.version);
+              else setSite(true);
+            });
+          else if (desktop?.watchUpdate) waiting ??= setTimeout(() => setSite(true), 2 * 60 * 1000);
           else setSite(true);
         })
         .catch(() => {});
@@ -155,16 +178,58 @@ export function UpdateBanner({ live }: { live: boolean }) {
     setNotes([]);
   };
   const isApp = Boolean(appVersion);
+  // A atualização não começou: tira a tela "Atualizando" e diz o que fazer, em vez de ficar parado.
+  const gaveUp = (message: string) => {
+    try {
+      localStorage.removeItem(PENDING_KEY);
+    } catch {
+      // Sem armazenamento.
+    }
+    setUpdating('');
+    setBusy(false);
+    setCardClosed(false);
+    setProblem(message);
+  };
   const update = () => {
     setBusy(true);
+    setProblem('');
     if (!isApp) {
       location.reload();
+      // Recarregar some com esta página; se ela continua aqui depois de 10 s, não recarregou.
+      setTimeout(() => gaveUp('A página não recarregou. Feche e abra o Nimbo para atualizar.'), 10000);
       return;
     }
     writePending({ from: APP_VERSION, to: appVersion, at: Date.now() });
     setUpdating(appVersion);
+    // O instalador fecha o app em poucos segundos; se depois de 40 s ele continua aberto, não começou.
+    const watchdog = setTimeout(
+      () => gaveUp('A atualização não começou. Feche e abra o Nimbo: ela instala ao abrir.'),
+      40000,
+    );
     // Um instante para a tela "Atualizando" aparecer antes de o app fechar.
-    setTimeout(() => void desktop?.installUpdate?.(), 700);
+    setTimeout(async () => {
+      const started = (r: { ok: true; value: boolean } | { ok: false; error: string } | void | undefined) =>
+        !r || (r.ok && r.value !== false);
+      try {
+        let result = await desktop?.installUpdate?.();
+        // Nada baixado (o download foi descartado, ou outro aviso já instalou): confere de novo e tenta mais uma vez.
+        if (!started(result) && desktop?.checkUpdate) {
+          const again = await desktop.checkUpdate();
+          if (again.ok && again.value) result = await desktop.installUpdate?.();
+        }
+        if (!started(result)) {
+          clearTimeout(watchdog);
+          gaveUp(
+            result && !result.ok
+              ? `Não deu para instalar: ${result.error}`
+              : 'A versão nova ainda não terminou de baixar. Tente de novo em instantes ou feche e abra o Nimbo.',
+          );
+        }
+      } catch (e) {
+        clearTimeout(watchdog);
+        gaveUp(`Não deu para instalar: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }, 700);
   };
 
   return (
@@ -246,6 +311,7 @@ export function UpdateBanner({ live }: { live: boolean }) {
               {isApp ? 'Reinicie o app para usar.' : 'Atualize para ter as novidades.'}
               {live && ' Sua live cai por alguns segundos.'}
             </span>
+            {problem && <span className="update-problem">{problem}</span>}
             <div className="update-actions">
               <button className="button primary small" disabled={busy} onClick={update}>
                 {isApp ? <Download size={15} /> : <RotateCw size={15} />}

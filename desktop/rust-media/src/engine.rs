@@ -179,8 +179,16 @@ pub enum Source {
 pub enum AudioSource {
     /// Só o som deste processo e dos filhos dele (o jogo).
     Include(u32),
-    /// Todo o som do computador, menos o deste processo e dos filhos dele (o próprio Nimbo).
+    /// Todo o som do computador, menos o deste processo e dos filhos dele. Inclui as vozes de apps
+    /// de chamada (Discord...): para o "Computador" da live, use [`AudioSource::SystemExcept`].
     Exclude(u32),
+    /// Todo o som do computador, menos o de `own` e dos filhos dele (o próprio Nimbo: passe
+    /// `std::process::id()`; o WebView2 é filho dele) e menos o dos apps de chamada de voz
+    /// (`nimbo_audio::CALL_APPS`: Discord, TeamSpeak, Teams, Zoom...), para quem está na chamada
+    /// não se ouvir na live. É o que o "Computador" do site pede (`audio: "system"`). Um programa
+    /// que começa a tocar depois entra em menos de um segundo. Ver
+    /// `nimbo_audio::Mode::SystemExcept`.
+    SystemExcept { own: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1011,6 +1019,7 @@ impl Engine {
         let mode = match source {
             AudioSource::Include(pid) => nimbo_audio::Mode::Include(pid),
             AudioSource::Exclude(pid) => nimbo_audio::Mode::Exclude(pid),
+            AudioSource::SystemExcept { own } => nimbo_audio::Mode::SystemExcept { own },
         };
         let start = audio::frames_in(self.shared.epoch.elapsed())
             .max(self.shared.audio_rtp.load(Ordering::Relaxed));

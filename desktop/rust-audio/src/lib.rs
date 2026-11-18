@@ -1,9 +1,10 @@
 //! Áudio do jogo: captura o som do Windows por processo (WASAPI process loopback, Windows 10
 //! 2004+), no lugar do auxiliar em C# (`desktop/native/NimboAudio.cs`).
 //!
-//! Dois modos, os mesmos do auxiliar: [`Mode::Include`] pega só um processo e seus filhos (o
-//! jogo); [`Mode::Exclude`] pega tudo menos um processo e seus filhos (o próprio Nimbo, para a
-//! live não recapturar o que toca nele).
+//! Três modos: [`Mode::Include`] pega só um processo e seus filhos (o jogo); [`Mode::Exclude`] pega
+//! tudo menos um processo e seus filhos; [`Mode::SystemExcept`] pega tudo menos o próprio Nimbo e
+//! os apps de chamada de voz ([`CALL_APPS`]), com os filhos deles. Os dois primeiros são um fluxo
+//! do Windows cada; o terceiro soma vários (ver `system.rs`).
 //!
 //! O formato é o mesmo do auxiliar: PCM de 16 bits, little-endian, 48 kHz, estéreo intercalado.
 //!
@@ -16,24 +17,29 @@
 //! O silêncio que vem do Windows não é zero puro: a conversão para 16 bits deixa um ruído de ±1
 //! (igual no auxiliar). O silêncio preenchido aqui é zero.
 
+mod calls;
+mod mix;
+mod procs;
+mod system;
 mod timeline;
 
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
-    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync,
-    IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
-    IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+    IAudioCaptureClient, IAudioClient, PROCESS_LOOPBACK_MODE,
     PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
     WAVE_FORMAT_PCM, WAVEFORMATEX,
@@ -48,6 +54,8 @@ use windows::Win32::System::Variant::VT_BLOB;
 use windows::core::{HRESULT, Interface, Ref, implement, w};
 
 use timeline::Timeline;
+
+pub use calls::{CALL_APPS, is_call_app};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
@@ -70,6 +78,21 @@ pub enum Mode {
     Include(u32),
     /// Todo o som do computador, menos o deste processo e dos filhos dele.
     Exclude(u32),
+    /// Todo o som do computador, menos o de `own` (o próprio Nimbo; o WebView2 é filho dele) e o
+    /// dos apps de chamada de voz ([`CALL_APPS`]), sempre com os filhos. É o "Computador" da live:
+    /// quem está numa chamada com você não se ouve nela.
+    ///
+    /// O Windows só tira uma árvore de processos por fluxo; aqui cada programa que está tocando
+    /// vira um fluxo [`Mode::Include`] e os fluxos são somados. Um programa que começa a tocar
+    /// depois entra em menos de um segundo; o que passa 30 s sem tocar sai (e volta quando tocar).
+    /// Diferenças para o [`Mode::Exclude`]: os sons do sistema (a sessão "Sons do sistema") não
+    /// entram, e um programa que tenha o Nimbo ou um app de chamada entre os descendentes também
+    /// não (o fluxo dele levaria junto o som bloqueado).
+    ///
+    /// `own` deve ser o processo que captura (`std::process::id()`) ou um ancestral dele: medido,
+    /// a própria captura cria uma sessão de áudio ativa nesse processo, e sem estar excluído ele
+    /// entraria como mais um programa tocando, com todos os filhos.
+    SystemExcept { own: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,12 +125,29 @@ fn win(step: &'static str) -> impl Fn(windows::core::Error) -> Error {
 }
 
 /// O que a captura entregou até parar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Quadros entregues ao `on_pcm` (som + silêncio).
     pub frames: u64,
     /// Quantos deles foram silêncio preenchido aqui, porque o Windows não entregou nada.
     pub silence_frames: u64,
+    /// Pacotes que o Windows marcou como descontínuos: faltou um pedaço do som (a fila estourou,
+    /// por exemplo). O primeiro pacote de cada fluxo não conta.
+    pub discontinuities: u64,
+    /// Só no [`Mode::SystemExcept`]: fluxos de programas abertos (contando reaberturas).
+    pub streams_opened: u64,
+    /// Só no [`Mode::SystemExcept`]: quadros em que um programa que estava tocando ficou sem som na
+    /// mistura (lacuna criada pela mistura, não pelo Windows).
+    pub gap_frames: u64,
+    /// Só no [`Mode::SystemExcept`]: quadros antigos descartados de programas que acabaram de
+    /// entrar na mistura (o que o Windows guardou antes de o fluxo novo ser lido).
+    pub trimmed_frames: u64,
+    /// Quantas vezes a thread do som acordou para ler o Windows.
+    pub wakes: u64,
+    /// Só no [`Mode::SystemExcept`]: quantas vezes a lista de programas foi refeita e o tempo
+    /// gasto nisso, em microssegundos.
+    pub refreshes: u64,
+    pub refresh_micros: u64,
 }
 
 struct Event(HANDLE);
@@ -143,6 +183,7 @@ impl Drop for Event {
 pub struct Capture {
     stop: Arc<Event>,
     thread: Option<JoinHandle<Result<Stats, Error>>>,
+    sources: Arc<Mutex<Vec<u32>>>,
 }
 
 impl Capture {
@@ -155,16 +196,31 @@ impl Capture {
     /// mesmo vale quando o processo fecha no meio; quem decide o fim da live é o vigia do jogo.
     pub fn start(mode: Mode, on_pcm: impl FnMut(&[u8]) + Send + 'static) -> Result<Self, Error> {
         let stop = Arc::new(Event::new(true)?);
+        let sources = Arc::new(Mutex::new(Vec::new()));
         let (ready, started) = mpsc::channel();
         let thread_stop = Arc::clone(&stop);
+        let thread_sources = Arc::clone(&sources);
         let thread = thread::Builder::new()
             .name("nimbo-audio".into())
-            .spawn(move || run(mode, &thread_stop, ready, on_pcm))
+            .spawn(move || match mode {
+                Mode::Include(pid) => com(|| {
+                    let tree = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+                    session(pid, tree, &thread_stop, ready, on_pcm)
+                }),
+                Mode::Exclude(pid) => com(|| {
+                    let tree = PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+                    session(pid, tree, &thread_stop, ready, on_pcm)
+                }),
+                Mode::SystemExcept { own } => {
+                    com(|| system::run(own, &thread_stop, ready, &thread_sources, on_pcm))
+                }
+            })
             .map_err(|_| Error::Thread)?;
         match started.recv() {
             Ok(()) => Ok(Self {
                 stop,
                 thread: Some(thread),
+                sources,
             }),
             // A thread saiu sem avisar que começou: o motivo é o que ela devolveu.
             Err(_) => Err(match thread.join() {
@@ -179,6 +235,15 @@ impl Capture {
         self.thread
             .as_ref()
             .is_some_and(|thread| !thread.is_finished())
+    }
+
+    /// Processos cujo som está indo agora, um por fluxo (cada um leva junto os filhos). Só no
+    /// [`Mode::SystemExcept`]; nos outros modos, vazio.
+    pub fn sources(&self) -> Vec<u32> {
+        self.sources
+            .lock()
+            .map(|sources| sources.clone())
+            .unwrap_or_default()
     }
 
     /// Para a captura e espera a thread sair. Depois disso o `on_pcm` não é mais chamado.
@@ -203,6 +268,19 @@ impl Drop for Capture {
     }
 }
 
+/// Roda `f` com o COM ligado nesta thread (multithread: os objetos de áudio passam de uma thread
+/// da captura para outra sem empacotamento).
+fn com<T>(f: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+    // SAFETY: primeira chamada COM desta thread, que é só nossa; o par é o CoUninitialize abaixo.
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+        .ok()
+        .map_err(win("CoInitializeEx"))?;
+    let result = f();
+    // SAFETY: par do CoInitializeEx acima; os objetos COM já foram soltos dentro de `f`.
+    unsafe { CoUninitialize() };
+    result
+}
+
 /// Avisa a thread de captura que o Windows terminou de ativar o cliente de áudio.
 #[implement(IActivateAudioInterfaceCompletionHandler)]
 struct Activated(mpsc::Sender<()>);
@@ -217,27 +295,7 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
     }
 }
 
-fn run(
-    mode: Mode,
-    stop: &Event,
-    ready: mpsc::Sender<()>,
-    mut on_pcm: impl FnMut(&[u8]),
-) -> Result<Stats, Error> {
-    // SAFETY: primeira chamada COM desta thread, que é só nossa; o par é o CoUninitialize abaixo.
-    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
-        .ok()
-        .map_err(win("CoInitializeEx"))?;
-    let result = session(mode, stop, ready, &mut on_pcm);
-    // SAFETY: par do CoInitializeEx acima; os objetos COM já foram soltos dentro de `session`.
-    unsafe { CoUninitialize() };
-    result
-}
-
-fn activate(mode: Mode) -> Result<IAudioClient, Error> {
-    let (pid, tree) = match mode {
-        Mode::Include(pid) => (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE),
-        Mode::Exclude(pid) => (pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
-    };
+fn activate(pid: u32, tree: PROCESS_LOOPBACK_MODE) -> Result<IAudioClient, Error> {
     let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -289,61 +347,167 @@ fn activate(mode: Mode) -> Result<IAudioClient, Error> {
         .map_err(win("ativação"))
 }
 
+/// Um pacote lido do Windows.
+struct Packet<'a> {
+    frames: u32,
+    /// `None` quando o Windows marcou o pacote como silêncio.
+    pcm: Option<&'a [u8]>,
+    /// O Windows perdeu som antes deste pacote.
+    discontinuity: bool,
+}
+
+/// Um fluxo de process loopback já correndo. Para ao ser descartado.
+struct Stream {
+    // A ordem importa: os campos são soltos nesta ordem, e o Windows usa o evento até o fim do
+    // cliente.
+    client: IAudioClient,
+    capture: IAudioCaptureClient,
+    _arrived: Arc<Event>,
+    /// Ainda não chegou pacote (o primeiro costuma vir marcado como descontínuo).
+    fresh: bool,
+}
+
+// SAFETY: os objetos de áudio do WASAPI são de modelo livre; as threads que usam um `Stream`
+// (a que escolhe os programas e a que lê o som) estão as duas no COM multithread (`com`), onde
+// um ponteiro de interface vale em qualquer thread sem empacotamento.
+unsafe impl Send for Stream {}
+
+impl Stream {
+    /// Abre o fluxo do `pid` (incluindo ou excluindo a árvore dele) com uma fila de `buffer_hns`
+    /// (unidades de 100 ns). O Windows sinaliza `arrived` a cada pacote.
+    fn open(
+        pid: u32,
+        tree: PROCESS_LOOPBACK_MODE,
+        buffer_hns: i64,
+        arrived: &Arc<Event>,
+    ) -> Result<Self, Error> {
+        let client = activate(pid, tree)?;
+        let block = CHANNELS * BITS_PER_SAMPLE / 8;
+        let format = WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: CHANNELS,
+            nSamplesPerSec: SAMPLE_RATE,
+            nAvgBytesPerSec: SAMPLE_RATE * u32::from(block),
+            nBlockAlign: block,
+            wBitsPerSample: BITS_PER_SAMPLE,
+            cbSize: 0,
+        };
+        // O dispositivo virtual não tem formato próprio: o Windows converte para o que pedimos.
+        let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+            | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        // SAFETY: `format` é uma estrutura local válida durante a chamada.
+        unsafe {
+            client.Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                flags,
+                buffer_hns,
+                0,
+                &format,
+                None,
+            )
+        }
+        .map_err(win("Initialize"))?;
+        // SAFETY: o evento fica guardado no `Stream` e só é solto depois do cliente.
+        unsafe { client.SetEventHandle(arrived.0) }.map_err(win("SetEventHandle"))?;
+        // SAFETY: chamada COM simples num cliente já inicializado.
+        let capture: IAudioCaptureClient =
+            unsafe { client.GetService() }.map_err(win("GetService"))?;
+        // SAFETY: idem.
+        unsafe { client.Start() }.map_err(win("Start"))?;
+        Ok(Self {
+            client,
+            capture,
+            _arrived: Arc::clone(arrived),
+            fresh: true,
+        })
+    }
+
+    /// Entrega ao `on_packet` todos os pacotes que já chegaram.
+    fn drain(&mut self, mut on_packet: impl FnMut(Packet<'_>)) -> Result<(), Error> {
+        loop {
+            // SAFETY: chamada COM simples.
+            let pending =
+                unsafe { self.capture.GetNextPacketSize() }.map_err(win("GetNextPacketSize"))?;
+            if pending == 0 {
+                return Ok(());
+            }
+            let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0, 0);
+            // SAFETY: os ponteiros apontam para variáveis locais.
+            unsafe {
+                self.capture
+                    .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+            }
+            .map_err(win("GetBuffer"))?;
+            // Fila vazia apesar do aviso: nada a entregar, e não conta como pacote.
+            if frames > 0 {
+                let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
+                let discontinuity = flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0;
+                on_packet(Packet {
+                    frames,
+                    // SAFETY: o Windows garante `frames` quadros em `data` até o ReleaseBuffer
+                    // abaixo, e a fatia não sai do `on_packet`.
+                    pcm: (!silent).then(|| unsafe {
+                        std::slice::from_raw_parts(data, frames as usize * FRAME_BYTES)
+                    }),
+                    discontinuity: discontinuity && !self.fresh,
+                });
+                self.fresh = false;
+            }
+            // SAFETY: devolve exatamente o que o GetBuffer entregou.
+            unsafe { self.capture.ReleaseBuffer(frames) }.map_err(win("ReleaseBuffer"))?;
+            if frames == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // SAFETY: chamada COM simples; se falhar não há o que fazer, o fluxo está acabando.
+        let _ = unsafe { self.client.Stop() };
+    }
+}
+
+/// Prioridade de áudio para a thread atual enquanto viver: um jogo usando todos os núcleos não
+/// pode atrasar a captura.
+struct AudioPriority(Option<HANDLE>);
+
+impl AudioPriority {
+    fn new() -> Self {
+        let mut task = 0;
+        // SAFETY: nome constante terminado em zero e ponteiro para variável local.
+        Self(unsafe { AvSetMmThreadCharacteristicsW(w!("Audio"), &mut task) }.ok())
+    }
+}
+
+impl Drop for AudioPriority {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0 {
+            // SAFETY: handle devolvido pelo AvSetMmThreadCharacteristicsW nesta mesma thread (o
+            // valor não sai da thread que o criou).
+            let _ = unsafe { AvRevertMmThreadCharacteristics(handle) };
+        }
+    }
+}
+
+/// [`Mode::Include`] e [`Mode::Exclude`]: um fluxo só do Windows.
 fn session(
-    mode: Mode,
+    pid: u32,
+    tree: PROCESS_LOOPBACK_MODE,
     stop: &Event,
     ready: mpsc::Sender<()>,
-    on_pcm: &mut impl FnMut(&[u8]),
+    mut on_pcm: impl FnMut(&[u8]),
 ) -> Result<Stats, Error> {
-    // Criado antes do cliente para ser solto depois dele: o Windows usa o evento até o fim.
-    let arrived = Event::new(false)?;
-    let client = activate(mode)?;
-    let block = CHANNELS * BITS_PER_SAMPLE / 8;
-    let format = WAVEFORMATEX {
-        wFormatTag: WAVE_FORMAT_PCM as u16,
-        nChannels: CHANNELS,
-        nSamplesPerSec: SAMPLE_RATE,
-        nAvgBytesPerSec: SAMPLE_RATE * u32::from(block),
-        nBlockAlign: block,
-        wBitsPerSample: BITS_PER_SAMPLE,
-        cbSize: 0,
-    };
-    // O dispositivo virtual não tem formato próprio: o Windows converte para o que pedimos.
-    let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
-        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    // SAFETY: `format` é uma estrutura local válida durante a chamada.
-    unsafe {
-        client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            flags,
-            BUFFER_HNS,
-            0,
-            &format,
-            None,
-        )
-    }
-    .map_err(win("Initialize"))?;
-    // SAFETY: `arrived` vive mais que `client` (declarado antes, solto depois).
-    unsafe { client.SetEventHandle(arrived.0) }.map_err(win("SetEventHandle"))?;
-    // SAFETY: chamada COM simples num cliente já inicializado.
-    let capture: IAudioCaptureClient = unsafe { client.GetService() }.map_err(win("GetService"))?;
-    // SAFETY: idem.
-    unsafe { client.Start() }.map_err(win("Start"))?;
+    let arrived = Arc::new(Event::new(false)?);
+    let mut stream = Stream::open(pid, tree, BUFFER_HNS, &arrived)?;
     let _ = ready.send(());
-
-    // Prioridade de áudio: um jogo usando todos os núcleos não pode atrasar esta thread.
-    let mut task = 0;
-    // SAFETY: nome constante terminado em zero e ponteiro para variável local.
-    let priority = unsafe { AvSetMmThreadCharacteristicsW(w!("Audio"), &mut task) }.ok();
-    let result = pump(&capture, stop, &arrived, on_pcm);
-    if let Some(priority) = priority {
-        // SAFETY: handle devolvido pelo AvSetMmThreadCharacteristicsW nesta mesma thread.
-        let _ = unsafe { AvRevertMmThreadCharacteristics(priority) };
-    }
-    // SAFETY: chamada COM simples; se falhar não há o que fazer, a captura está acabando.
-    let _ = unsafe { client.Stop() };
+    let priority = AudioPriority::new();
+    let result = pump(&mut stream, stop, &arrived, &mut on_pcm);
+    drop(priority);
+    drop(stream);
     result
 }
 
@@ -357,7 +521,7 @@ fn silence(frames: u64, on_pcm: &mut impl FnMut(&[u8])) {
 }
 
 fn pump(
-    capture: &IAudioCaptureClient,
+    stream: &mut Stream,
     stop: &Event,
     arrived: &Event,
     on_pcm: &mut impl FnMut(&[u8]),
@@ -365,47 +529,35 @@ fn pump(
     let handles = [stop.0, arrived.0];
     let started = Instant::now();
     let mut timeline = Timeline::default();
+    let mut discontinuities = 0;
+    let mut wakes = 0;
     loop {
         // SAFETY: os dois handles pertencem a eventos vivos durante toda a função.
         let wait = unsafe { WaitForMultipleObjects(&handles, false, TICK_MS) };
         if wait == WAIT_OBJECT_0 {
             break;
         }
+        wakes += 1;
         if wait == WAIT_FAILED {
             return Err(win("WaitForMultipleObjects")(
                 windows::core::Error::from_thread(),
             ));
         }
         silence(timeline.silence_due(started.elapsed()), on_pcm);
-        loop {
-            // SAFETY: chamada COM simples.
-            let pending =
-                unsafe { capture.GetNextPacketSize() }.map_err(win("GetNextPacketSize"))?;
-            if pending == 0 {
-                break;
+        stream.drain(|packet| {
+            match packet.pcm {
+                Some(pcm) => on_pcm(pcm),
+                None => silence(u64::from(packet.frames), on_pcm),
             }
-            let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0, 0);
-            // SAFETY: os ponteiros apontam para variáveis locais.
-            unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None) }
-                .map_err(win("GetBuffer"))?;
-            if frames == 0 {
-                // Fila vazia apesar do aviso: nada a entregar, e não conta como pacote.
-            } else if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
-                silence(u64::from(frames), on_pcm);
-            } else {
-                // SAFETY: o Windows garante `frames` quadros em `data` até o ReleaseBuffer abaixo.
-                on_pcm(unsafe { std::slice::from_raw_parts(data, frames as usize * FRAME_BYTES) });
-            }
-            // SAFETY: devolve exatamente o que o GetBuffer entregou.
-            unsafe { capture.ReleaseBuffer(frames) }.map_err(win("ReleaseBuffer"))?;
-            if frames == 0 {
-                break;
-            }
-            timeline.packet(started.elapsed(), u64::from(frames));
-        }
+            discontinuities += u64::from(packet.discontinuity);
+            timeline.packet(started.elapsed(), u64::from(packet.frames));
+        })?;
     }
     Ok(Stats {
         frames: timeline.emitted,
         silence_frames: timeline.filled,
+        discontinuities,
+        wakes,
+        ..Stats::default()
     })
 }

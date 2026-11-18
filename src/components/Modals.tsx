@@ -119,12 +119,14 @@ export function StreamSettingsModal({
         </div>
         <small className="muted">
           {settings.audio === 'system'
-            ? supportsOwnAudioRestriction()
-              ? 'Todo o som do computador vai para a live, inclusive as vozes de outros apps (ex.: Discord): quem está na chamada com você vai se ouvir. O som das lives que você assiste no Nimbo não é reenviado.'
-              : 'Seu navegador pode reenviar o som das lives que você assiste. Use fones ou silencie as outras lives.'
+            ? desktop?.media
+              ? 'Todo o som do computador vai para a live, menos as vozes dos apps de chamada (Discord, TeamSpeak, Teams, Zoom...): quem está na chamada com você não se ouve. O som das lives que você assiste no Nimbo também fica de fora.'
+              : supportsOwnAudioRestriction()
+                ? 'Todo o som do computador vai para a live, inclusive as vozes de outros apps (ex.: Discord): quem está na chamada com você vai se ouvir. O som das lives que você assiste no Nimbo não é reenviado.'
+                : 'Seu navegador pode reenviar o som das lives que você assiste. Use fones ou silencie as outras lives.'
             : settings.audio === 'window'
               ? desktop
-                ? 'Só o som do jogo ou programa escolhido vai para a live; as vozes do Discord ficam de fora. Ao transmitir a tela inteira, vai o som do computador. Se o jogo ficar sem som, use "Computador".'
+                ? `Só o som do jogo ou programa escolhido vai para a live; as vozes do Discord ficam de fora. Ao transmitir a tela inteira, vai o som do computador${desktop.media ? ', também sem as vozes dos apps de chamada' : ''}. Se o jogo ficar sem som, use "Computador".`
                 : 'Envia apenas o som da janela escolhida, quando o navegador permite.'
               : 'Somente vídeo.'}
         </small>

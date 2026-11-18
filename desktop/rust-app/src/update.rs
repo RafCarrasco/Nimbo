@@ -202,6 +202,9 @@ struct State {
 pub struct Updates {
     state: Mutex<State>,
     log: Log,
+    /// Uma conferência por vez: a da rotina de 30 minutos e a pedida pela página não baixam o mesmo
+    /// instalador duas vezes ao mesmo tempo.
+    checking: tauri::async_runtime::Mutex<()>,
 }
 
 impl Updates {
@@ -213,6 +216,7 @@ impl Updates {
             .or_else(|| app.path().app_local_data_dir().ok());
         Self {
             state: Mutex::default(),
+            checking: tauri::async_runtime::Mutex::new(()),
             log: Log {
                 file: folder.map(|folder| folder.join(LOG_FILE)),
                 version: app.package_info().version.to_string(),
@@ -267,6 +271,12 @@ impl Updates {
         ready
     }
 
+    fn ready(&self) -> Option<Info> {
+        self.state().ready.as_ref().map(|downloaded| Info {
+            version: downloaded.update.version.clone(),
+        })
+    }
+
     fn take(&self) -> Option<Downloaded> {
         self.state().ready.take()
     }
@@ -303,6 +313,29 @@ pub async fn install_update(_caller: FromApp, app: AppHandle) -> Reply<bool> {
         }
     });
     Reply::ok(true)
+}
+
+/// Confere agora e devolve a atualização baixada, se houver. A página pede quando vê que o site
+/// publicado mudou: sem isto, o site novo carregava dentro do app velho, que só conferia de 30 em
+/// 30 minutos, e a pessoa tinha de fechar e abrir o Nimbo (relatado em 17/11/2026).
+#[tauri::command]
+pub async fn check_update(_caller: FromApp, app: AppHandle) -> Reply<Option<Info>> {
+    let updates = app.state::<Updates>();
+    if let Some(reason) = disabled_reason(&app) {
+        updates.log.write(&format!(
+            "conferência pedida pela página, desligada: {reason}"
+        ));
+        return Reply::ok(None);
+    }
+    updates.log.write("conferência pedida pela página");
+    match check(&app).await {
+        Ok(()) => Reply::ok(updates.ready()),
+        Err(e) => {
+            updates.log.write(&format!("erro: {e}"));
+            updates.progress(0);
+            Reply::error(format!("Não deu para procurar atualização agora: {e}"))
+        }
+    }
 }
 
 /// Começa a conferir, numa thread própria: ao abrir e depois a cada 30 minutos.
@@ -342,6 +375,7 @@ fn start(app: AppHandle) {
 /// Uma conferência: se há versão nova que ainda não foi baixada, baixa e avisa a página.
 async fn check(app: &AppHandle) -> tauri_plugin_updater::Result<()> {
     let updates = app.state::<Updates>();
+    let _one_at_a_time = updates.checking.lock().await;
     let updater = app.updater_builder().timeout(CHECK_TIMEOUT).build()?;
     let Some(mut update) = updater.check().await? else {
         return Ok(());
@@ -706,6 +740,7 @@ mod tests {
         for (command, permission) in [
             ("watch_update", "allow-watch-update"),
             ("install_update", "allow-install-update"),
+            ("check_update", "allow-check-update"),
         ] {
             assert!(build.contains(&format!("\"{command}\"")), "{command}");
             assert!(main.contains(&format!("update::{command}")), "{command}");

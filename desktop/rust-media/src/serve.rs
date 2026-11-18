@@ -1,8 +1,9 @@
-//! `nimbo-media serve [porta] [exclude|include <pid>]`: página de teste do motor. Abra
+//! `nimbo-media serve [porta] [exclude|include|system <pid>]`: página de teste do motor. Abra
 //! http://127.0.0.1:3070 em quantas abas quiser; cada uma vira um espectador da tela principal.
 //!
 //! Com `exclude <pid>` a live leva todo o som do computador menos o daquele processo; com
-//! `include <pid>`, só o som dele. Sem isso, não há som. A página nunca toca o som que recebe.
+//! `system <pid>`, o mesmo e ainda sem os apps de chamada de voz; com `include <pid>`, só o som
+//! dele. Sem isso, não há som. A página nunca toca o som que recebe.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
