@@ -20,14 +20,21 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod admin;
 mod app;
+mod dialogs;
+mod images;
 mod live;
 // O login pelo navegador é o do app atual, sem cópia: mesma porta local, mesmo código de uso único.
 #[allow(dead_code)]
 #[path = "../../rust-app/src/login.rs"]
 mod login;
+mod menu;
+mod ops;
 mod picker;
+mod script;
 mod session_store;
+mod settings;
 mod sidebar;
 mod stage;
 mod theme;
@@ -62,6 +69,15 @@ fn main() -> eframe::Result {
             }
             "--cpu-video" => args.cpu_video = true,
             "--pick" => args.pick = true,
+            // Telas abertas sem clicar, para as fotos de teste (ver `Args` em app.rs).
+            "--open-admin" => args.open_admin = list.next(),
+            "--open-role" => args.open_role = list.next(),
+            "--role-tab" => args.role_tab = list.next(),
+            "--open-settings" => args.open_settings = list.next(),
+            "--open-menu" => args.open_menu = list.next(),
+            "--no-auto-open" => args.no_auto_open = true,
+            "--clicks" => args.clicks = list.next(),
+            "--fullscreen-in-window" => args.windowed_fullscreen = true,
             "--site" => args.site = list.next(),
             // Onde abrir a janela ("x,y") e de que tamanho ("largura,altura"): os testes abrem fora da
             // tela, para não aparecer para quem está usando o computador.

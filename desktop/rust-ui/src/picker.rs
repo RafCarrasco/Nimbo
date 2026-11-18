@@ -61,14 +61,25 @@ fn source_for(source: &PickerSource) -> Source {
     }
 }
 
+/// Som padrão da live no app, o mesmo do site (`src/live/audioDefault.ts`): só o som do programa
+/// escolhido (com o som do computador inteiro, a voz da chamada entra na live e quem fala se ouve
+/// com atraso); na tela inteira não há programa escolhido, e vai o som do computador, menos o do
+/// próprio Nimbo.
+fn default_audio(source: &PickerSource) -> AudioSource {
+    match source.kind {
+        SourceKind::Window | SourceKind::Game if source.pid != 0 => {
+            AudioSource::Include(source.pid)
+        }
+        _ => AudioSource::Exclude(std::process::id()),
+    }
+}
+
 impl Picker {
     /// Abre o seletor; a lista é levantada fora da thread que desenha.
     pub fn open(ctx: &egui::Context) -> Self {
         let (tx, loading) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            // Som padrão do site: o do computador, menos o do próprio Nimbo.
-            let audio = Some(AudioSource::Exclude(std::process::id()));
             let items = picker_sources(&[])
                 .iter()
                 .map(|source| Item {
@@ -82,7 +93,12 @@ impl Picker {
                     game: source.game,
                     capture: Capture {
                         source: source_for(source),
-                        audio,
+                        audio: Some(default_audio(source)),
+                        game: if source.game {
+                            source.title.trim().chars().take(48).collect()
+                        } else {
+                            String::new()
+                        },
                     },
                     restore: (source.minimized && source.kind == SourceKind::Window)
                         .then_some(source.hwnd),
@@ -107,90 +123,55 @@ impl Picker {
             .corner_radius(14.0)
             .inner_margin(egui::Margin::same(20));
         let mut choice = None;
-        let modal = egui::Modal::new(egui::Id::unique("o-que-transmitir"))
-            .frame(frame)
-            .show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.label(
-                    egui::RichText::new("O que você quer compartilhar?").font(theme::bold(17.0)),
-                );
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "A live leva junto o som do computador, menos o do próprio Nimbo.",
-                    )
+        let modal = egui::Modal::new(egui::Id::unique("o-que-transmitir")).frame(frame).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.label(egui::RichText::new("O que você quer compartilhar?").font(theme::bold(17.0)));
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("A live leva junto só o som do programa escolhido; na tela inteira, o som do computador (menos o do Nimbo).")
                     .font(theme::regular(12.0))
                     .color(theme::MUTED),
-                );
-                ui.add_space(12.0);
-                match &self.items {
-                    None => {
-                        ui.add(egui::Spinner::new().size(24.0).color(theme::MUTED));
-                    }
-                    Some(items) if items.is_empty() => {
-                        ui.label(
-                            egui::RichText::new("Nenhuma tela ou janela para compartilhar.")
-                                .color(theme::MUTED),
-                        );
-                    }
-                    Some(items) => {
-                        egui::ScrollArea::vertical()
-                            .max_height(380.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for (label, screens) in [("TELAS", true), ("APLICATIVOS", false)] {
-                                    if !items.iter().any(|item| item.screen == screens) {
-                                        continue;
-                                    }
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(label)
-                                            .font(theme::bold(11.0))
-                                            .color(theme::MUTED),
-                                    );
-                                    ui.add_space(4.0);
-                                    for item in items.iter().filter(|item| item.screen == screens) {
-                                        if row(ui, item) {
-                                            if let Some(window) = item.restore {
-                                                sources::restore(window);
-                                            }
-                                            choice = Some(Choice::Start(item.capture));
-                                        }
-                                    }
-                                }
-                            });
-                    }
+            );
+            ui.add_space(12.0);
+            match &self.items {
+                None => {
+                    ui.add(egui::Spinner::new().size(24.0).color(theme::MUTED));
                 }
-                ui.add_space(14.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let text = ui.painter().layout_no_wrap(
-                        "Cancelar".to_owned(),
-                        theme::semibold(14.0),
-                        theme::TEXT,
-                    );
-                    let (rect, response) =
-                        ui.allocate_exact_size(vec2(text.size().x + 32.0, 36.0), Sense::click());
-                    ui.painter().rect_filled(
-                        rect,
-                        8.0,
-                        if response.hovered() {
-                            theme::SURFACE_3
-                        } else {
-                            theme::SURFACE_2
-                        },
-                    );
-                    ui.painter().text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        "Cancelar",
-                        theme::semibold(14.0),
-                        theme::TEXT,
-                    );
-                    if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        choice = Some(Choice::Cancel);
-                    }
-                });
+                Some(items) if items.is_empty() => {
+                    ui.label(egui::RichText::new("Nenhuma tela ou janela para compartilhar.").color(theme::MUTED));
+                }
+                Some(items) => {
+                    egui::ScrollArea::vertical().max_height(380.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for (label, screens) in [("TELAS", true), ("APLICATIVOS", false)] {
+                            if !items.iter().any(|item| item.screen == screens) {
+                                continue;
+                            }
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(label).font(theme::bold(11.0)).color(theme::MUTED));
+                            ui.add_space(4.0);
+                            for item in items.iter().filter(|item| item.screen == screens) {
+                                if row(ui, item) {
+                                    if let Some(window) = item.restore {
+                                        sources::restore(window);
+                                    }
+                                    choice = Some(Choice::Start(item.capture.clone()));
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = ui.painter().layout_no_wrap("Cancelar".to_owned(), theme::semibold(14.0), theme::TEXT);
+                let (rect, response) = ui.allocate_exact_size(vec2(text.size().x + 32.0, 36.0), Sense::click());
+                ui.painter().rect_filled(rect, 8.0, if response.hovered() { theme::SURFACE_3 } else { theme::SURFACE_2 });
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Cancelar", theme::semibold(14.0), theme::TEXT);
+                if response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    choice = Some(Choice::Cancel);
+                }
             });
+        });
         if choice.is_none() && modal.should_close() {
             choice = Some(Choice::Cancel);
         }

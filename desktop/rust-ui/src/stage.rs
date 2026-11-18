@@ -1,16 +1,21 @@
-//! Palco do canal: cabeçalho com as lives no ar e os ladrilhos das que a pessoa abriu. Segue
-//! `src/components/Stage.tsx` e `LiveTile.tsx` do site.
+//! Palco do canal: cabeçalho com as lives no ar, os cartões "Ao vivo agora" (quando há lives e
+//! nenhuma aberta) e os ladrilhos das que a pessoa abriu. Segue `src/components/Stage.tsx`,
+//! `LiveTile.tsx` e `LiveMeta.tsx` do site: tempo no ar ao lado do AO VIVO, plateia (olho com o
+//! número e os nomes), jogo, resolução e quadros por segundo, duplo clique para a tela cheia.
+
+use std::collections::HashMap;
 
 use egui::{Align2, Color32, CursorIcon, Rect, Sense, TextureHandle, Ui, pos2, vec2};
 use lucide_icons::Icon;
 use nimbo_core::community::Snapshot;
 use nimbo_core::room::RoomSnapshot;
 
+use crate::images::Images;
 use crate::live::{BroadcastState, Broadcasting, LiveState, Watching, parse_key};
 use crate::sidebar::Action;
 use crate::theme;
 use crate::video::Videos;
-use crate::widgets::icon;
+use crate::widgets::{cover, elapsed, icon, photo, viewers_chip};
 
 /// Espaço entre os ladrilhos, como no site.
 const GAP: f32 = 10.0;
@@ -18,6 +23,7 @@ const RATIO: f32 = 16.0 / 9.0;
 /// Lado a lado é mais natural em telas largas: aceita lives até 20% menores para ganhar uma coluna.
 const PREFER_COLUMNS: f32 = 0.8;
 const TILE_FILL: Color32 = Color32::from_rgb(0x05, 0x07, 0x0d);
+const CHIP_FILL: Color32 = Color32::from_rgba_premultiplied(5, 7, 13, 140);
 
 /// Escolhe o número de colunas para as lives (16:9) ocuparem o máximo da área (`fitGrid` do site).
 /// Devolve colunas, largura e altura de cada ladrilho.
@@ -53,6 +59,13 @@ pub struct Stage<'a> {
     pub videos: &'a Videos,
     pub logo: &'a TextureHandle,
     pub notice: &'a str,
+    pub images: &'a mut Images,
+    /// Hora do servidor agora, em ms (para o tempo no ar).
+    pub now_ms: i64,
+    /// "1080p · 60 fps" de cada live que está chegando.
+    pub quality: &'a HashMap<String, String>,
+    /// Live em tela cheia, se houver.
+    pub fullscreen: Option<&'a str>,
 }
 
 impl Stage<'_> {
@@ -66,6 +79,10 @@ impl Stage<'_> {
             }
             .to_owned();
         }
+        self.person(uid)
+    }
+
+    fn person(&self, uid: &str) -> String {
         self.data
             .profiles
             .get(uid)
@@ -73,7 +90,51 @@ impl Stage<'_> {
             .unwrap_or_else(|| "Participante".to_owned())
     }
 
-    pub fn show(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    /// Quem está assistindo uma live (só gente que está no canal), com "Você" para a própria pessoa.
+    fn viewers_of(&self, key: &str) -> Vec<String> {
+        self.room
+            .watchers
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|uid| self.room.members.contains(uid))
+            .map(|uid| {
+                if *uid == self.data.uid {
+                    "Você".to_owned()
+                } else {
+                    self.person(uid)
+                }
+            })
+            .collect()
+    }
+
+    /// Há quanto tempo a live está no ar ("12:34"), se o início veio no anúncio.
+    fn elapsed_of(&self, key: &str) -> Option<String> {
+        let (uid, kind) = parse_key(key);
+        let started = self.room.broadcasts.get(uid)?.get(kind)?.started_at;
+        (started > 0).then(|| elapsed(self.now_ms - started))
+    }
+
+    fn game_of(&self, key: &str) -> Option<&str> {
+        let (uid, kind) = parse_key(key);
+        Some(self.room.broadcasts.get(uid)?.get(kind)?.game.as_str())
+            .filter(|game| !game.is_empty())
+    }
+
+    pub fn show(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        if let Some(key) = self
+            .fullscreen
+            .filter(|key| self.shown.iter().any(|shown| shown == key))
+        {
+            let key = key.to_owned();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(Color32::BLACK))
+                .show(ui, |ui| {
+                    let area = ui.max_rect();
+                    self.tile(ui, area, &key, actions, true);
+                });
+            return;
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG))
             .show(ui, |ui| {
@@ -81,7 +142,9 @@ impl Stage<'_> {
                 let head = Rect::from_min_size(area.min, vec2(area.width(), 56.0));
                 self.head(ui, head, actions);
                 let body = Rect::from_min_max(pos2(area.left(), head.bottom()), area.max);
-                if self.shown.is_empty() {
+                if self.shown.is_empty() && !self.active.is_empty() {
+                    self.cards(ui, body, actions);
+                } else if self.shown.is_empty() {
                     self.empty(ui, body);
                 } else {
                     self.tiles(ui, body.shrink(12.0), actions);
@@ -191,17 +254,10 @@ impl Stage<'_> {
 
     fn empty(&self, ui: &Ui, body: Rect) {
         let painter = ui.painter();
-        let (strong, hint) = if self.active.is_empty() {
-            (
-                "Ninguém ao vivo por aqui",
-                "Quando alguém transmitir neste canal, a live aparece aqui.",
-            )
-        } else {
-            (
-                "Escolha uma live para assistir",
-                "Clique nos nomes acima ou na barra lateral. Dá para assistir várias ao mesmo tempo.",
-            )
-        };
+        let (strong, hint) = (
+            "Ninguém ao vivo por aqui",
+            "Compartilhe sua tela pelo botão no canto inferior esquerdo: a live aparece aqui.",
+        );
         let strong = painter.layout_no_wrap(strong.to_owned(), theme::bold(17.0), theme::TEXT);
         let hint = theme::centered(painter, hint, theme::regular(14.0), theme::MUTED, 420.0);
         let height = 90.0 + 8.0 + strong.size().y + 8.0 + hint.size().y;
@@ -223,8 +279,229 @@ impl Stage<'_> {
         painter.galley(pos2(body.center().x, y), hint, theme::MUTED);
     }
 
+    /// Como no Discord: cada live do canal vira um cartão, com a prévia, quem transmite, o que é,
+    /// há quanto tempo está no ar e quantos estão assistindo.
+    fn cards(&mut self, ui: &mut Ui, body: Rect, actions: &mut Vec<Action>) {
+        let ctx = ui.ctx().clone();
+        let width = body.width().min(760.0) - 32.0;
+        let count = self.active.len();
+        let cols = ((width + 12.0) / (230.0 + 12.0))
+            .floor()
+            .clamp(1.0, count as f32) as usize;
+        let card_width = ((width - 12.0 * (cols - 1) as f32) / cols as f32).min(340.0);
+        let preview_height = (card_width - 28.0) / RATIO;
+        let card_height = 14.0 + preview_height + 12.0 + 40.0 + 12.0 + 28.0 + 14.0;
+        let rows = count.div_ceil(cols);
+        let grid_height = rows as f32 * card_height + (rows.saturating_sub(1)) as f32 * 12.0;
+        let total = 24.0 + 14.0 + grid_height + 14.0 + 18.0;
+        let top = (body.center().y - total / 2.0).max(body.top() + 16.0);
+        let painter = ui.painter().clone();
+        painter.text(
+            pos2(body.center().x, top + 12.0),
+            Align2::CENTER_CENTER,
+            "Ao vivo agora",
+            theme::bold(17.0),
+            theme::TEXT,
+        );
+        let grid_top = top + 24.0 + 14.0;
+        for (index, key) in self.active.iter().enumerate() {
+            let (row, col) = (index / cols, index % cols);
+            let in_row = if row == rows - 1 {
+                count - row * cols
+            } else {
+                cols
+            };
+            let row_width = in_row as f32 * card_width + 12.0 * (in_row - 1) as f32;
+            let left = body.center().x - row_width / 2.0 + col as f32 * (card_width + 12.0);
+            let card = Rect::from_min_size(
+                pos2(left, grid_top + row as f32 * (card_height + 12.0)),
+                vec2(card_width, card_height),
+            );
+            if card.top() > body.bottom() {
+                break;
+            }
+            let (uid, kind) = parse_key(key);
+            let own = uid == self.data.uid;
+            let name = if own {
+                "Você".to_owned()
+            } else {
+                self.person(uid)
+            };
+            let response = ui.interact(card, ui.scope_id().with(("cartao", key)), Sense::click());
+            let hovered = response.hovered();
+            painter.rect_filled(
+                card,
+                12.0,
+                if hovered {
+                    theme::SURFACE_2
+                } else {
+                    theme::SURFACE
+                },
+            );
+            painter.rect_stroke(
+                card,
+                12.0,
+                (
+                    1.0,
+                    if hovered {
+                        theme::PRIMARY.gamma_multiply(0.55)
+                    } else {
+                        theme::BORDER
+                    },
+                ),
+                egui::StrokeKind::Inside,
+            );
+            let preview = Rect::from_min_size(
+                card.min + vec2(14.0, 14.0),
+                vec2(card_width - 28.0, preview_height),
+            );
+            painter.rect_filled(preview, 8.0, theme::PANEL);
+            match self
+                .room
+                .previews
+                .get(key)
+                .and_then(|data| self.images.get(&ctx, data))
+            {
+                Some(texture) => cover(&painter, preview, 8.0, &texture),
+                None => {
+                    let glyph = if kind == "camera" {
+                        Icon::Video
+                    } else {
+                        Icon::MonitorPlay
+                    };
+                    icon(
+                        &painter,
+                        preview.center(),
+                        glyph,
+                        30.0,
+                        theme::MUTED.gamma_multiply(0.6),
+                    );
+                }
+            }
+            // Cabeçalho: foto, nome e o que é (webcam, jogo ou tela).
+            let head_y = preview.bottom() + 12.0 + 20.0;
+            let texture = self
+                .data
+                .avatars
+                .get(uid)
+                .and_then(|source| self.images.get(&ctx, source));
+            photo(
+                &painter,
+                pos2(card.left() + 14.0 + 18.0, head_y),
+                36.0,
+                &self.person(uid),
+                texture.as_ref(),
+            );
+            let text_left = card.left() + 14.0 + 36.0 + 10.0;
+            let room = card.right() - 14.0 - text_left;
+            let title = theme::line(&painter, &name, theme::bold(14.0), theme::TEXT, room);
+            let what = if kind == "camera" {
+                "Webcam".to_owned()
+            } else {
+                self.game_of(key).unwrap_or("Tela").to_owned()
+            };
+            let sub = theme::line(
+                &painter,
+                &what,
+                theme::regular(12.0),
+                theme::MUTED,
+                room - 18.0,
+            );
+            let title_top = head_y - (title.size().y + sub.size().y) / 2.0;
+            let sub_top = title_top + title.size().y;
+            painter.galley(pos2(text_left, title_top), title, theme::TEXT);
+            let glyph = if kind == "camera" {
+                Icon::Video
+            } else if self.game_of(key).is_some() {
+                Icon::Gamepad2
+            } else {
+                Icon::MonitorPlay
+            };
+            icon(
+                &painter,
+                pos2(text_left + 6.0, sub_top + sub.size().y / 2.0),
+                glyph,
+                12.0,
+                theme::MUTED,
+            );
+            painter.galley(pos2(text_left + 17.0, sub_top), sub, theme::MUTED);
+            // Embaixo: AO VIVO, tempo no ar, plateia e o botão.
+            let meta_y = head_y + 20.0 + 12.0 + 14.0;
+            let badge =
+                painter.layout_no_wrap("AO VIVO".to_owned(), theme::bold(10.0), Color32::WHITE);
+            let badge_rect = Rect::from_min_size(
+                pos2(card.left() + 14.0, meta_y - 9.0),
+                badge.size() + vec2(12.0, 6.0),
+            );
+            painter.rect_filled(badge_rect, 4.0, theme::LIVE);
+            painter.galley(badge_rect.min + vec2(6.0, 3.0), badge, Color32::WHITE);
+            let mut x = badge_rect.right() + 8.0;
+            if let Some(time) = self.elapsed_of(key) {
+                let galley = painter.layout_no_wrap(time, theme::semibold(12.0), theme::MUTED);
+                painter.galley(
+                    pos2(x, meta_y - galley.size().y / 2.0),
+                    galley.clone(),
+                    theme::MUTED,
+                );
+                x += galley.size().x + 8.0;
+            }
+            let viewers = self.viewers_of(key);
+            if !viewers.is_empty() {
+                let chip = viewers_chip(&painter, pos2(x, meta_y), viewers.len(), theme::SURFACE_3);
+                ui.interact(
+                    chip,
+                    ui.scope_id().with(("plateia-cartao", key)),
+                    Sense::hover(),
+                )
+                .on_hover_text(format!("Assistindo: {}", viewers.join(", ")));
+            }
+            let label = if own { "Ver prévia" } else { "Assistir" };
+            let galley =
+                painter.layout_no_wrap(label.to_owned(), theme::semibold(12.5), Color32::WHITE);
+            let action = Rect::from_min_size(
+                pos2(card.right() - 14.0 - galley.size().x - 24.0, meta_y - 14.0),
+                vec2(galley.size().x + 24.0, 28.0),
+            );
+            painter.rect_filled(
+                action,
+                8.0,
+                if hovered {
+                    theme::PRIMARY_STRONG
+                } else {
+                    theme::PRIMARY
+                },
+            );
+            painter.galley(
+                action.center() - galley.size() / 2.0,
+                galley,
+                Color32::WHITE,
+            );
+            let hint = if own {
+                "Ver a sua prévia".to_owned()
+            } else {
+                format!("Assistir a live de {name}")
+            };
+            if response
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(hint)
+                .clicked()
+            {
+                actions.push(Action::ToggleLive(key.clone()));
+            }
+        }
+        let note =
+            "Dá para assistir várias ao mesmo tempo, pelos nomes acima ou pela barra lateral.";
+        painter.text(
+            pos2(body.center().x, grid_top + grid_height + 14.0 + 9.0),
+            Align2::CENTER_CENTER,
+            note,
+            theme::regular(13.0),
+            theme::MUTED,
+        );
+    }
+
     /// Grade de ladrilhos, centrada, como `.tile-grid` no site.
-    fn tiles(&self, ui: &mut Ui, area: Rect, actions: &mut Vec<Action>) {
+    fn tiles(&mut self, ui: &mut Ui, area: Rect, actions: &mut Vec<Action>) {
         let count = self.shown.len();
         let (cols, width, height) = fit_grid(count, area.width(), area.height());
         let rows = count.div_ceil(cols);
@@ -246,15 +523,18 @@ impl Stage<'_> {
                 ),
                 vec2(width, height),
             );
-            self.tile(ui, tile, key, actions);
+            self.tile(ui, tile, key, actions, false);
         }
     }
 
-    fn tile(&self, ui: &mut Ui, tile: Rect, key: &str, actions: &mut Vec<Action>) {
+    fn tile(&mut self, ui: &mut Ui, tile: Rect, key: &str, actions: &mut Vec<Action>, full: bool) {
         let (uid, kind) = parse_key(key);
         let own = uid == self.data.uid;
+        let radius = if full { 0.0 } else { 12.0 };
         let painter = ui.painter().clone();
-        painter.rect_filled(tile, 12.0, TILE_FILL);
+        painter.rect_filled(tile, radius, TILE_FILL);
+        // O ladrilho inteiro escuta o duplo clique (tela cheia); os botões por cima têm prioridade.
+        let surface = ui.interact(tile, ui.scope_id().with(("ladrilho", key)), Sense::click());
         let hovered = ui.rect_contains_pointer(tile);
         let state = if own {
             LiveState::Playing
@@ -271,24 +551,43 @@ impl Stage<'_> {
             );
             self.videos.paint(ui, video, key);
         } else if own {
-            self.own_placeholder(&painter, tile);
+            self.own_placeholder(ui, tile, key);
         } else {
             self.placeholder(ui, tile, key, state, actions);
         }
-        painter.rect_stroke(
-            tile,
-            12.0,
-            (1.0, Color32::from_white_alpha(15)),
-            egui::StrokeKind::Inside,
-        );
+        if !full {
+            painter.rect_stroke(
+                tile,
+                radius,
+                (1.0, Color32::from_white_alpha(15)),
+                egui::StrokeKind::Inside,
+            );
+        }
 
-        // Topo: "AO VIVO", o nome de quem transmite e, com o mouse em cima, o botão de fechar.
+        // Topo: "AO VIVO", tempo no ar, o nome, o jogo, a plateia e, com o mouse em cima, fechar.
         let badge = painter.layout_no_wrap("AO VIVO".to_owned(), theme::bold(10.0), Color32::WHITE);
         let badge_rect =
             Rect::from_min_size(tile.min + vec2(10.0, 10.0), badge.size() + vec2(12.0, 4.0));
         painter.rect_filled(badge_rect, 4.0, theme::LIVE);
         painter.galley(badge_rect.min + vec2(6.0, 2.0), badge, Color32::WHITE);
+        let shadow = |at: egui::Pos2, galley: std::sync::Arc<egui::Galley>| {
+            painter.galley(
+                at + vec2(1.0, 1.0),
+                galley.clone(),
+                Color32::from_black_alpha(90),
+            );
+            painter.galley_with_override_text_color(at, galley, Color32::WHITE);
+        };
         let mut x = badge_rect.right() + 8.0;
+        if let Some(time) = self.elapsed_of(key) {
+            let galley = painter.layout_no_wrap(time, theme::semibold(12.0), Color32::WHITE);
+            let width = galley.size().x;
+            shadow(
+                pos2(x, badge_rect.center().y - galley.size().y / 2.0),
+                galley,
+            );
+            x += width + 8.0;
+        }
         if kind == "camera" {
             icon(
                 &painter,
@@ -299,25 +598,54 @@ impl Stage<'_> {
             );
             x += 19.0;
         }
+        let viewers = self.viewers_of(key);
+        let viewers_width = if viewers.is_empty() { 0.0 } else { 52.0 };
+        let reserve = 52.0 + viewers_width;
         let name = theme::line(
             &painter,
             &self.name_of(key),
             theme::semibold(13.0),
             Color32::WHITE,
-            tile.right() - 52.0 - x,
+            (tile.right() - reserve - x).max(20.0),
         );
-        // Sombra de um ponto, para o nome continuar legível sobre imagem clara.
-        painter.galley(
-            pos2(x + 1.0, badge_rect.center().y - name.size().y / 2.0 + 1.0),
-            name.clone(),
-            Color32::from_black_alpha(150),
-        );
-        painter.galley_with_override_text_color(
-            pos2(x, badge_rect.center().y - name.size().y / 2.0),
-            name,
-            Color32::WHITE,
-        );
-        if hovered {
+        let name_width = name.size().x;
+        shadow(pos2(x, badge_rect.center().y - name.size().y / 2.0), name);
+        x += name_width + 8.0;
+        if let Some(game) = self.game_of(key) {
+            let room = tile.right() - reserve - x;
+            if room > 40.0 {
+                let galley = theme::line(
+                    &painter,
+                    game,
+                    theme::regular(12.0),
+                    Color32::from_white_alpha(205),
+                    room,
+                );
+                let width = galley.size().x;
+                painter.galley(
+                    pos2(x + 1.0, badge_rect.center().y - galley.size().y / 2.0 + 1.0),
+                    galley.clone(),
+                    Color32::from_black_alpha(90),
+                );
+                painter.galley(
+                    pos2(x, badge_rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    Color32::from_white_alpha(205),
+                );
+                x += width + 8.0;
+            }
+        }
+        if !viewers.is_empty() {
+            let chip = viewers_chip(
+                &painter,
+                pos2(x, badge_rect.center().y),
+                viewers.len(),
+                CHIP_FILL,
+            );
+            ui.interact(chip, ui.scope_id().with(("plateia", key)), Sense::hover())
+                .on_hover_text(format!("Assistindo: {}", viewers.join(", ")));
+        }
+        if hovered && !full {
             let close = Rect::from_min_size(
                 pos2(tile.right() - 42.0, tile.top() + 10.0),
                 vec2(32.0, 32.0),
@@ -337,25 +665,85 @@ impl Stage<'_> {
             {
                 actions.push(Action::ToggleLive(key.to_owned()));
             }
-            if !own && playing && !self.watching.has_sound(key) {
-                let label = painter.layout_no_wrap(
-                    "Sem som".to_owned(),
-                    theme::regular(12.0),
-                    Color32::WHITE,
-                );
-                let at = pos2(
-                    tile.left() + 12.0 + 22.0,
-                    tile.bottom() - 12.0 - label.size().y,
-                );
-                icon(
-                    &painter,
-                    pos2(tile.left() + 12.0 + 8.0, at.y + label.size().y / 2.0),
-                    Icon::VolumeX,
-                    16.0,
-                    Color32::WHITE,
-                );
-                painter.galley(at, label, Color32::WHITE);
+        }
+        // Embaixo: "Sem som" (com o mouse em cima) e a imagem que está chegando ("1080p · 60 fps").
+        if hovered && !own && playing && !self.watching.has_sound(key) {
+            let label =
+                painter.layout_no_wrap("Sem som".to_owned(), theme::regular(12.0), Color32::WHITE);
+            let at = pos2(
+                tile.left() + 12.0 + 22.0,
+                tile.bottom() - 12.0 - label.size().y,
+            );
+            icon(
+                &painter,
+                pos2(tile.left() + 12.0 + 8.0, at.y + label.size().y / 2.0),
+                Icon::VolumeX,
+                16.0,
+                Color32::WHITE,
+            );
+            painter.galley(at, label, Color32::WHITE);
+        }
+        let mut right = tile.right() - 12.0;
+        if hovered {
+            // Tela cheia (ou sair dela), como o botão do site.
+            let button = Rect::from_min_size(
+                pos2(right - 32.0, tile.bottom() - 10.0 - 32.0),
+                vec2(32.0, 32.0),
+            );
+            let response = ui.interact(
+                button,
+                ui.scope_id().with(("tela-cheia", key)),
+                Sense::click(),
+            );
+            let fill = if response.hovered() { 217 } else { 140 };
+            painter.rect_filled(
+                button,
+                8.0,
+                Color32::from_rgba_unmultiplied(10, 14, 26, fill),
+            );
+            icon(
+                &painter,
+                button.center(),
+                if full { Icon::Minimize } else { Icon::Maximize },
+                16.0,
+                Color32::WHITE,
+            );
+            let hint = if full {
+                "Sair da tela cheia (Esc)"
+            } else {
+                "Tela cheia (duplo clique)"
+            };
+            if response
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(hint)
+                .clicked()
+            {
+                actions.push(Action::Fullscreen(key.to_owned()));
             }
+            right = button.left() - 8.0;
+        }
+        if playing && let Some(quality) = self.quality.get(key).filter(|text| !text.is_empty()) {
+            let galley = painter.layout_no_wrap(
+                quality.clone(),
+                theme::regular(12.0),
+                Color32::from_white_alpha(230),
+            );
+            let chip = Rect::from_min_size(
+                pos2(
+                    right - galley.size().x - 16.0,
+                    tile.bottom() - 10.0 - 16.0 - 11.0,
+                ),
+                galley.size() + vec2(16.0, 6.0),
+            );
+            painter.rect_filled(chip, 6.0, CHIP_FILL);
+            painter.galley(
+                chip.min + vec2(8.0, 3.0),
+                galley,
+                Color32::from_white_alpha(230),
+            );
+        }
+        if surface.double_clicked() {
+            actions.push(Action::Fullscreen(key.to_owned()));
         }
     }
 
@@ -440,11 +828,32 @@ impl Stage<'_> {
         }
     }
 
-    /// A própria live: sem prévia nesta etapa, só o que o motor está fazendo.
-    fn own_placeholder(&self, painter: &egui::Painter, tile: Rect) {
+    /// A própria live: a última prévia (a mesma foto que os outros veem nos cartões), escurecida,
+    /// com o que o motor está fazendo por cima.
+    fn own_placeholder(&mut self, ui: &Ui, tile: Rect, key: &str) {
         let Some(broadcasting) = self.broadcasting else {
             return;
         };
+        let painter = ui.painter();
+        let ctx = ui.ctx().clone();
+        if let Some(texture) = broadcasting
+            .preview()
+            .and_then(|data| self.images.get(&ctx, &data))
+            .or_else(|| {
+                let data = self.room.previews.get(key)?.clone();
+                self.images.get(&ctx, &data)
+            })
+        {
+            let [width, height] = texture.size().map(|side| side.max(1) as f32);
+            let scale = (tile.width() / width).min(tile.height() / height);
+            let image = Rect::from_center_size(tile.center(), vec2(width * scale, height * scale));
+            painter.image(
+                texture.id(),
+                image,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE.gamma_multiply(0.35),
+            );
+        }
         let (title, detail) = match broadcasting.state() {
             BroadcastState::Starting => ("Começando a transmissão…".to_owned(), String::new()),
             BroadcastState::Failed => {
@@ -473,7 +882,7 @@ impl Stage<'_> {
             pos2(tile.center().x, tile.center().y - 30.0),
             Icon::MonitorUp,
             28.0,
-            theme::MUTED,
+            theme::TEXT,
         );
         painter.text(
             tile.center(),

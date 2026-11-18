@@ -29,8 +29,11 @@ url = "2"
 open = { version = "5", features = ["shellexecute-on-windows"] }
 # Cifra a sessão guardada com a chave do usuário do Windows (DPAPI).
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
-# Logo e fotos de perfil (PNG e WebP).
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+# Logo, fotos de perfil e prévias das lives (PNG, WebP e JPEG; a prévia própria sai em JPEG).
+image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg"] }
+# Fotos e prévias vêm do banco como data URL (base64); a foto da conta Google vem por HTTPS.
+base64 = "0.23"
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 [profile.release]
 opt-level = 3

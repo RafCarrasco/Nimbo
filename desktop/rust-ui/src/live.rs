@@ -12,6 +12,11 @@
 //! Diferença de propósito para o site: lá o navegador abre conexão com toda live nativa do canal,
 //! mesmo as que não estão no palco. Aqui só as que estão no palco, para a placa não decodificar
 //! vídeo que ninguém vê e quem transmite não contar espectador que não está assistindo.
+//!
+//! Prévia da própria live (`src/live/preview.ts`): 3 s depois de começar e a cada 45 s, uma foto de
+//! 256 px de largura do que está sendo transmitido vai para o canal (JPEG em base64, até 14000
+//! caracteres). A foto não sai do motor: é tirada pelo mesmo caminho das miniaturas do seletor (GDI,
+//! `capture_thumbnail`), que não mexe na captura da live.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -19,7 +24,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nimbo_core::room::{Broadcasts, Room};
+use base64::Engine as _;
+use nimbo_core::room::{Broadcasts, PREVIEW_LIMIT, Room};
 use nimbo_media::engine::{AudioSource, Engine, Quality, Source};
 use nimbo_media::viewer::{self, Frame, Viewer};
 use serde_json::json;
@@ -28,6 +34,10 @@ const TRIES: u32 = 3;
 const CONNECT: Duration = Duration::from_millis(12_000);
 /// O motor encerra a conexão do lado dele sem aviso: com a rede calada por este tempo, tenta de novo.
 const LOST: Duration = Duration::from_millis(5_000);
+/// Prévia da própria live: a primeira depois de tanto tempo, e depois de quanto em quanto.
+const PREVIEW_FIRST: Duration = Duration::from_millis(3_000);
+const PREVIEW_EVERY: Duration = Duration::from_millis(45_000);
+const PREVIEW_WIDTH: u32 = 256;
 
 pub fn live_key(uid: &str, kind: &str) -> String {
     format!("{uid}:{kind}")
@@ -425,10 +435,60 @@ impl Drop for Watching {
 }
 
 /// O que transmitir e com que som.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Capture {
     pub source: Source,
     pub audio: Option<AudioSource>,
+    /// Nome do jogo, quando a fonte é um jogo (vai no anúncio da live, até 48 caracteres). Título de
+    /// janela qualquer não vai: pode expor o que a pessoa não quis mostrar.
+    pub game: String,
+}
+
+/// Quanto custou a última prévia (para `--stats`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreviewCost {
+    pub millis: f64,
+    pub chars: usize,
+    pub sent: u32,
+}
+
+/// Foto pequena da fonte da live, como data URL (JPEG), ou `None` quando não deu (janela
+/// minimizada, protegida, imagem toda preta).
+fn snapshot(source: Source) -> Option<String> {
+    let target = match source {
+        Source::Window(hwnd) => sources::CaptureTarget::Window(hwnd),
+        Source::Monitor(index) => sources::CaptureTarget::Monitor(index),
+        Source::PrimaryMonitor => sources::CaptureTarget::Monitor(
+            sources::list_monitors()
+                .into_iter()
+                .find(|monitor| monitor.primary)
+                .map_or(1, |monitor| monitor.index),
+        ),
+    };
+    let shot = sources::capture_thumbnail_as(
+        target,
+        PREVIEW_WIDTH,
+        PREVIEW_WIDTH * 4,
+        sources::ImageFormat::Png,
+    )
+    .ok()?;
+    let image = image::load_from_memory(&shot.data).ok()?;
+    // A mesma escada de qualidade do site: a primeira que couber no limite das regras.
+    for quality in [50, 35, 20] {
+        let mut jpeg = Vec::new();
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality);
+        if image.to_rgb8().write_with_encoder(encoder).is_err() {
+            return None;
+        }
+        let data = format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&jpeg)
+        );
+        if data.len() <= PREVIEW_LIMIT {
+            return Some(data);
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -460,6 +520,8 @@ pub struct Broadcasting {
     out: Arc<Mutex<BTreeMap<String, u64>>>,
     /// Quem está no canal agora (o motor só responde a quem está).
     members: Arc<Mutex<Vec<String>>>,
+    /// A última prévia gravada (data URL) e quanto ela custou.
+    preview: Arc<Mutex<(Option<String>, PreviewCost)>>,
 }
 
 impl Broadcasting {
@@ -476,6 +538,7 @@ impl Broadcasting {
             Arc::new(Mutex::new(Vec::new())),
         );
         let (orders, inbox) = channel();
+        let preview = Arc::new(Mutex::new((None, PreviewCost::default())));
         let this = Self {
             engine: engine.clone(),
             orders,
@@ -483,6 +546,7 @@ impl Broadcasting {
             error: error.clone(),
             out: out.clone(),
             members: members.clone(),
+            preview: preview.clone(),
         };
         let repaint = repaint.clone();
         std::thread::spawn(move || {
@@ -496,8 +560,13 @@ impl Broadcasting {
                 .and_then(|()| engine.start(capture.source, Quality::default()))
                 .map_err(|e| e.to_string())
                 .and_then(|()| {
-                    room.publish_stream("screen", &stream_id, capture.audio.is_some())
-                        .map_err(|e| e.to_string())
+                    room.publish_stream(
+                        "screen",
+                        &stream_id,
+                        capture.audio.is_some(),
+                        &capture.game,
+                    )
+                    .map_err(|e| e.to_string())
                 });
             if let Err(e) = started {
                 *error.lock().expect("erro da transmissão") = e;
@@ -505,9 +574,36 @@ impl Broadcasting {
                 return set(BroadcastState::Failed);
             }
             set(BroadcastState::Live);
+            let mut next_preview = Instant::now() + PREVIEW_FIRST;
             // Uma oferta por vez, na ordem em que chegaram: duas ofertas da mesma pessoa (nova
-            // tentativa) não podem deixar duas conexões abertas no motor.
-            while let Ok(Order::Offer { from, sdp, nonce }) = inbox.recv() {
+            // tentativa) não podem deixar duas conexões abertas no motor. Entre uma e outra, a prévia.
+            loop {
+                let wait = next_preview.saturating_duration_since(Instant::now());
+                let (from, sdp, nonce) = match inbox.recv_timeout(wait) {
+                    Ok(Order::Offer { from, sdp, nonce }) => (from, sdp, nonce),
+                    Ok(Order::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        next_preview = Instant::now() + PREVIEW_EVERY;
+                        let started = Instant::now();
+                        if let Some(data) = snapshot(capture.source) {
+                            let millis = started.elapsed().as_secs_f64() * 1000.0;
+                            if room.publish_preview("screen", &data).is_ok() {
+                                let mut slot = preview.lock().expect("prévia");
+                                let sent = slot.1.sent + 1;
+                                *slot = (
+                                    Some(data.clone()),
+                                    PreviewCost {
+                                        millis,
+                                        chars: data.len(),
+                                        sent,
+                                    },
+                                );
+                                repaint.request_repaint();
+                            }
+                        }
+                        continue;
+                    }
+                };
                 let present = |who: &str| {
                     members
                         .lock()
@@ -587,6 +683,15 @@ impl Broadcasting {
 
     pub fn stats(&self) -> nimbo_media::engine::Stats {
         self.engine.stats()
+    }
+
+    /// A última prévia gravada no canal (data URL), para mostrar no próprio ladrilho.
+    pub fn preview(&self) -> Option<String> {
+        self.preview.lock().expect("prévia").0.clone()
+    }
+
+    pub fn preview_cost(&self) -> PreviewCost {
+        self.preview.lock().expect("prévia").1
     }
 
     /// Encerra a live: fecha as conexões, para a captura e tira o anúncio (na thread da transmissão).

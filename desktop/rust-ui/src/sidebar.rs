@@ -1,17 +1,24 @@
 //! Barra lateral: categorias, canais, quem está em cada um e o painel da conta. Segue
 //! `src/components/Sidebar.tsx` e `UserPanel.tsx` do site, com as mesmas regras do que aparece.
+//!
+//! Botão direito: numa pessoa abre o menu dela; num canal ou categoria (equipe), o menu de
+//! edição. Cadeados e cores de cargo só aparecem para o proprietário (cargos são segredo dele).
 
 use std::collections::BTreeSet;
 
-use egui::{Align2, CursorIcon, Rect, Sense, TextureHandle, Ui, pos2, vec2};
+use egui::{Align2, CursorIcon, Pos2, Rect, Sense, TextureHandle, Ui, pos2, vec2};
 use lucide_icons::Icon;
 use nimbo_core::community::Snapshot;
 
+use crate::dialogs::Dialog;
+use crate::images::Images;
 use crate::live::BroadcastState;
+use crate::ops::Op;
+use crate::settings::Tab as SettingsTab;
 use crate::theme;
-use crate::widgets::{avatar, icon, icon_button, icon_button_at, live_count, live_pill};
+use crate::widgets::{avatar, icon, icon_button, icon_button_at, live_count, live_pill, photo};
 
-/// O que a pessoa pediu ao clicar na barra.
+/// O que a pessoa pediu ao clicar (na barra, no palco, nos menus e janelas).
 pub enum Action {
     ToggleCategory(String),
     Join(String),
@@ -19,14 +26,45 @@ pub enum Action {
     Leave,
     /// Abre ou fecha uma live no palco (a chave é "uid:screen" ou "uid:camera").
     ToggleLive(String),
+    /// Abre uma live no palco (o "Assistir" do aviso de live nova).
+    OpenLive(String),
     /// "Tentar de novo" nas lives de uma pessoa.
     RetryLive(String),
     /// Abre o seletor do que transmitir.
     PickSource,
     StopBroadcast,
     OpenAdmin,
+    CloseAdmin,
     EditProfile,
     SignOut,
+    /// Menu do botão direito numa pessoa (no canal, ou na lista de membros sem canal).
+    PersonMenu {
+        channel: Option<String>,
+        uid: String,
+        at: Pos2,
+    },
+    ChannelMenu {
+        id: String,
+        at: Pos2,
+    },
+    CategoryMenu {
+        id: String,
+        at: Pos2,
+    },
+    /// Janela de configurações de um canal ou categoria.
+    Settings {
+        category: bool,
+        id: String,
+        tab: SettingsTab,
+    },
+    CreateChannel(String),
+    CreateCategory,
+    /// Uma gravação (cargo, nível, canal...), que roda fora da thread que desenha.
+    Run(Op),
+    /// Uma caixa de confirmação ou de texto antes de agir.
+    Ask(Box<Dialog>),
+    /// Duplo clique num ladrilho: tela cheia com aquela live (ou sai dela).
+    Fullscreen(String),
 }
 
 /// Canal em que a pessoa está, para o painel de conexão acima da conta.
@@ -37,6 +75,15 @@ pub struct Connection<'a> {
     pub broadcasting: Option<BroadcastState>,
 }
 
+/// Pessoa ao vivo com o mouse em cima (para a prévia ao lado da barra).
+#[derive(Clone, PartialEq)]
+pub struct Hover {
+    pub channel: String,
+    pub uid: String,
+    pub name: String,
+    pub anchor: Rect,
+}
+
 pub struct Sidebar<'a> {
     pub data: &'a Snapshot,
     pub collapsed: &'a BTreeSet<String>,
@@ -44,10 +91,14 @@ pub struct Sidebar<'a> {
     pub logo: &'a TextureHandle,
     pub version: &'a str,
     pub connection: Option<Connection<'a>>,
+    pub images: &'a mut Images,
+    pub admin_open: bool,
+    /// Sai daqui: quem está ao vivo com o mouse em cima.
+    pub hover: Option<Hover>,
 }
 
 impl Sidebar<'_> {
-    pub fn show(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    pub fn show(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let frame = egui::Frame::new().fill(theme::SIDEBAR);
         egui::Panel::left("barra")
             .exact_size(theme::SIDEBAR_WIDTH)
@@ -100,13 +151,16 @@ impl Sidebar<'_> {
             theme::bold(16.0),
             theme::TEXT,
         );
-        if self.data.level.is_staff() || self.data.net_admins.contains(&self.data.uid) {
+        if self.data.level.is_staff() {
             let button = Rect::from_center_size(
                 pos2(rect.right() - 10.0 - 16.0, rect.center().y),
                 vec2(32.0, 32.0),
             );
             let response = ui.interact(button, ui.scope_id().with("admin"), Sense::click());
-            if icon_button_at(
+            if self.admin_open {
+                painter.rect_filled(button, 8.0, theme::SURFACE_2);
+            }
+            let response = icon_button_at(
                 ui,
                 button,
                 response,
@@ -114,15 +168,36 @@ impl Sidebar<'_> {
                 18.0,
                 "Gerenciar comunidade",
                 false,
-            )
-            .clicked()
-            {
-                actions.push(Action::OpenAdmin);
+            );
+            // Solicitações esperando o proprietário: uma bolinha no canto da engrenagem.
+            let pending = self
+                .data
+                .requests
+                .keys()
+                .filter(|uid| !self.data.approved.contains(*uid))
+                .count();
+            if pending > 0 {
+                let dot = pos2(button.right() - 6.0, button.top() + 6.0);
+                painter.circle_filled(dot, 7.0, theme::LIVE);
+                painter.text(
+                    dot,
+                    Align2::CENTER_CENTER,
+                    pending.min(9).to_string(),
+                    theme::bold(9.5),
+                    egui::Color32::WHITE,
+                );
+            }
+            if response.clicked() {
+                actions.push(if self.admin_open {
+                    Action::CloseAdmin
+                } else {
+                    Action::OpenAdmin
+                });
             }
         }
     }
 
-    fn channels(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    fn channels(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let data = self.data;
         let uid = data.uid.as_str();
         let staff = data.level.is_staff();
@@ -230,31 +305,48 @@ impl Sidebar<'_> {
         } else {
             response.on_hover_text(lock)
         };
-        // Os botões da equipe aparecem ao passar o mouse, como no site. Ainda sem ação nesta etapa.
+        // Os botões da equipe aparecem ao passar o mouse, como no site.
         if staff && hovered {
-            for (i, (glyph, size, hint)) in [
+            let buttons = [
                 (Icon::Settings, 13.0, format!("Permissões de {name}")),
                 (Icon::Plus, 14.0, format!("Criar canal em {name}")),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            ];
+            for (i, (glyph, size, hint)) in buttons.into_iter().enumerate() {
                 let button = Rect::from_center_size(
                     pos2(rect.right() - 12.0 - i as f32 * 24.0, rect.center().y),
                     vec2(24.0, 24.0),
                 );
                 let button_response =
                     ui.interact(button, ui.scope_id().with(("cat", id, i)), Sense::click());
-                icon_button_at(ui, button, button_response, glyph, size, &hint, false);
+                if icon_button_at(ui, button, button_response, glyph, size, &hint, false).clicked()
+                {
+                    actions.push(match i {
+                        0 => Action::Settings {
+                            category: true,
+                            id: id.to_owned(),
+                            tab: SettingsTab::Permissions,
+                        },
+                        _ => Action::CreateChannel(id.to_owned()),
+                    });
+                }
             }
         }
         if response.clicked() {
             actions.push(Action::ToggleCategory(id.to_owned()));
         }
+        if staff && response.secondary_clicked() {
+            let at = response
+                .interact_pointer_pos()
+                .unwrap_or(rect.left_bottom());
+            actions.push(Action::CategoryMenu {
+                id: id.to_owned(),
+                at,
+            });
+        }
     }
 
     fn channel_row(
-        &self,
+        &mut self,
         ui: &mut Ui,
         actions: &mut Vec<Action>,
         id: &str,
@@ -344,11 +436,24 @@ impl Sidebar<'_> {
             color,
         );
         let hint = if allowed {
-            format!("Entrar em {name}")
+            if lock.is_empty() {
+                format!("Entrar em {name}")
+            } else {
+                format!("Entrar em {name} ({lock})")
+            }
         } else {
             "Você não tem acesso a este canal".to_owned()
         };
         let response = response.on_hover_text(hint);
+        if staff && response.secondary_clicked() {
+            let at = response
+                .interact_pointer_pos()
+                .unwrap_or(rect.left_bottom());
+            actions.push(Action::ChannelMenu {
+                id: id.to_owned(),
+                at,
+            });
+        }
         if allowed && response.on_hover_cursor(CursorIcon::PointingHand).clicked() {
             actions.push(Action::Join(id.to_owned()));
         }
@@ -359,21 +464,31 @@ impl Sidebar<'_> {
             );
             let button_response =
                 ui.interact(button, ui.scope_id().with(("chan", id)), Sense::click());
-            icon_button_at(
+            let hint = format!("Permissões do canal {name}");
+            if icon_button_at(
                 ui,
                 button,
                 button_response,
                 Icon::Settings,
                 13.0,
-                &format!("Permissões do canal {name}"),
+                &hint,
                 false,
-            );
+            )
+            .clicked()
+            {
+                actions.push(Action::Settings {
+                    category: false,
+                    id: id.to_owned(),
+                    tab: SettingsTab::Permissions,
+                });
+            }
         }
 
         if members.is_empty() {
             return;
         }
         ui.add_space(2.0);
+        let ctx = ui.ctx().clone();
         for member in members {
             let profile = data.profiles.get(member);
             let live = here.streams.get(member).copied().unwrap_or_default();
@@ -381,7 +496,8 @@ impl Sidebar<'_> {
             let (row, response) =
                 ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
             let item = Rect::from_min_max(pos2(row.left() + 22.0, row.top()), row.max);
-            let hovered = on_air && allowed && ui.rect_contains_pointer(item);
+            let pointer = ui.rect_contains_pointer(item);
+            let hovered = on_air && allowed && pointer;
             if hovered {
                 painter.rect_filled(item, 6.0, theme::SURFACE);
             }
@@ -390,12 +506,15 @@ impl Sidebar<'_> {
                 Some(name) => name.clone(),
                 None => "Sessão sem perfil".to_owned(),
             };
-            avatar(
-                &painter,
-                pos2(item.left() + 6.0 + 11.0, item.center().y),
-                22.0,
-                profile.map_or("", String::as_str),
-            );
+            let texture = data
+                .avatars
+                .get(member)
+                .and_then(|source| self.images.get(&ctx, source));
+            let center = pos2(item.left() + 6.0 + 11.0, item.center().y);
+            match profile {
+                Some(name) => photo(&painter, center, 22.0, name, texture.as_ref()),
+                None => avatar(&painter, center, 22.0, ""),
+            }
             let mut right = item.right() - 6.0;
             if on_air {
                 right -= live_pill(
@@ -416,10 +535,27 @@ impl Sidebar<'_> {
                 label,
                 color,
             );
-            if on_air && allowed {
-                let response = response
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Assistir");
+            if hovered {
+                self.hover = Some(Hover {
+                    channel: id.to_owned(),
+                    uid: member.clone(),
+                    name: profile
+                        .cloned()
+                        .unwrap_or_else(|| "Participante".to_owned()),
+                    anchor: item,
+                });
+            }
+            if response.secondary_clicked() {
+                let at = response
+                    .interact_pointer_pos()
+                    .unwrap_or(item.left_bottom());
+                actions.push(Action::PersonMenu {
+                    channel: Some(id.to_owned()),
+                    uid: member.clone(),
+                    at,
+                });
+            } else if on_air && allowed {
+                let response = response.on_hover_cursor(CursorIcon::PointingHand);
                 if response.clicked() {
                     actions.push(Action::Watch(id.to_owned(), member.clone()));
                 }
@@ -552,7 +688,7 @@ impl Sidebar<'_> {
         );
     }
 
-    fn account(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
+    fn account(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let data = self.data;
         let top = ui.max_rect();
         ui.painter()
@@ -563,11 +699,17 @@ impl Sidebar<'_> {
         let nickname = data.profiles.get(&data.uid).map_or("", String::as_str);
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::hover());
         let painter = ui.painter().clone();
-        avatar(
+        let ctx = ui.ctx().clone();
+        let texture = data
+            .avatars
+            .get(&data.uid)
+            .and_then(|source| self.images.get(&ctx, source));
+        photo(
             &painter,
             pos2(rect.left() + 10.0 + 16.0, rect.center().y),
             32.0,
             nickname,
+            texture.as_ref(),
         );
         let left = rect.left() + 10.0 + 32.0 + 8.0;
         let room = rect.right() - 8.0 - 64.0 - 8.0 - left;

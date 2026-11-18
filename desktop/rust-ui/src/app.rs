@@ -2,9 +2,11 @@
 //!
 //! O app entra com uma conta, espera a aprovação e mostra a comunidade ao vivo. Dentro de um canal,
 //! assiste às lives nativas (as do motor do app) pelo player e transmite uma janela pelo motor
-//! (`live.rs`). O que ainda falta está em `docs/rust-app.md`, seção "App full Rust".
+//! (`live.rs`). A equipe edita canais e categorias (`settings.rs`) e o proprietário cuida de cargos,
+//! membros e solicitações (`admin.rs`, menus do botão direito em `menu.rs`). O que ainda falta está
+//! em `docs/rust-app.md`, seção "App full Rust".
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,22 +15,30 @@ use std::time::{Duration, Instant};
 
 use egui::{Align2, Color32, Rect, Sense, TextureHandle, Ui, pos2, vec2};
 use lucide_icons::Icon;
+use nimbo_core::admin::{is_system_channel, name_error};
 use nimbo_core::auth::{self, Session};
-use nimbo_core::community::Community;
+use nimbo_core::community::{Community, DEFAULT_CATEGORY, Level, Snapshot};
 use nimbo_core::config::Project;
-use nimbo_core::room::{Room, RoomSnapshot, Signal};
+use nimbo_core::room::{self, Room, RoomSnapshot, Signal};
 use nimbo_core::rtdb::{Db, Event, Status};
 use nimbo_media::engine::{AudioSource, Source};
 use nimbo_media::viewer;
 use serde_json::json;
 
+use crate::admin::{Admin, Tab as AdminTab};
+use crate::dialogs::{Dialog, Then, Toasts, Tone};
+use crate::images::Images;
 use crate::live::{
     BroadcastState, Broadcasting, Capture, LiveState, Watching, live_key, parse_key,
 };
 use crate::login::{self, LoginManager, Outcome, Timing};
+use crate::menu::{self, Entry, Item, Place};
+use crate::ops::{Done, Op};
 use crate::picker::{Choice, Picker};
+use crate::script::Script;
 use crate::session_store;
-use crate::sidebar::{Action, Connection, Sidebar};
+use crate::settings::{self, Settings};
+use crate::sidebar::{Action, Connection, Hover, Sidebar};
 use crate::stage::{Stage, notice_bar};
 use crate::theme;
 use crate::video::Videos;
@@ -40,6 +50,12 @@ const APP_LABEL: &str = concat!(env!("CARGO_PKG_VERSION"), " (nativo)");
 const AUTO_OPEN: Duration = Duration::from_secs(5);
 /// Quantas lives abrem sozinhas ao entrar.
 const AUTO_OPEN_MAX: usize = 4;
+/// Logo depois de entrar, as lives que já estavam no ar chegam aos poucos: não viram aviso.
+const ANNOUNCE_AFTER: Duration = Duration::from_secs(4);
+/// O mouse parado em quem está ao vivo por este tempo mostra a prévia (como no site).
+const PEEK_AFTER: Duration = Duration::from_millis(350);
+/// Prévia lida pelo mouse vale por este tempo (passar de novo em cima não relê do banco).
+const PEEK_FRESH: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 pub struct Args {
@@ -74,6 +90,22 @@ pub struct Args {
     pub cpu_video: bool,
     /// Abre o seletor do que transmitir assim que entrar no canal (para conferir a tela sem clicar).
     pub pick: bool,
+    /// Telas novas abertas sem clicar, para as fotos de teste: "Gerenciar comunidade" numa aba
+    /// (`solicitacoes`, `membros`, `cargos`, `canais`), o cargo selecionado e a aba dele
+    /// (`exibicao`, `acesso`, `membros`), a janela de um canal ou categoria (`canal:<id>` ou
+    /// `categoria:<id>`, com `:permissoes` no fim para abrir nas permissões) e o menu do botão direito
+    /// de uma pessoa (pelo nome).
+    pub open_admin: Option<String>,
+    pub open_role: Option<String>,
+    pub role_tab: Option<String>,
+    pub open_settings: Option<String>,
+    pub open_menu: Option<String>,
+    /// Não abre sozinha no palco nenhuma live ao entrar (para ver os cartões "Ao vivo agora").
+    pub no_auto_open: bool,
+    /// Roteiro de cliques e teclas (`script.rs`), para testar as telas sem mão humana.
+    pub clicks: Option<String>,
+    /// A tela cheia fica só dentro da janela (os testes não podem cobrir o monitor de quem usa).
+    pub windowed_fullscreen: bool,
 }
 
 const PRODUCTION_SITE: &str = "https://golive-ad118.web.app";
@@ -88,6 +120,10 @@ enum Msg {
     Online(bool),
     /// Resultado de entrar num canal (o id do canal e a sala, ou o motivo de não ter dado).
     Joined(String, Result<Room, String>),
+    /// Resultado de uma gravação da administração.
+    Done(Done),
+    /// Prévias de uma pessoa lidas para mostrar ao lado da barra (canal, pessoa, tipo → foto).
+    Peek(String, String, BTreeMap<String, String>),
 }
 
 /// Lives do canal em que a pessoa está: o que ela assiste, o que transmite e o que está no palco.
@@ -104,6 +140,13 @@ struct Lives {
     active: Vec<String>,
     /// As de `visible` que estão no ar: são os ladrilhos do palco.
     shown: Vec<String>,
+    /// "1080p · 60 fps" de cada live que está chegando, refeito a cada 2 s.
+    quality: HashMap<String, String>,
+    quality_at: Instant,
+    decoded: HashMap<String, u64>,
+    /// Lives dos outros já conhecidas, e desde quando a pessoa está no canal (para o aviso de live nova).
+    known: BTreeSet<String>,
+    since: Instant,
 }
 
 impl Lives {
@@ -122,7 +165,56 @@ impl Lives {
             reconnects: 0,
             active: Vec::new(),
             shown: Vec::new(),
+            quality: HashMap::new(),
+            quality_at: Instant::now(),
+            decoded: HashMap::new(),
+            known: BTreeSet::new(),
+            since: Instant::now(),
         }
+    }
+
+    /// Lives dos outros que começaram agora (com a pessoa já no canal): viram um aviso com o botão
+    /// Assistir, em vez de abrir sozinhas.
+    fn fresh_lives(&mut self, snapshot: &RoomSnapshot, uid: &str) -> Vec<String> {
+        let now: BTreeSet<String> = Self::keys_of(snapshot, uid, None).into_iter().collect();
+        let fresh = if self.since.elapsed() >= ANNOUNCE_AFTER {
+            now.difference(&self.known).cloned().collect()
+        } else {
+            Vec::new()
+        };
+        self.known = now;
+        fresh
+    }
+
+    /// A cada 2 s: resolução e quadros por segundo que estão chegando em cada live.
+    fn measure(&mut self) {
+        let elapsed = self.quality_at.elapsed();
+        if elapsed < Duration::from_secs(2) {
+            return;
+        }
+        self.quality_at = Instant::now();
+        let mut decoded = HashMap::new();
+        let mut quality = HashMap::new();
+        for (key, stats) in self.watching.stats() {
+            let before = self
+                .decoded
+                .get(&key)
+                .copied()
+                .unwrap_or(stats.frames_decoded);
+            let fps = (stats.frames_decoded.saturating_sub(before) as f64 / elapsed.as_secs_f64())
+                .round();
+            if stats.height > 0 {
+                let text = if fps > 0.0 {
+                    format!("{}p · {fps} fps", stats.height)
+                } else {
+                    format!("{}p", stats.height)
+                };
+                quality.insert(key.clone(), text);
+            }
+            decoded.insert(key, stats.frames_decoded);
+        }
+        self.decoded = decoded;
+        self.quality = quality;
     }
 
     /// Lives dos outros no ar (de uma pessoa, ou de todos).
@@ -207,6 +299,11 @@ impl Lives {
         self.watching
             .sync(&snapshot.broadcasts, &snapshot.members, &on_stage);
         self.watching.tick();
+        self.measure();
+        // Plateia: o canal fica sabendo o que está aberto no palco (só lives dos outros, no ar).
+        room.set_watching(&self.shown);
+        // Os cartões "Ao vivo agora" mostram as prévias: lidas só enquanto eles estão na tela.
+        room.watch_previews(self.shown.is_empty() && !self.active.is_empty());
         if let Some(live) = &self.broadcasting {
             live.set_members(&snapshot.members);
         }
@@ -292,6 +389,33 @@ pub struct Nimbo {
     auto_joined: bool,
     auto_broadcast: bool,
     shot_done: Arc<AtomicBool>,
+    images: Images,
+    toasts: Toasts<String>,
+    /// Menu do botão direito aberto: sobre quem (ou o quê) e onde.
+    menu: Option<(MenuTarget, Place)>,
+    dialog: Option<Dialog>,
+    settings: Option<Settings>,
+    admin: Option<Admin>,
+    /// Live em tela cheia (a janela vira tela cheia sem borda e mostra só ela).
+    fullscreen: Option<String>,
+    /// Quem está ao vivo com o mouse em cima na barra, desde quando, e as prévias já lidas.
+    hover: Option<(Hover, Instant)>,
+    peeks: HashMap<(String, String), (Instant, BTreeMap<String, String>)>,
+    peeking: BTreeSet<(String, String)>,
+    /// Telas de teste já abertas (`--open-*`).
+    opened_for_test: bool,
+    script: Option<Script>,
+}
+
+/// Sobre o que é o menu do botão direito.
+#[derive(Clone, PartialEq)]
+enum MenuTarget {
+    Person {
+        channel: Option<String>,
+        uid: String,
+    },
+    Channel(String),
+    Category(String),
 }
 
 impl Nimbo {
@@ -344,7 +468,23 @@ impl Nimbo {
             auto_joined: false,
             auto_broadcast: false,
             shot_done: Arc::new(AtomicBool::new(false)),
+            images: Images::new(),
+            toasts: Toasts::new(),
+            menu: None,
+            dialog: None,
+            settings: None,
+            admin: None,
+            fullscreen: None,
+            hover: None,
+            peeks: HashMap::new(),
+            peeking: BTreeSet::new(),
+            opened_for_test: false,
+            script: None,
         };
+        app.script = app.args.clicks.as_deref().and_then(Script::parse);
+        if app.args.clicks.is_some() && app.script.is_none() {
+            eprintln!("roteiro de cliques inválido: {:?}", app.args.clicks);
+        }
         match app.args.dev_user.clone() {
             Some(name) if app.project.emulator => app.sign_in(&cc.egui_ctx, &name),
             _ => app.resume(&cc.egui_ctx),
@@ -519,6 +659,23 @@ impl Nimbo {
                         account.online = online;
                     }
                 }
+                Msg::Done(done) => {
+                    match done.result {
+                        Ok(message) if !message.is_empty() => {
+                            self.toasts.show_text(message, Tone::Success)
+                        }
+                        Ok(_) => {}
+                        Err(error) => self.toasts.show_text(error, Tone::Error),
+                    }
+                    if let (Some(id), Some(admin)) = (done.created_role, self.admin.as_mut()) {
+                        admin.select_role(&id);
+                    }
+                }
+                Msg::Peek(channel, uid, previews) => {
+                    self.peeking.remove(&(channel.clone(), uid.clone()));
+                    self.peeks
+                        .insert((channel, uid), (Instant::now(), previews));
+                }
                 Msg::Joined(channel, result) => {
                     let Some(account) = &mut self.account else {
                         continue;
@@ -536,13 +693,12 @@ impl Nimbo {
                             let room = Arc::new(room);
                             let volume = if self.args.mute { 0.0 } else { 1.0 };
                             let watch = account.watch_on_join.take();
-                            account.lives = Some(Lives::new(
-                                room.clone(),
-                                &account.session.uid,
-                                volume,
-                                watch,
-                                ctx,
-                            ));
+                            let mut lives =
+                                Lives::new(room.clone(), &account.session.uid, volume, watch, ctx);
+                            if self.args.no_auto_open {
+                                lives.auto_open = None;
+                            }
+                            account.lives = Some(lives);
                             account.room = Some(room);
                             self.notice.clear();
                         }
@@ -626,6 +782,28 @@ impl Nimbo {
         });
     }
 
+    /// Faz uma gravação fora da thread que desenha; o resultado vira um aviso.
+    fn run(&self, ctx: &egui::Context, op: Op) {
+        let Some(account) = &self.account else { return };
+        let (db, uid, tx, repaint) = (
+            account.db.clone(),
+            account.session.uid.clone(),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Done(op.run(&db, &uid)));
+            repaint.request_repaint();
+        });
+    }
+
+    fn set_fullscreen(&mut self, ctx: &egui::Context, key: Option<String>) {
+        if self.fullscreen.is_some() != key.is_some() && !self.args.windowed_fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(key.is_some()));
+        }
+        self.fullscreen = key;
+    }
+
     fn leave(&mut self) {
         let Some(account) = &mut self.account else {
             return;
@@ -675,6 +853,73 @@ impl Nimbo {
                         }
                     }
                 }
+                Action::OpenLive(key) => {
+                    if let Some(lives) = self
+                        .account
+                        .as_mut()
+                        .and_then(|account| account.lives.as_mut())
+                    {
+                        lives.open(vec![key]);
+                    }
+                }
+                Action::Fullscreen(key) => {
+                    let next = if self.fullscreen.as_deref() == Some(key.as_str()) {
+                        None
+                    } else {
+                        Some(key)
+                    };
+                    self.set_fullscreen(ctx, next);
+                }
+                Action::PersonMenu { channel, uid, at } => {
+                    self.menu = Some((MenuTarget::Person { channel, uid }, Place::new(at)))
+                }
+                Action::ChannelMenu { id, at } => {
+                    self.menu = Some((MenuTarget::Channel(id), Place::new(at)))
+                }
+                Action::CategoryMenu { id, at } => {
+                    self.menu = Some((MenuTarget::Category(id), Place::new(at)))
+                }
+                Action::Settings { category, id, tab } => {
+                    let data = self
+                        .account
+                        .as_ref()
+                        .and_then(|account| account.community.as_ref())
+                        .map(Community::snapshot);
+                    if let Some(data) = data.filter(|data| data.level.is_staff()) {
+                        self.settings = Settings::open(&data, category, &id, tab);
+                    }
+                }
+                Action::CreateChannel(category) => {
+                    self.dialog = Some(Dialog::prompt(
+                        "Novo canal",
+                        "Nome do canal",
+                        "Criar",
+                        name_error,
+                        Then::CreateChannel(category),
+                    ));
+                }
+                Action::CreateCategory => {
+                    self.dialog = Some(Dialog::prompt(
+                        "Nova categoria",
+                        "Nome da categoria",
+                        "Criar",
+                        name_error,
+                        Then::CreateCategory,
+                    ));
+                }
+                Action::Run(op) => self.run(ctx, op),
+                Action::Ask(dialog) => self.dialog = Some(*dialog),
+                Action::OpenAdmin => {
+                    let data = self
+                        .account
+                        .as_ref()
+                        .and_then(|account| account.community.as_ref())
+                        .map(Community::snapshot);
+                    if let Some(data) = data.filter(|data| data.level.is_staff()) {
+                        self.admin = Some(Admin::new(&data));
+                    }
+                }
+                Action::CloseAdmin => self.admin = None,
                 Action::RetryLive(uid) => {
                     if let Some(lives) = self
                         .account
@@ -702,8 +947,8 @@ impl Nimbo {
                         lives.broadcasting = None;
                     }
                 }
-                // Perfil e administração chegam nas próximas etapas.
-                Action::OpenAdmin | Action::EditProfile => {}
+                // Perfil chega numa próxima etapa (N11).
+                Action::EditProfile => {}
             }
         }
     }
@@ -735,6 +980,11 @@ impl Nimbo {
             auto_joined,
             auto_broadcast,
             meter,
+            images,
+            toasts,
+            admin,
+            fullscreen,
+            hover,
             ..
         } = self;
         let Some(account) = account.as_mut() else {
@@ -777,19 +1027,29 @@ impl Nimbo {
             if let Some(window) = args.broadcast.filter(|_| !*auto_broadcast) {
                 *auto_broadcast = true;
                 let audio = args.sound.then(|| AudioSource::Exclude(std::process::id()));
-                Self::start_broadcast(
-                    lives,
-                    handle,
-                    &data.uid,
-                    Capture {
-                        source: Source::Window(window),
-                        audio,
-                    },
-                    &ctx,
-                );
+                let capture = Capture {
+                    source: Source::Window(window),
+                    audio,
+                    game: String::new(),
+                };
+                Self::start_broadcast(lives, handle, &data.uid, capture, &ctx);
             }
             if let Some(message) = lives.update(handle, snapshot, &data.uid, args.watch_all) {
                 *notice = message.to_owned();
+            }
+            for key in lives.fresh_lives(snapshot, &data.uid) {
+                let (uid, kind) = parse_key(&key);
+                let name = data
+                    .profiles
+                    .get(uid)
+                    .cloned()
+                    .unwrap_or_else(|| "Participante".to_owned());
+                let text = if kind == "camera" {
+                    format!("{name} ligou a webcam")
+                } else {
+                    format!("{name} começou uma live")
+                };
+                toasts.with_action(text, "Assistir", key);
             }
             for key in lives
                 .shown
@@ -838,41 +1098,603 @@ impl Nimbo {
             });
             return ready;
         }
-        Sidebar {
-            data: &data,
-            collapsed,
-            room: current,
-            logo,
-            version: env!("CARGO_PKG_VERSION"),
-            connection: room.as_ref().map(|room| Connection {
-                online: room.online,
-                channel: channel_name,
-                broadcasting: lives
-                    .and_then(|lives| lives.broadcasting.as_ref())
-                    .map(Broadcasting::state),
-            }),
+        // Tela cheia: só a live, sem a barra.
+        let full = fullscreen
+            .clone()
+            .filter(|key| lives.is_some_and(|lives| lives.shown.contains(key)));
+        if fullscreen.is_some() && full.is_none() {
+            actions.push(Action::Fullscreen(fullscreen.clone().unwrap_or_default()));
         }
-        .show(ui, actions);
-        match (&room, lives) {
-            (Some(room), Some(lives)) => Stage {
+        if full.is_none() {
+            let mut sidebar = Sidebar {
                 data: &data,
-                room,
-                channel_name,
-                active: &lives.active,
-                shown: &lives.shown,
-                watching: &lives.watching,
-                broadcasting: lives.broadcasting.as_ref(),
-                videos,
+                collapsed,
+                room: current,
                 logo,
-                notice,
+                version: env!("CARGO_PKG_VERSION"),
+                connection: room.as_ref().map(|room| Connection {
+                    online: room.online,
+                    channel: channel_name,
+                    broadcasting: lives
+                        .and_then(|lives| lives.broadcasting.as_ref())
+                        .map(Broadcasting::state),
+                }),
+                images,
+                admin_open: admin.is_some(),
+                hover: None,
+            };
+            sidebar.show(ui, actions);
+            // A prévia ao lado da barra espera o mouse parar um instante em quem está ao vivo.
+            match (sidebar.hover, hover.as_ref()) {
+                (Some(now), Some((before, _))) if now == *before => {}
+                (Some(now), _) => *hover = Some((now, Instant::now())),
+                (None, _) => *hover = None,
             }
-            .show(ui, actions),
+        }
+        let now_ms = account.db.server_now_ms();
+        if let Some(panel) = admin
+            .as_mut()
+            .filter(|_| data.level.is_staff() && full.is_none())
+        {
+            panel.show(ui, &data, images, now_ms, actions);
+            return ready;
+        }
+        match (&room, lives) {
+            (Some(room), Some(lives)) => {
+                Stage {
+                    data: &data,
+                    room,
+                    channel_name,
+                    active: &lives.active,
+                    shown: &lives.shown,
+                    watching: &lives.watching,
+                    broadcasting: lives.broadcasting.as_ref(),
+                    videos,
+                    logo,
+                    notice,
+                    images,
+                    now_ms,
+                    quality: &lives.quality,
+                    fullscreen: full.as_deref(),
+                }
+                .show(ui, actions);
+                // O tempo no ar anda de segundo em segundo.
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
             _ => {
                 let nickname = data.profiles.get(&data.uid).cloned().unwrap_or_default();
                 home(ui, logo, &nickname, notice);
             }
         }
         ready
+    }
+
+    /// Itens do menu do botão direito, montados com os dados de agora (marcar um cargo atualiza a
+    /// caixa sem fechar o menu). Cada item clicável tem a ação que ele dispara.
+    fn menu_items(
+        &mut self,
+        ctx: &egui::Context,
+        data: &Snapshot,
+        target: &MenuTarget,
+    ) -> Vec<(Item, Option<Action>)> {
+        let me = data.uid.as_str();
+        let mut items: Vec<(Item, Option<Action>)> = Vec::new();
+        match target {
+            MenuTarget::Person { channel, uid } => {
+                let profile = data.profiles.get(uid);
+                let name = profile
+                    .cloned()
+                    .unwrap_or_else(|| "Sessão sem perfil".to_owned());
+                // Canal onde a pessoa está ao vivo (o do menu, ou qualquer um que a conta enxerga).
+                let live_in = channel
+                    .iter()
+                    .chain(data.presence.keys())
+                    .find(|id| {
+                        data.channel_allowed(id, me)
+                            && data
+                                .presence
+                                .get(*id)
+                                .is_some_and(|room| room.streams.contains_key(uid))
+                    })
+                    .cloned();
+                let known_level = data.owner || uid == me;
+                let detail = if known_level {
+                    data.level_of(uid).label().to_owned()
+                } else {
+                    channel
+                        .as_ref()
+                        .and_then(|id| data.channels.get(id))
+                        .map_or(String::new(), |c| format!("No canal {}", c.name))
+                };
+                let tags = data
+                    .roles_of(uid)
+                    .into_iter()
+                    .map(|(_, def)| {
+                        (
+                            def.name.clone(),
+                            theme::hex(&def.color).unwrap_or(theme::MUTED),
+                        )
+                    })
+                    .collect();
+                let texture = data
+                    .avatars
+                    .get(uid)
+                    .and_then(|source| self.images.get(ctx, source));
+                let color = data
+                    .role_color(uid)
+                    .and_then(theme::hex)
+                    .unwrap_or(theme::TEXT);
+                items.push((
+                    Item::Header {
+                        photo: texture,
+                        name: name.clone(),
+                        color,
+                        detail,
+                        tags,
+                    },
+                    None,
+                ));
+                if let Some(live) = live_in.filter(|_| uid != me) {
+                    items.push((Item::Separator, None));
+                    items.push((
+                        Item::Action(Entry::new("Assistir live", Icon::MonitorPlay)),
+                        Some(Action::Watch(live, uid.clone())),
+                    ));
+                }
+                // Só o proprietário mexe em cargos, nível e acesso, e nunca nele mesmo.
+                if data.owner
+                    && uid != me
+                    && data.level_of(uid) != Level::Owner
+                    && data.approved.contains(uid)
+                {
+                    items.push((Item::Separator, None));
+                    items.push((Item::Label("Cargos".into()), None));
+                    let roles = data.ordered_roles();
+                    if roles.is_empty() {
+                        let entry = Entry::new("Nenhum cargo criado", Icon::Tag)
+                            .enabled(false, "Crie em Gerenciar comunidade → Cargos");
+                        items.push((Item::Action(entry), None));
+                    }
+                    for (id, def) in roles {
+                        let on = data
+                            .member_roles
+                            .get(uid)
+                            .is_some_and(|set| set.contains(id));
+                        let entry = Entry::check(def.name.clone(), on)
+                            .dot(theme::hex(&def.color).unwrap_or(theme::MUTED));
+                        let message = if on {
+                            format!("{} removido de {name}", def.name)
+                        } else {
+                            format!("{name} agora é {}", def.name)
+                        };
+                        let op = Op::SetMemberRole {
+                            uid: uid.clone(),
+                            role: id.clone(),
+                            on: !on,
+                            message,
+                        };
+                        items.push((Item::Action(entry), Some(Action::Run(op))));
+                    }
+                    items.push((Item::Separator, None));
+                    items.push((Item::Label("Nível".into()), None));
+                    let level = data.level_of(uid);
+                    for (option, label) in
+                        [(Level::Member, "Membro"), (Level::Admin, "Administrador")]
+                    {
+                        let action = (level != option).then(|| {
+                            Action::Run(Op::SetLevel {
+                                uid: uid.clone(),
+                                level: option,
+                            })
+                        });
+                        items.push((Item::Action(Entry::check(label, level == option)), action));
+                    }
+                    items.push((Item::Separator, None));
+                    let roles = data.member_roles.get(uid).cloned().unwrap_or_default();
+                    let dialog = Dialog::confirm(
+                        "Revogar acesso?",
+                        &format!(
+                            "{name} sai da comunidade imediatamente, perde o nível e os cargos e precisará de uma nova aprovação."
+                        ),
+                        "Revogar",
+                        true,
+                        Then::Run(Op::Revoke {
+                            uid: uid.clone(),
+                            roles,
+                        }),
+                    );
+                    items.push((
+                        Item::Action(Entry::new("Revogar acesso", Icon::UserX).danger()),
+                        Some(Action::Ask(Box::new(dialog))),
+                    ));
+                }
+                // Sessão sem perfil (abandonada): a equipe limpa.
+                if data.level.is_staff()
+                    && profile.is_none()
+                    && uid != me
+                    && let Some(room) = channel
+                {
+                    items.push((Item::Separator, None));
+                    let op = Op::RemoveSession {
+                        room: room.clone(),
+                        uid: uid.clone(),
+                    };
+                    items.push((
+                        Item::Action(Entry::new("Remover sessão", Icon::Trash2).danger()),
+                        Some(Action::Run(op)),
+                    ));
+                }
+            }
+            MenuTarget::Channel(id) => {
+                let name = data
+                    .channels
+                    .get(id)
+                    .map_or(id.as_str(), |channel| channel.name.as_str());
+                items.push((Item::Label(name.to_owned()), None));
+                let tab = |tab| Action::Settings {
+                    category: false,
+                    id: id.clone(),
+                    tab,
+                };
+                items.push((
+                    Item::Action(Entry::new("Editar canal", Icon::Pencil)),
+                    Some(tab(settings::Tab::Overview)),
+                ));
+                items.push((
+                    Item::Action(Entry::new("Permissões", Icon::Shield)),
+                    Some(tab(settings::Tab::Permissions)),
+                ));
+                if !is_system_channel(id) {
+                    items.push((Item::Separator, None));
+                    let dialog = Dialog::confirm(
+                        "Excluir canal?",
+                        &format!("{name} some para todos. Quem estiver nele será desconectado."),
+                        "Excluir",
+                        true,
+                        Then::Run(Op::DeleteChannel { id: id.clone() }),
+                    );
+                    items.push((
+                        Item::Action(Entry::new("Excluir canal", Icon::Trash2).danger()),
+                        Some(Action::Ask(Box::new(dialog))),
+                    ));
+                }
+            }
+            MenuTarget::Category(id) => {
+                let name = data
+                    .categories
+                    .get(id)
+                    .map_or(id.as_str(), |category| category.name.as_str());
+                items.push((Item::Label(name.to_owned()), None));
+                let tab = |tab| Action::Settings {
+                    category: true,
+                    id: id.clone(),
+                    tab,
+                };
+                items.push((
+                    Item::Action(Entry::new("Editar categoria", Icon::Pencil)),
+                    Some(tab(settings::Tab::Overview)),
+                ));
+                items.push((
+                    Item::Action(Entry::new("Criar canal", Icon::Plus)),
+                    Some(Action::CreateChannel(id.clone())),
+                ));
+                items.push((
+                    Item::Action(Entry::new("Permissões", Icon::Shield)),
+                    Some(tab(settings::Tab::Permissions)),
+                ));
+                if id != DEFAULT_CATEGORY {
+                    items.push((Item::Separator, None));
+                    let empty = !data
+                        .channels
+                        .values()
+                        .any(|channel| channel.category_id == *id);
+                    let entry = Entry::new("Excluir categoria", Icon::Trash2)
+                        .danger()
+                        .enabled(empty, "Mova ou exclua os canais antes");
+                    let dialog = Dialog::confirm(
+                        "Excluir categoria?",
+                        name,
+                        "Excluir",
+                        true,
+                        Then::Run(Op::DeleteCategory { id: id.clone() }),
+                    );
+                    items.push((
+                        Item::Action(entry),
+                        empty.then(|| Action::Ask(Box::new(dialog))),
+                    ));
+                }
+            }
+        }
+        items
+    }
+
+    /// Por cima da tela principal: menu, janela do canal, caixa de confirmação, prévia ao lado da
+    /// barra e avisos. Devolve as ações pedidas por eles.
+    fn overlays(&mut self, ctx: &egui::Context) -> Vec<Action> {
+        let mut actions = Vec::new();
+        self.images.update(ctx);
+        let Some(data) = self
+            .account
+            .as_ref()
+            .and_then(|account| account.community.as_ref())
+            .map(Community::snapshot)
+        else {
+            return actions;
+        };
+        if let Some((target, mut place)) = self.menu.take() {
+            let items = self.menu_items(ctx, &data, &target);
+            let (list, commands): (Vec<Item>, Vec<Option<Action>>) = items.into_iter().unzip();
+            let shown = menu::show(ctx, "pessoa", &mut place, &list);
+            let mut commands = commands;
+            if let Some(action) = shown
+                .clicked
+                .and_then(|index| commands.get_mut(index).and_then(Option::take))
+            {
+                actions.push(action);
+            }
+            if !shown.close {
+                self.menu = Some((target, place));
+            }
+        }
+        if let Some(window) = self.settings.as_mut() {
+            match window.show(ctx, &data, &mut self.images) {
+                Some(settings::Event::Close) => self.settings = None,
+                Some(settings::Event::AskClose) if self.dialog.is_none() => {
+                    self.dialog = Some(Dialog::confirm(
+                        "Descartar alterações?",
+                        "Você tem alterações que não foram salvas.",
+                        "Descartar",
+                        true,
+                        Then::DiscardSettings,
+                    ));
+                }
+                Some(settings::Event::Save(op)) => actions.push(Action::Run(op)),
+                Some(settings::Event::AskDelete) if self.dialog.is_none() => {
+                    let what = if window.category {
+                        "Excluir categoria?"
+                    } else {
+                        "Excluir canal?"
+                    };
+                    let message = if window.category {
+                        window.title().to_owned()
+                    } else {
+                        format!(
+                            "{} some para todos. Quem estiver nele será desconectado.",
+                            window.title()
+                        )
+                    };
+                    self.dialog = Some(Dialog::confirm(
+                        what,
+                        &message,
+                        "Excluir",
+                        true,
+                        Then::Run(window.delete_op()),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(dialog) = self.dialog.as_mut()
+            && let Some(outcome) = dialog.show(ctx)
+        {
+            self.dialog = None;
+            match outcome {
+                Some((Then::Run(op), _)) => actions.push(Action::Run(op)),
+                Some((Then::CreateChannel(category), name)) => {
+                    actions.push(Action::Run(Op::CreateChannel { name, category }))
+                }
+                Some((Then::CreateCategory, name)) => {
+                    actions.push(Action::Run(Op::CreateCategory { name }))
+                }
+                Some((Then::DiscardSettings, _)) => self.settings = None,
+                None => {}
+            }
+        }
+        self.peek(ctx, &data);
+        if let Some(key) = self.toasts.draw(ctx) {
+            actions.push(Action::OpenLive(key));
+        }
+        // Esc sai da tela cheia (as janelas por cima consomem o Esc antes).
+        if self.fullscreen.is_some()
+            && self.menu.is_none()
+            && self.dialog.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            let key = self.fullscreen.clone().unwrap_or_default();
+            actions.push(Action::Fullscreen(key));
+        }
+        actions
+    }
+
+    /// Prévia ao lado da barra, com o mouse parado em quem está ao vivo. A foto é lida do banco só
+    /// nessa hora (e guardada por 20 s).
+    fn peek(&mut self, ctx: &egui::Context, data: &Snapshot) {
+        let Some((hover, since)) = self.hover.clone() else {
+            return;
+        };
+        if since.elapsed() < PEEK_AFTER {
+            ctx.request_repaint_after(PEEK_AFTER);
+            return;
+        }
+        let key = (hover.channel.clone(), hover.uid.clone());
+        let fresh = self
+            .peeks
+            .get(&key)
+            .is_some_and(|(at, _)| at.elapsed() < PEEK_FRESH);
+        if !fresh
+            && !self.peeking.contains(&key)
+            && let Some(account) = &self.account
+        {
+            self.peeking.insert(key.clone());
+            let (db, tx, repaint) = (account.db.clone(), self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let previews = room::load_previews(&db, &key.0, &key.1);
+                let _ = tx.send(Msg::Peek(key.0, key.1, previews));
+                repaint.request_repaint();
+            });
+        }
+        let Some((_, previews)) = self.peeks.get(&(hover.channel.clone(), hover.uid.clone()))
+        else {
+            return;
+        };
+        let textures: Vec<TextureHandle> = ["screen", "camera"]
+            .iter()
+            .filter_map(|kind| previews.get(*kind))
+            .cloned()
+            .collect::<Vec<_>>()
+            .iter()
+            .filter_map(|source| self.images.get(ctx, source))
+            .collect();
+        if textures.is_empty() {
+            return;
+        }
+        let _ = data;
+        let screen = ctx.content_rect();
+        let height = textures.len() as f32 * (260.0 * 9.0 / 16.0 + 6.0) + 26.0;
+        let top = (hover.anchor.top() - 8.0)
+            .min(screen.bottom() - height - 8.0)
+            .max(8.0);
+        egui::Area::new(egui::Id::unique("previa-da-barra"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos2(hover.anchor.right() + 10.0, top))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::SURFACE_2)
+                    .stroke((1.0, theme::BORDER))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::same(8))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 16],
+                        blur: 40,
+                        spread: 0,
+                        color: Color32::from_black_alpha(115),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_width(260.0);
+                        for texture in &textures {
+                            let [width, height] = texture.size().map(|side| side.max(1) as f32);
+                            let (rect, _) = ui.allocate_exact_size(
+                                vec2(260.0, 260.0 * height / width),
+                                Sense::hover(),
+                            );
+                            crate::widgets::cover(ui.painter(), rect, 6.0, texture);
+                            ui.add_space(6.0);
+                        }
+                        let text = format!("{} · clique para assistir", hover.name);
+                        let galley = theme::line(
+                            ui.painter(),
+                            &text,
+                            theme::regular(12.0),
+                            theme::MUTED,
+                            260.0,
+                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(vec2(260.0, galley.size().y), Sense::hover());
+                        ui.painter().galley(rect.min, galley, theme::MUTED);
+                    });
+            });
+    }
+
+    /// `--open-*`: abre as telas novas sem clicar, para as fotos de teste.
+    fn open_for_test(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if self.opened_for_test {
+            return;
+        }
+        let Some(account) = &self.account else { return };
+        let Some(data) = account
+            .community
+            .as_ref()
+            .map(Community::snapshot)
+            .filter(|data| data.loaded)
+        else {
+            return;
+        };
+        // Espera o canal (quando foi pedido) e os perfis das pessoas.
+        if self.args.join.is_some() && account.room.is_none() {
+            return;
+        }
+        if self.started.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.opened_for_test = true;
+        if let Some(tab) = self.args.open_admin.clone() {
+            actions.push(Action::OpenAdmin);
+            self.act(ctx, std::mem::take(actions));
+            if let Some(admin) = self.admin.as_mut() {
+                admin.tab = match tab.as_str() {
+                    "membros" => AdminTab::Members,
+                    "cargos" => AdminTab::Roles,
+                    "canais" => AdminTab::Channels,
+                    _ => AdminTab::Requests,
+                };
+                if let Some(name) = &self.args.open_role
+                    && let Some((id, _)) = data.role_defs.iter().find(|(_, def)| def.name == *name)
+                {
+                    admin.select_role(id);
+                    admin.set_role_tab(self.args.role_tab.as_deref().unwrap_or("exibicao"));
+                }
+            }
+        }
+        if let Some(spec) = self.args.open_settings.clone() {
+            let mut parts = spec.split(':');
+            let (kind, id, tab) = (
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+                parts.next().unwrap_or(""),
+            );
+            let tab = if tab == "permissoes" {
+                settings::Tab::Permissions
+            } else {
+                settings::Tab::Overview
+            };
+            // O nome também vale no lugar do id.
+            let id = if kind == "categoria" {
+                data.categories
+                    .iter()
+                    .find(|(key, c)| *key == id || c.name == id)
+                    .map(|(key, _)| key.clone())
+            } else {
+                data.channels
+                    .iter()
+                    .find(|(key, c)| *key == id || c.name == id)
+                    .map(|(key, _)| key.clone())
+            };
+            if let Some(id) = id {
+                actions.push(Action::Settings {
+                    category: kind == "categoria",
+                    id,
+                    tab,
+                });
+            }
+        }
+        // "sem-perfil" escolhe uma sessão abandonada (alguém no canal sem perfil).
+        let menu_for = self.args.open_menu.clone().and_then(|name| {
+            if name == "sem-perfil" {
+                data.presence
+                    .values()
+                    .flat_map(|room| room.members.iter())
+                    .find(|uid| !data.profiles.contains_key(*uid))
+                    .cloned()
+            } else {
+                data.profiles
+                    .iter()
+                    .find(|(_, shown)| **shown == name)
+                    .map(|(uid, _)| uid.clone())
+            }
+        });
+        if let Some(uid) = &menu_for {
+            let channel = data
+                .presence
+                .iter()
+                .find(|(_, room)| room.members.contains(uid))
+                .map(|(id, _)| id.clone());
+            actions.push(Action::PersonMenu {
+                channel,
+                uid: uid.clone(),
+                at: pos2(170.0, 180.0),
+            });
+        }
     }
 
     /// `--screenshot`: com a tela carregada e parada, salva a foto e fecha.
@@ -906,6 +1728,16 @@ impl Nimbo {
 }
 
 impl eframe::App for Nimbo {
+    /// `--clicks`: o roteiro de teste entra aqui, como se viesse do mouse e do teclado.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Some(script) = self.script.as_mut() {
+            script.feed(raw_input);
+            if !script.done() {
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
@@ -1030,6 +1862,9 @@ impl eframe::App for Nimbo {
             Some(_) => ready = self.main_screen(ui, &mut actions),
         }
         self.act(&ctx, actions);
+        let mut actions = self.overlays(&ctx);
+        self.open_for_test(&ctx, &mut actions);
+        self.act(&ctx, actions);
         if let Some(choice) = self.picker.as_mut().and_then(|picker| picker.show(&ctx)) {
             self.picker = None;
             if let Choice::Start(capture) = choice
@@ -1039,6 +1874,8 @@ impl eframe::App for Nimbo {
                 Self::start_broadcast(lives, room, &account.session.uid, capture, &ctx);
             }
         }
+        // Com roteiro de cliques, a foto espera o roteiro acabar.
+        let ready = ready && self.script.as_ref().is_none_or(Script::done);
         self.screenshot(ui, ready);
         if self
             .args
@@ -1116,7 +1953,11 @@ fn report(meter: &mut Meter, lives: &Lives, videos: &Videos, drawn: &HashMap<Str
     let broadcast = lives.broadcasting.as_ref().map(|live| {
         let stats = live.stats();
         let encoded = stats.frames_encoded;
+        let preview = live.preview_cost();
         let line = json!({
+            "previa_ms": (preview.millis * 100.0).round() / 100.0,
+            "previa_caracteres": preview.chars,
+            "previas_gravadas": preview.sent,
             "estado": format!("{:?}", live.state()),
             "espectadores": stats.viewers,
             "codificador": stats.encoder,
@@ -1136,6 +1977,7 @@ fn report(meter: &mut Meter, lives: &Lives, videos: &Videos, drawn: &HashMap<Str
             "desenho": videos.path(),
             "lives_no_ar": lives.active.len(),
             "ladrilhos_no_palco": lives.shown.len(),
+            "qualidade": lives.quality,
             "assistindo": watching,
             "transmitindo": broadcast,
         })
