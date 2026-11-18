@@ -20,10 +20,11 @@ use crate::sidebar::Action;
 use crate::theme;
 use crate::widgets::{Kind, button, button_at, check_box, icon, photo, role_dot, text_field};
 
-/// Cores sugeridas para cargos: as 8 do site e mais 2. A cor livre (`#rrggbb`) aceita qualquer outra.
+/// Cores sugeridas para cargos: as mesmas 10 do site (`PALETTE` em `src/components/RoleEditor.tsx`). A cor
+/// livre (`#rrggbb`) aceita qualquer outra.
 pub const ROLE_COLORS: [&str; 10] = [
     "#7c6cff", "#3ecf8e", "#f0475a", "#f5b14c", "#4cc3f5", "#ff7ac6", "#a3e635", "#94a3b8",
-    "#fb923c", "#2dd4bf",
+    "#e879f9", "#fb923c",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
