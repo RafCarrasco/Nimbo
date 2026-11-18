@@ -1,5 +1,6 @@
 //! Attributed picker lifecycle. Portable host core, not a WebView controller or capture grant.
 use crate::policy::{Config, NativeRequest};
+use std::collections::HashMap;
 mod protocol;
 #[cfg(windows)]
 pub mod windows;
@@ -55,7 +56,13 @@ pub struct RefreshTicket {
     generation: u64,
     sequence: u64,
 }
+struct PresentedSource {
+    wire_id: String,
+    candidate: crate::sources::Candidate,
+}
 pub struct PickerSession {
+    next_item: u64,
+    presented: HashMap<String, PresentedSource>,
     wire_ready: bool,
     last_wire_id: u32,
     closed: bool,
@@ -70,10 +77,16 @@ pub struct PickerSession {
     pending: Option<RefreshTicket>,
 }
 pub struct Choice {
+    owner_frame: Option<u32>,
+    owner_generation: u64,
     candidate: crate::sources::Candidate,
     audio: bool,
 }
 impl Choice {
+    /// Native owner liveness only; this is not OS source identity validation or a WGC grant.
+    pub fn authorized(&self, config: &Config, main: &NativeRequest<'_>) -> bool {
+        config.authorize(main, self.owner_generation) && main.frame_id == self.owner_frame
+    }
     pub fn candidate(&self) -> &crate::sources::Candidate {
         &self.candidate
     }
@@ -93,6 +106,7 @@ impl PickerSession {
         }
         self.closed = true;
         self.catalog = None;
+        self.presented.clear();
         self.pending = None;
         self.frame = None;
         Ok(())
@@ -110,19 +124,28 @@ impl PickerSession {
             return Err("picker-unauthorized");
         }
         let presented = self
-            .catalog
-            .as_ref()
-            .and_then(|c| c.resolve(id))
+            .presented
+            .values()
+            .find(|p| p.wire_id == id)
+            .map(|p| &p.candidate)
             .ok_or("picker-source-not-found")?;
-        let candidate = fresh.resolve(id).ok_or("picker-source-not-found")?;
+        let candidate = fresh
+            .resolve(presented.id())
+            .ok_or("picker-source-not-found")?;
         if !presented.same_source(&candidate) {
             return Err("picker-source-changed");
         }
         self.closed = true;
         self.catalog = None;
+        self.presented.clear();
         self.pending = None;
         self.frame = None;
-        Ok(Choice { candidate, audio })
+        Ok(Choice {
+            candidate,
+            audio,
+            owner_frame: self.owner_frame,
+            owner_generation: self.owner_generation,
+        })
     }
     pub fn new(
         config: &Config,
@@ -134,6 +157,8 @@ impl PickerSession {
             return Err("picker-unauthorized");
         }
         Ok(Self {
+            next_item: 0,
+            presented: HashMap::new(),
             wire_ready: false,
             last_wire_id: 0,
             closed: false,
@@ -183,11 +208,37 @@ impl PickerSession {
         self.pending = None;
         match result {
             Ok(c) => {
+                self.catalog = None;
+                let previous = std::mem::take(&mut self.presented);
+                let mut presented = HashMap::new();
+                let rows = c.list();
+                for row in rows.as_array().ok_or("picker-invalid-catalog")? {
+                    let native_id = row["id"].as_str().ok_or("picker-invalid-catalog")?;
+                    let candidate = c.resolve(native_id).ok_or("picker-invalid-catalog")?;
+                    let wire_id = if let Some(old) = previous
+                        .get(native_id)
+                        .filter(|p| p.candidate.same_source(&candidate))
+                    {
+                        old.wire_id.clone()
+                    } else {
+                        self.next_item = self
+                            .next_item
+                            .checked_add(1)
+                            .ok_or("picker-item-exhausted")?;
+                        format!(
+                            "source:{}:{}:{}",
+                            self.window, self.generation, self.next_item
+                        )
+                    };
+                    presented.insert(native_id.to_owned(), PresentedSource { wire_id, candidate });
+                }
+                self.presented = presented;
                 self.catalog = Some(c);
                 Ok(true)
             }
             Err(e) => {
                 self.catalog = None;
+                self.presented.clear();
                 Err(e)
             }
         }
@@ -201,9 +252,21 @@ impl PickerSession {
         if !self.authorized(config, main, request) {
             return Err("picker-unauthorized");
         }
-        Ok(
-            serde_json::json!({"sources":self.catalog.as_ref().ok_or("picker-catalog-unavailable")?.list(),"audio":self.audio}),
-        )
+        let mut sources = self
+            .catalog
+            .as_ref()
+            .ok_or("picker-catalog-unavailable")?
+            .list();
+        for row in sources.as_array_mut().ok_or("picker-invalid-catalog")? {
+            let native_id = row["id"].as_str().ok_or("picker-invalid-catalog")?;
+            let token = &self
+                .presented
+                .get(native_id)
+                .ok_or("picker-invalid-catalog")?
+                .wire_id;
+            row["id"] = serde_json::Value::String(token.clone());
+        }
+        Ok(serde_json::json!({"sources":sources,"audio":self.audio}))
     }
     pub fn bind_document(&mut self, frame: u32) -> Result<u64, &'static str> {
         if self.closed {
@@ -212,6 +275,7 @@ impl PickerSession {
         self.wire_ready = false;
         self.last_wire_id = 0;
         self.catalog = None;
+        self.presented.clear();
         self.pending = None;
         self.frame = None;
         if frame == 0 {

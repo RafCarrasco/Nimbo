@@ -88,6 +88,7 @@ impl State {
         if let Ok(mut s) = self.model.try_borrow_mut() {
             s.closed = true;
             s.catalog = None;
+            s.presented.clear();
             s.pending = None;
             s.frame = None;
         }

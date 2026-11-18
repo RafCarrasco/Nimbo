@@ -338,6 +338,16 @@ impl State {
                 let _ = DestroyWindow(self.hwnd);
             }
         }
+        // Closing the controller/window can reenter the owner's native event loop.
+        // Never deliver a selection to a different main document after modal teardown.
+        if choice.as_ref().is_some_and(|c| {
+            !(self.owner)()
+                .as_ref()
+                .is_some_and(|o| c.authorized(&self.config, &o.request()))
+        }) {
+            choice = None;
+            self.end.set(Some(DialogEnd::Failed));
+        }
         let done = self.done.borrow_mut().take();
         if let Some(done) = done {
             done(choice);
