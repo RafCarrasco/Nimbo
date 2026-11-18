@@ -48,19 +48,31 @@ pub fn install(ctx: &egui::Context) {
     let mut load = |name: &str, file: &str| -> bool {
         match std::fs::read(format!("{windows}\\Fonts\\{file}")) {
             Ok(bytes) => {
-                fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
+                fonts
+                    .font_data
+                    .insert(name.to_owned(), Arc::new(FontData::from_owned(bytes)));
                 true
             }
             Err(_) => false,
         }
     };
-    let (has_regular, has_semibold, has_bold) =
-        (load("segoe", "segoeui.ttf"), load("segoe-semibold", "seguisb.ttf"), load("segoe-bold", "segoeuib.ttf"));
+    let (has_regular, has_semibold, has_bold) = (
+        load("segoe", "segoeui.ttf"),
+        load("segoe-semibold", "seguisb.ttf"),
+        load("segoe-bold", "segoeuib.ttf"),
+    );
     // Emoji e símbolos que a Segoe UI não tem.
     let has_emoji = load("segoe-emoji", "seguiemj.ttf");
-    fonts.font_data.insert(ICONS.to_owned(), Arc::new(FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES)));
+    fonts.font_data.insert(
+        ICONS.to_owned(),
+        Arc::new(FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES)),
+    );
 
-    let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let fallback = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
     let family = |first: Option<&str>| -> Vec<String> {
         first
             .map(str::to_owned)
@@ -70,10 +82,20 @@ pub fn install(ctx: &egui::Context) {
             .chain(fallback.iter().cloned())
             .collect()
     };
-    fonts.families.insert(FontFamily::Proportional, family(None));
-    fonts.families.insert(FontFamily::Name(SEMIBOLD.into()), family(has_semibold.then_some("segoe-semibold")));
-    fonts.families.insert(FontFamily::Name(BOLD.into()), family(has_bold.then_some("segoe-bold")));
-    fonts.families.insert(FontFamily::Name(ICONS.into()), vec![ICONS.to_owned()]);
+    fonts
+        .families
+        .insert(FontFamily::Proportional, family(None));
+    fonts.families.insert(
+        FontFamily::Name(SEMIBOLD.into()),
+        family(has_semibold.then_some("segoe-semibold")),
+    );
+    fonts.families.insert(
+        FontFamily::Name(BOLD.into()),
+        family(has_bold.then_some("segoe-bold")),
+    );
+    fonts
+        .families
+        .insert(FontFamily::Name(ICONS.into()), vec![ICONS.to_owned()]);
     ctx.set_fonts(fonts);
 
     ctx.global_style_mut(|style| {
@@ -91,7 +113,13 @@ pub fn install(ctx: &egui::Context) {
 }
 
 /// Uma linha de texto que termina em "…" quando não cabe na largura.
-pub fn line(painter: &Painter, text: &str, font: FontId, color: Color32, max_width: f32) -> Arc<Galley> {
+pub fn line(
+    painter: &Painter,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> Arc<Galley> {
     spaced(painter, text, font, color, max_width, 0.0)
 }
 
@@ -106,16 +134,42 @@ pub fn spaced(
 ) -> Arc<Galley> {
     let mut job = LayoutJob::single_section(
         text.to_owned(),
-        TextFormat { font_id: font, color, extra_letter_spacing: letter_spacing, ..TextFormat::default() },
+        TextFormat {
+            font_id: font,
+            color,
+            extra_letter_spacing: letter_spacing,
+            ..TextFormat::default()
+        },
     );
-    job.wrap = TextWrapping { max_width, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    job.wrap = TextWrapping {
+        max_width,
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
     painter.layout_job(job)
 }
 
 /// Parágrafo com quebra de linha e cada linha centralizada. Desenhe com o x no meio da área.
-pub fn centered(painter: &Painter, text: &str, font: FontId, color: Color32, max_width: f32) -> Arc<Galley> {
-    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat { font_id: font, color, ..TextFormat::default() });
-    job.wrap = TextWrapping { max_width, ..TextWrapping::default() };
+pub fn centered(
+    painter: &Painter,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> Arc<Galley> {
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat {
+            font_id: font,
+            color,
+            ..TextFormat::default()
+        },
+    );
+    job.wrap = TextWrapping {
+        max_width,
+        ..TextWrapping::default()
+    };
     job.halign = egui::Align::Center;
     painter.layout_job(job)
 }

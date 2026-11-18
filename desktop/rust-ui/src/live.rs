@@ -68,8 +68,16 @@ struct Incoming {
 }
 
 enum Report {
-    Opened { key: String, attempt: u64, viewer: Arc<Viewer> },
-    Failed { key: String, attempt: u64, why: String },
+    Opened {
+        key: String,
+        attempt: u64,
+        viewer: Arc<Viewer>,
+    },
+    Failed {
+        key: String,
+        attempt: u64,
+        why: String,
+    },
 }
 
 /// Lado de quem assiste: uma conexão só de recepção para cada live nativa que está no palco.
@@ -104,14 +112,24 @@ impl Watching {
     }
 
     /// Abre conexão para as lives nativas que estão no palco e fecha as que acabaram ou saíram dele.
-    pub fn sync(&mut self, broadcasts: &Broadcasts, members: &[String], on_stage: &BTreeSet<String>) {
+    pub fn sync(
+        &mut self,
+        broadcasts: &Broadcasts,
+        members: &[String],
+        on_stage: &BTreeSet<String>,
+    ) {
         let mut native: HashMap<String, Wanted> = HashMap::new();
         for (uid, kinds) in broadcasts {
             if *uid == self.uid || !members.contains(uid) {
                 continue;
             }
             for (kind, live) in kinds.iter().filter(|(_, live)| live.native) {
-                let wanted = Wanted { uid: uid.clone(), kind: kind.clone(), stream_id: live.stream_id.clone(), sound: live.sound };
+                let wanted = Wanted {
+                    uid: uid.clone(),
+                    kind: kind.clone(),
+                    stream_id: live.stream_id.clone(),
+                    sound: live.sound,
+                };
                 native.insert(live_key(uid, kind), wanted);
             }
         }
@@ -126,10 +144,17 @@ impl Watching {
             self.close(&key);
         }
         self.gave_up.retain(|entry| {
-            entry.split_once('|').is_some_and(|(key, stream_id)| native.get(key).is_some_and(|live| live.stream_id == stream_id))
+            entry.split_once('|').is_some_and(|(key, stream_id)| {
+                native
+                    .get(key)
+                    .is_some_and(|live| live.stream_id == stream_id)
+            })
         });
         for (key, live) in native {
-            if on_stage.contains(&key) && !self.conns.contains_key(&key) && !self.gave_up.contains(&format!("{key}|{}", live.stream_id)) {
+            if on_stage.contains(&key)
+                && !self.conns.contains_key(&key)
+                && !self.gave_up.contains(&format!("{key}|{}", live.stream_id))
+            {
                 self.open(key, live, 0);
             }
         }
@@ -155,15 +180,29 @@ impl Watching {
                 stop: stop.clone(),
             },
         );
-        let (room, reports, repaint, volume) = (self.room.clone(), self.reports.0.clone(), self.repaint.clone(), self.volume);
+        let (room, reports, repaint, volume) = (
+            self.room.clone(),
+            self.reports.0.clone(),
+            self.repaint.clone(),
+            self.volume,
+        );
         // Abrir o player leva até ~1 s (ele descobre o endereço público): fora da thread que desenha.
         // A mesma thread depois acorda a tela a cada quadro novo.
         std::thread::spawn(move || {
             let failed = |why: String| {
-                let _ = reports.send(Report::Failed { key: key.clone(), attempt, why });
+                let _ = reports.send(Report::Failed {
+                    key: key.clone(),
+                    attempt,
+                    why,
+                });
                 repaint.request_repaint();
             };
-            let options = viewer::Options { audio: live.sound, volume, software: false, memory: true };
+            let options = viewer::Options {
+                audio: live.sound,
+                volume,
+                software: false,
+                memory: true,
+            };
             let viewer = match Viewer::new(options) {
                 Ok(viewer) => Arc::new(viewer),
                 Err(e) => return failed(format!("o player não abriu: {e}")),
@@ -175,12 +214,20 @@ impl Watching {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            let _ = reports.send(Report::Opened { key: key.clone(), attempt, viewer: viewer.clone() });
+            let _ = reports.send(Report::Opened {
+                key: key.clone(),
+                attempt,
+                viewer: viewer.clone(),
+            });
             let (on_error, wake) = (reports.clone(), repaint.clone());
             let error_key = key.clone();
             room.send_native_offer(&live.uid, &live.kind, sdp, &nonce, move |result| {
                 if let Err(e) = result {
-                    let _ = on_error.send(Report::Failed { key: error_key, attempt, why: format!("oferta não enviada: {e}") });
+                    let _ = on_error.send(Report::Failed {
+                        key: error_key,
+                        attempt,
+                        why: format!("oferta não enviada: {e}"),
+                    });
                     wake.request_repaint();
                 }
             });
@@ -199,15 +246,28 @@ impl Watching {
     /// Resposta do motor de quem transmite à nossa oferta.
     pub fn on_answer(&mut self, from: &str, kind: &str, sdp: &str, nonce: &str) {
         let key = live_key(from, kind);
-        let Some(conn) = self.conns.get_mut(&key) else { return };
+        let Some(conn) = self.conns.get_mut(&key) else {
+            return;
+        };
         // Só vale a resposta à oferta desta conexão.
-        let Some(viewer) = conn.viewer.clone().filter(|_| conn.nonce == nonce && !conn.answered) else { return };
+        let Some(viewer) = conn
+            .viewer
+            .clone()
+            .filter(|_| conn.nonce == nonce && !conn.answered)
+        else {
+            return;
+        };
         conn.answered = true;
-        let (reports, repaint, attempt) = (self.reports.0.clone(), self.repaint.clone(), conn.attempt);
+        let (reports, repaint, attempt) =
+            (self.reports.0.clone(), self.repaint.clone(), conn.attempt);
         let answer = json!({ "type": "answer", "sdp": sdp }).to_string();
         std::thread::spawn(move || {
             if let Err(e) = viewer.answer(answer.as_bytes()) {
-                let _ = reports.send(Report::Failed { key, attempt, why: format!("resposta recusada: {e}") });
+                let _ = reports.send(Report::Failed {
+                    key,
+                    attempt,
+                    why: format!("resposta recusada: {e}"),
+                });
                 repaint.request_repaint();
             }
         });
@@ -217,12 +277,24 @@ impl Watching {
     pub fn tick(&mut self) {
         while let Ok(report) = self.reports.1.try_recv() {
             match report {
-                Report::Opened { key, attempt, viewer } => match self.conns.get_mut(&key).filter(|conn| conn.attempt == attempt) {
+                Report::Opened {
+                    key,
+                    attempt,
+                    viewer,
+                } => match self
+                    .conns
+                    .get_mut(&key)
+                    .filter(|conn| conn.attempt == attempt)
+                {
                     Some(conn) => conn.viewer = Some(viewer),
                     None => viewer.close(),
                 },
                 Report::Failed { key, attempt, why } => {
-                    if self.conns.get(&key).is_some_and(|conn| conn.attempt == attempt) {
+                    if self
+                        .conns
+                        .get(&key)
+                        .is_some_and(|conn| conn.attempt == attempt)
+                    {
                         self.retry_later(&key, why);
                     }
                 }
@@ -259,7 +331,9 @@ impl Watching {
 
     /// Uma tentativa acabou mal: abre outra, até o limite; depois disso a live fica como "não conectou".
     fn retry_later(&mut self, key: &str, why: String) {
-        let Some(conn) = self.conns.get(key) else { return };
+        let Some(conn) = self.conns.get(key) else {
+            return;
+        };
         let (failures, live) = (conn.tries + 1, conn.live.clone());
         self.last_error.insert(key.to_owned(), why);
         self.close(key);
@@ -273,20 +347,37 @@ impl Watching {
     /// "Tentar de novo" (de uma pessoa) ou volta da rede (de todos): esquece as desistências e fecha
     /// as conexões; o próximo `sync` abre de novo.
     pub fn reset(&mut self, uid: Option<&str>) {
-        let keys: Vec<String> = self.conns.keys().filter(|key| uid.is_none_or(|uid| parse_key(key).0 == uid)).cloned().collect();
+        let keys: Vec<String> = self
+            .conns
+            .keys()
+            .filter(|key| uid.is_none_or(|uid| parse_key(key).0 == uid))
+            .cloned()
+            .collect();
         for key in keys {
             self.close(&key);
         }
-        self.gave_up.retain(|entry| uid.is_some_and(|uid| !entry.starts_with(&format!("{uid}:"))));
+        self.gave_up
+            .retain(|entry| uid.is_some_and(|uid| !entry.starts_with(&format!("{uid}:"))));
     }
 
     pub fn state(&self, key: &str) -> LiveState {
         let Some(conn) = self.conns.get(key) else {
-            let gave_up = self.gave_up.iter().any(|entry| entry.split_once('|').is_some_and(|(base, _)| base == key));
-            return if gave_up { LiveState::Failed } else { LiveState::Connecting };
+            let gave_up = self
+                .gave_up
+                .iter()
+                .any(|entry| entry.split_once('|').is_some_and(|(base, _)| base == key));
+            return if gave_up {
+                LiveState::Failed
+            } else {
+                LiveState::Connecting
+            };
         };
         match &conn.viewer {
-            Some(viewer) if viewer.state() == viewer::State::Connected && viewer.latest().is_some() => LiveState::Playing,
+            Some(viewer)
+                if viewer.state() == viewer::State::Connected && viewer.latest().is_some() =>
+            {
+                LiveState::Playing
+            }
             _ => LiveState::Connecting,
         }
     }
@@ -303,7 +394,10 @@ impl Watching {
 
     /// Números de cada conexão aberta, para o relatório de medidas.
     pub fn stats(&self) -> Vec<(String, viewer::Stats)> {
-        self.conns.iter().filter_map(|(key, conn)| Some((key.clone(), conn.viewer.as_ref()?.stats()))).collect()
+        self.conns
+            .iter()
+            .filter_map(|(key, conn)| Some((key.clone(), conn.viewer.as_ref()?.stats())))
+            .collect()
     }
 
     fn close(&mut self, key: &str) {
@@ -347,7 +441,11 @@ pub enum BroadcastState {
 
 enum Order {
     /// Oferta de alguém que quer assistir.
-    Offer { from: String, sdp: String, nonce: String },
+    Offer {
+        from: String,
+        sdp: String,
+        nonce: String,
+    },
     Stop,
 }
 
@@ -368,10 +466,24 @@ impl Broadcasting {
     /// Começa a captura e anuncia a live. Tudo acontece numa thread própria: o resultado aparece em
     /// `state()`.
     pub fn start(room: Arc<Room>, capture: Capture, repaint: &egui::Context) -> Self {
-        let (engine, state, error) = (Arc::new(Engine::new()), Arc::new(AtomicU8::new(0)), Arc::new(Mutex::new(String::new())));
-        let (out, members) = (Arc::new(Mutex::new(BTreeMap::new())), Arc::new(Mutex::new(Vec::new())));
+        let (engine, state, error) = (
+            Arc::new(Engine::new()),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(Mutex::new(String::new())),
+        );
+        let (out, members) = (
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
         let (orders, inbox) = channel();
-        let this = Self { engine: engine.clone(), orders, state: state.clone(), error: error.clone(), out: out.clone(), members: members.clone() };
+        let this = Self {
+            engine: engine.clone(),
+            orders,
+            state: state.clone(),
+            error: error.clone(),
+            out: out.clone(),
+            members: members.clone(),
+        };
         let repaint = repaint.clone();
         std::thread::spawn(move || {
             let set = |value: BroadcastState| {
@@ -383,7 +495,10 @@ impl Broadcasting {
                 .set_audio(capture.audio)
                 .and_then(|()| engine.start(capture.source, Quality::default()))
                 .map_err(|e| e.to_string())
-                .and_then(|()| room.publish_stream("screen", &stream_id, capture.audio.is_some()).map_err(|e| e.to_string()));
+                .and_then(|()| {
+                    room.publish_stream("screen", &stream_id, capture.audio.is_some())
+                        .map_err(|e| e.to_string())
+                });
             if let Err(e) = started {
                 *error.lock().expect("erro da transmissão") = e;
                 engine.stop();
@@ -393,7 +508,13 @@ impl Broadcasting {
             // Uma oferta por vez, na ordem em que chegaram: duas ofertas da mesma pessoa (nova
             // tentativa) não podem deixar duas conexões abertas no motor.
             while let Ok(Order::Offer { from, sdp, nonce }) = inbox.recv() {
-                let present = |who: &str| members.lock().expect("membros").iter().any(|member| member == who);
+                let present = |who: &str| {
+                    members
+                        .lock()
+                        .expect("membros")
+                        .iter()
+                        .any(|member| member == who)
+                };
                 if !present(&from) {
                     continue;
                 }
@@ -402,7 +523,9 @@ impl Broadcasting {
                     engine.close(previous);
                 }
                 let offer = json!({ "type": "offer", "sdp": sdp }).to_string();
-                let Ok((id, answer)) = engine.accept(offer.as_bytes()) else { continue };
+                let Ok((id, answer)) = engine.accept(offer.as_bytes()) else {
+                    continue;
+                };
                 let answer = serde_json::from_slice::<serde_json::Value>(&answer).ok();
                 let answer = answer.as_ref().and_then(|answer| answer["sdp"].as_str());
                 // A pessoa pode ter saído enquanto o motor respondia.
@@ -439,14 +562,22 @@ impl Broadcasting {
 
     /// Oferta de alguém que quer assistir à live.
     pub fn offer(&self, from: &str, sdp: &str, nonce: &str) {
-        let _ = self.orders.send(Order::Offer { from: from.to_owned(), sdp: sdp.to_owned(), nonce: nonce.to_owned() });
+        let _ = self.orders.send(Order::Offer {
+            from: from.to_owned(),
+            sdp: sdp.to_owned(),
+            nonce: nonce.to_owned(),
+        });
     }
 
     /// Quem está no canal agora: fecha no motor a conexão de quem saiu.
     pub fn set_members(&self, members: &[String]) {
         *self.members.lock().expect("membros") = members.to_vec();
         let mut out = self.out.lock().expect("espectadores");
-        let gone: Vec<String> = out.keys().filter(|key| !members.iter().any(|member| member == parse_key(key).0)).cloned().collect();
+        let gone: Vec<String> = out
+            .keys()
+            .filter(|key| !members.iter().any(|member| member == parse_key(key).0))
+            .cloned()
+            .collect();
         for key in gone {
             if let Some(id) = out.remove(&key) {
                 self.engine.close(id);
@@ -474,7 +605,9 @@ impl Drop for Broadcasting {
 fn random_id() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         bytes.copy_from_slice(&nanos.to_le_bytes());
     }
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()

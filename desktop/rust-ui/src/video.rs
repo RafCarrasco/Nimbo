@@ -87,8 +87,12 @@ impl CallbackTrait for Draw {
         pass: &mut wgpu::RenderPass<'static>,
         resources: &CallbackResources,
     ) {
-        let Some(gpu) = resources.get::<Gpu>() else { return };
-        let Some(planes) = gpu.videos.get(&self.key) else { return };
+        let Some(gpu) = resources.get::<Gpu>() else {
+            return;
+        };
+        let Some(planes) = gpu.videos.get(&self.key) else {
+            return;
+        };
         pass.set_pipeline(&gpu.pipeline);
         pass.set_bind_group(0, &planes.bind, &[]);
         pass.draw(0..4, 0..1);
@@ -160,7 +164,11 @@ impl Videos {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
-                    entry_point: Some(if state.target_format.is_srgb() { "fs_linear" } else { "fs_gamma" }),
+                    entry_point: Some(if state.target_format.is_srgb() {
+                        "fs_linear"
+                    } else {
+                        "fs_gamma"
+                    }),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: state.target_format,
                         blend: None,
@@ -177,7 +185,12 @@ impl Videos {
                 min_filter: wgpu::FilterMode::Linear,
                 ..wgpu::SamplerDescriptor::default()
             });
-            state.renderer.write().callback_resources.insert(Gpu { pipeline, layout, sampler, videos: HashMap::new() });
+            state.renderer.write().callback_resources.insert(Gpu {
+                pipeline,
+                layout,
+                sampler,
+                videos: HashMap::new(),
+            });
         }
         Self {
             state: state.cloned(),
@@ -191,7 +204,11 @@ impl Videos {
 
     /// Por onde os quadros estão indo para a tela, para o relatório de medidas.
     pub fn path(&self) -> &'static str {
-        if self.state.is_some() && !self.cpu { "planos na placa" } else { "conversão na CPU" }
+        if self.state.is_some() && !self.cpu {
+            "planos na placa"
+        } else {
+            "conversão na CPU"
+        }
     }
 
     /// Entrega o quadro mais recente de uma live. Devolve `true` quando ele era novo (foi enviado
@@ -201,7 +218,11 @@ impl Videos {
             return false;
         }
         let (width, height) = (frame.width, frame.height);
-        if width == 0 || height == 0 || frame.stride < width as usize || frame.y().len() < frame.stride * height as usize {
+        if width == 0
+            || height == 0
+            || frame.stride < width as usize
+            || frame.y().len() < frame.stride * height as usize
+        {
             return false;
         }
         match self.state.clone().filter(|_| !self.cpu) {
@@ -220,12 +241,22 @@ impl Videos {
             return;
         }
         let mut renderer = state.renderer.write();
-        let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() else { return };
-        if gpu.videos.get(key).is_none_or(|planes| planes.size != (width, height)) {
+        let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() else {
+            return;
+        };
+        if gpu
+            .videos
+            .get(key)
+            .is_none_or(|planes| planes.size != (width, height))
+        {
             let plane = |label, format, width, height| {
                 state.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
-                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -234,21 +265,52 @@ impl Videos {
                     view_formats: &[],
                 })
             };
-            let light = plane("nimbo_video_luz", wgpu::TextureFormat::R8Unorm, width, height);
-            let color = plane("nimbo_video_cor", wgpu::TextureFormat::Rg8Unorm, half_width, half_height);
-            let view = |texture: &wgpu::Texture| texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let light = plane(
+                "nimbo_video_luz",
+                wgpu::TextureFormat::R8Unorm,
+                width,
+                height,
+            );
+            let color = plane(
+                "nimbo_video_cor",
+                wgpu::TextureFormat::Rg8Unorm,
+                half_width,
+                half_height,
+            );
+            let view = |texture: &wgpu::Texture| {
+                texture.create_view(&wgpu::TextureViewDescriptor::default())
+            };
             let bind = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("nimbo_video"),
                 layout: &gpu.layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view(&light)) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view(&color)) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view(&light)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view(&color)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&gpu.sampler),
+                    },
                 ],
             });
-            gpu.videos.insert(key.to_owned(), Planes { light, color, bind, size: (width, height) });
+            gpu.videos.insert(
+                key.to_owned(),
+                Planes {
+                    light,
+                    color,
+                    bind,
+                    size: (width, height),
+                },
+            );
         }
-        let Some(planes) = gpu.videos.get(key) else { return };
+        let Some(planes) = gpu.videos.get(key) else {
+            return;
+        };
         let write = |texture: &wgpu::Texture, data: &[u8], width, height| {
             state.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -263,7 +325,11 @@ impl Videos {
                     bytes_per_row: Some(frame.stride as u32),
                     rows_per_image: Some(height),
                 },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
             );
         };
         write(&planes.light, frame.y(), width, height);
@@ -300,7 +366,8 @@ impl Videos {
         match self.textures.get_mut(key) {
             Some((texture, _)) => texture.set(image, TextureOptions::LINEAR),
             None => {
-                let texture = ctx.load_texture(format!("live-{key}"), image, TextureOptions::LINEAR);
+                let texture =
+                    ctx.load_texture(format!("live-{key}"), image, TextureOptions::LINEAR);
                 self.textures.insert(key.to_owned(), (texture, 0));
             }
         }
@@ -317,9 +384,19 @@ impl Videos {
             return;
         }
         if self.state.is_some() && !self.cpu {
-            ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, Draw { key: key.to_owned() }));
+            ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+                rect,
+                Draw {
+                    key: key.to_owned(),
+                },
+            ));
         } else if let Some((texture, _)) = self.textures.get(key) {
-            ui.painter().image(texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            ui.painter().image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
         }
     }
 
@@ -337,7 +414,12 @@ impl Videos {
 
     /// Solta tudo o que não está na lista (lives que saíram do palco).
     pub fn keep_only(&mut self, keys: &[String]) {
-        let gone: Vec<String> = self.sizes.keys().filter(|key| !keys.contains(key)).cloned().collect();
+        let gone: Vec<String> = self
+            .sizes
+            .keys()
+            .filter(|key| !keys.contains(key))
+            .cloned()
+            .collect();
         for key in gone {
             self.forget(&key);
         }

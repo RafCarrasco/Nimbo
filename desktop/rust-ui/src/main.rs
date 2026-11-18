@@ -54,8 +54,12 @@ fn main() -> eframe::Result {
             "--mute" => args.mute = true,
             "--watch-all" => args.watch_all = true,
             "--stats" => args.stats = true,
-            "--exit-after" => args.exit_after = list.next().and_then(|seconds| seconds.parse().ok()),
-            "--shot-after" => args.shot_after = list.next().and_then(|seconds| seconds.parse().ok()),
+            "--exit-after" => {
+                args.exit_after = list.next().and_then(|seconds| seconds.parse().ok())
+            }
+            "--shot-after" => {
+                args.shot_after = list.next().and_then(|seconds| seconds.parse().ok())
+            }
             "--cpu-video" => args.cpu_video = true,
             "--pick" => args.pick = true,
             "--site" => args.site = list.next(),
@@ -68,7 +72,11 @@ fn main() -> eframe::Result {
     }
     let icon = image::load_from_memory(include_bytes!("../../../public/nimbo-icon-64.png"))
         .map(|img| img.to_rgba8())
-        .map(|img| egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
+        .map(|img| egui::IconData {
+            width: img.width(),
+            height: img.height(),
+            rgba: img.into_raw(),
+        })
         .unwrap_or_default();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Nimbo")
@@ -78,6 +86,13 @@ fn main() -> eframe::Result {
     if let Some(at) = position {
         viewport = viewport.with_position(at).with_active(false);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Nimbo", options, Box::new(|cc| Ok(Box::new(app::Nimbo::new(cc, args)))))
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Nimbo",
+        options,
+        Box::new(|cc| Ok(Box::new(app::Nimbo::new(cc, args)))),
+    )
 }

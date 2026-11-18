@@ -46,7 +46,13 @@ pub type Broadcasts = BTreeMap<String, BTreeMap<String, Broadcast>>;
 pub enum Signal {
     /// Sinalização de uma live nativa: a resposta do motor de quem transmite à nossa oferta, ou a
     /// oferta de quem quer assistir à nossa.
-    Native { from: String, kind: String, answer: bool, sdp: String, nonce: String },
+    Native {
+        from: String,
+        kind: String,
+        answer: bool,
+        sdp: String,
+        nonce: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -121,7 +127,11 @@ impl Room {
             app: app.to_owned(),
             sid: session_id(),
             state: Mutex::new(State {
-                snapshot: RoomSnapshot { room: room.to_owned(), online: db.is_connected(), ..RoomSnapshot::default() },
+                snapshot: RoomSnapshot {
+                    room: room.to_owned(),
+                    online: db.is_connected(),
+                    ..RoomSnapshot::default()
+                },
                 locals: BTreeMap::new(),
                 was_offline: false,
                 replaced: false,
@@ -144,7 +154,9 @@ impl Room {
 
         let weak = Arc::downgrade(&inner);
         db.on_status(move |status| {
-            let (Some(inner), Status::Connected(online)) = (weak.upgrade(), status) else { return };
+            let (Some(inner), Status::Connected(online)) = (weak.upgrade(), status) else {
+                return;
+            };
             let again = {
                 let mut state = inner.state.lock().expect("estado da sala");
                 state.snapshot.online = *online;
@@ -166,7 +178,12 @@ impl Room {
                     if let Err(e) = done {
                         retry.issue(format!("Não deu para voltar ao canal: {e}"), false);
                     }
-                    retry.state.lock().expect("estado da sala").snapshot.reconnects += 1;
+                    retry
+                        .state
+                        .lock()
+                        .expect("estado da sala")
+                        .snapshot
+                        .reconnects += 1;
                     (retry.notify)();
                 });
             }
@@ -188,16 +205,28 @@ impl Room {
                 Event::Value(value) => broadcasts(value),
                 Event::Denied(_) => Broadcasts::new(),
             };
-            inner.state.lock().expect("estado da sala").snapshot.broadcasts = value;
+            inner
+                .state
+                .lock()
+                .expect("estado da sala")
+                .snapshot
+                .broadcasts = value;
             (inner.notify)();
         });
         let weak: Weak<Inner> = Arc::downgrade(&inner);
         let inbox = db.listen(&inner.path(&format!("signals/{uid}")), move |event| {
-            let (Some(inner), Event::Value(data)) = (weak.upgrade(), event) else { return };
+            let (Some(inner), Event::Value(data)) = (weak.upgrade(), event) else {
+                return;
+            };
             inner.on_inbox(data);
             (inner.notify)();
         });
-        inner.state.lock().expect("estado da sala").listens.extend([listen, streams, inbox]);
+        inner
+            .state
+            .lock()
+            .expect("estado da sala")
+            .listens
+            .extend([listen, streams, inbox]);
         Ok(Room { inner })
     }
 
@@ -206,7 +235,12 @@ impl Room {
     }
 
     pub fn snapshot(&self) -> RoomSnapshot {
-        self.inner.state.lock().expect("estado da sala").snapshot.clone()
+        self.inner
+            .state
+            .lock()
+            .expect("estado da sala")
+            .snapshot
+            .clone()
     }
 
     /// O que chegou na caixa de entrada desde a última chamada.
@@ -225,7 +259,11 @@ impl Room {
         done: impl FnOnce(Result<(), DbError>) + Send + 'static,
     ) {
         let message = json!({ "type": "offer", "sdp": { "type": "offer", "sdp": sdp }, "native": kind, "nonce": nonce });
-        let path = self.inner.path(&format!("signals/{to}/{}/{}", self.inner.uid, push_id(self.inner.db.server_now_ms())));
+        let path = self.inner.path(&format!(
+            "signals/{to}/{}/{}",
+            self.inner.uid,
+            push_id(self.inner.db.server_now_ms())
+        ));
         self.inner.db.set_then(&path, message, done);
     }
 
@@ -239,11 +277,16 @@ impl Room {
         nonce: &str,
         done: impl FnOnce(Result<(), DbError>) + Send + 'static,
     ) {
-        let mut message = json!({ "type": "answer", "sdp": { "type": "answer", "sdp": sdp }, "native": kind });
+        let mut message =
+            json!({ "type": "answer", "sdp": { "type": "answer", "sdp": sdp }, "native": kind });
         if !nonce.is_empty() {
             message["nonce"] = json!(nonce);
         }
-        let path = self.inner.path(&format!("signals/{to}/{}/{}", self.inner.uid, push_id(self.inner.db.server_now_ms())));
+        let path = self.inner.path(&format!(
+            "signals/{to}/{}/{}",
+            self.inner.uid,
+            push_id(self.inner.db.server_now_ms())
+        ));
         self.inner.db.set_then(&path, message, done);
     }
 
@@ -251,19 +294,42 @@ impl Room {
     /// assiste vê o anúncio e manda a oferta. `stream_id` identifica esta live (muda a cada começo);
     /// `sound` diz se há som para pedir. Bloqueia até o servidor confirmar.
     pub fn publish_stream(&self, kind: &str, stream_id: &str, sound: bool) -> Result<(), DbError> {
-        let local = Local { started_at: self.inner.db.server_now_ms(), stream_id: stream_id.to_owned(), sound };
-        self.inner.state.lock().expect("estado da sala").locals.insert(kind.to_owned(), local.clone());
+        let local = Local {
+            started_at: self.inner.db.server_now_ms(),
+            stream_id: stream_id.to_owned(),
+            sound,
+        };
+        self.inner
+            .state
+            .lock()
+            .expect("estado da sala")
+            .locals
+            .insert(kind.to_owned(), local.clone());
         let done = self.inner.publish(kind, &local);
         if done.is_err() {
-            self.inner.state.lock().expect("estado da sala").locals.remove(kind);
+            self.inner
+                .state
+                .lock()
+                .expect("estado da sala")
+                .locals
+                .remove(kind);
         }
         done
     }
 
     /// Tira o anúncio de uma live desta conta. Bloqueia até o servidor confirmar.
     pub fn unpublish_stream(&self, kind: &str) {
-        self.inner.state.lock().expect("estado da sala").locals.remove(kind);
-        let _ = self.inner.db.remove(&self.inner.path(&format!("streams/{}/{kind}", self.inner.uid)));
+        self.inner
+            .state
+            .lock()
+            .expect("estado da sala")
+            .locals
+            .remove(kind);
+        let _ = self.inner.db.remove(
+            &self
+                .inner
+                .path(&format!("streams/{}/{kind}", self.inner.uid)),
+        );
     }
 
     /// Sai do canal. Bloqueia até o servidor confirmar: chame fora da thread que desenha.
@@ -271,7 +337,11 @@ impl Room {
         let (listens, replaced, locals) = {
             let mut state = self.inner.state.lock().expect("estado da sala");
             state.snapshot.joined = false;
-            (std::mem::take(&mut state.listens), state.replaced, std::mem::take(&mut state.locals))
+            (
+                std::mem::take(&mut state.listens),
+                state.replaced,
+                std::mem::take(&mut state.locals),
+            )
         };
         for id in listens {
             self.inner.db.unlisten(id);
@@ -323,7 +393,8 @@ impl Inner {
         if removals.is_empty() {
             return Ok(());
         }
-        self.db.update(&format!("rooms/{}", self.room), Json::Object(removals))
+        self.db
+            .update(&format!("rooms/{}", self.room), Json::Object(removals))
     }
 
     /// O pedido de "tire-me se a conexão cair" vai antes da entrada, para uma queda logo depois de
@@ -332,14 +403,18 @@ impl Inner {
         let member = self.member();
         self.db.on_disconnect_remove(&member)?;
         // A versão do app vai junto: quando uma live não conecta, mostra quem ainda não atualizou.
-        self.db.set(&member, json!({ "joinedAt": { ".sv": "timestamp" }, "app": self.app, "sid": self.sid }))
+        self.db.set(
+            &member,
+            json!({ "joinedAt": { ".sv": "timestamp" }, "app": self.app, "sid": self.sid }),
+        )
     }
 
     /// O pedido de "tire a live se a conexão cair" vai antes do anúncio, como na presença.
     fn publish(&self, kind: &str, local: &Local) -> Result<(), DbError> {
         let streams = self.path(&format!("streams/{}", self.uid));
         self.db.on_disconnect_remove(&streams)?;
-        let mut live = json!({ "startedAt": local.started_at, "streamId": local.stream_id, "native": true });
+        let mut live =
+            json!({ "startedAt": local.started_at, "streamId": local.stream_id, "native": true });
         if local.sound {
             live["sound"] = json!(true);
         }
@@ -349,7 +424,9 @@ impl Inner {
     /// Depois de uma queda: anuncia de novo as lives que estavam no ar.
     fn republish(&self) -> Result<(), DbError> {
         let locals = self.state.lock().expect("estado da sala").locals.clone();
-        locals.iter().try_for_each(|(kind, local)| self.publish(kind, local))
+        locals
+            .iter()
+            .try_for_each(|(kind, local)| self.publish(kind, local))
     }
 
     fn on_members(self: &Arc<Self>, entries: &Json) {
@@ -357,7 +434,11 @@ impl Inner {
         // A presença desta conta foi escrita por outra sessão (outra aba, o navegador, outro
         // aparelho): a mais nova fica com o canal. Sem registro nenhum é só uma queda de rede.
         let mine = &entries[&self.uid];
-        if state.snapshot.joined && !state.replaced && mine.is_object() && mine["sid"] != self.sid.as_str() {
+        if state.snapshot.joined
+            && !state.replaced
+            && mine.is_object()
+            && mine["sid"] != self.sid.as_str()
+        {
             state.replaced = true;
             state.snapshot.issue = Some(Issue {
                 message: "Você entrou neste canal em outro lugar (outra aba, navegador ou aparelho). Esta sessão saiu do canal."
@@ -369,7 +450,11 @@ impl Inner {
         let map = entries.as_object();
         state.snapshot.members = map.map(|m| m.keys().cloned().collect()).unwrap_or_default();
         state.snapshot.apps = map
-            .map(|m| m.iter().map(|(id, entry)| (id.clone(), entry["app"].as_str().unwrap_or("").to_owned())).collect())
+            .map(|m| {
+                m.iter()
+                    .map(|(id, entry)| (id.clone(), entry["app"].as_str().unwrap_or("").to_owned()))
+                    .collect()
+            })
             .unwrap_or_default();
         // Sinais que chegaram antes da lista de membros ficam guardados até aqui.
         let first = !state.members_loaded;
@@ -408,11 +493,20 @@ impl Inner {
                     });
                 }
                 let weak = Arc::downgrade(self);
-                self.db.set_then(&self.path(&format!("signals/{}/{sender}/{id}", self.uid)), Json::Null, move |result| {
-                    if let (Ok(()), Some(inner)) = (result, weak.upgrade()) {
-                        inner.state.lock().expect("estado da sala").seen.remove(&key);
-                    }
-                });
+                self.db.set_then(
+                    &self.path(&format!("signals/{}/{sender}/{id}", self.uid)),
+                    Json::Null,
+                    move |result| {
+                        if let (Ok(()), Some(inner)) = (result, weak.upgrade()) {
+                            inner
+                                .state
+                                .lock()
+                                .expect("estado da sala")
+                                .seen
+                                .remove(&key);
+                        }
+                    },
+                );
             }
         }
     }
@@ -423,7 +517,9 @@ fn broadcasts(value: &Json) -> Broadcasts {
     for (uid, kinds) in value.as_object().into_iter().flatten() {
         for kind in ["screen", "camera"] {
             let live = &kinds[kind];
-            let Some(stream_id) = live["streamId"].as_str().filter(|id| !id.is_empty()) else { continue };
+            let Some(stream_id) = live["streamId"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
             all.entry(uid.clone()).or_default().insert(
                 kind.to_owned(),
                 Broadcast {
@@ -449,7 +545,9 @@ fn push_id(now_ms: i64) -> String {
     }
     let mut random = [0u8; 12];
     if getrandom::fill(&mut random).is_err() {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         random.copy_from_slice(&nanos.to_le_bytes()[..12]);
     }
     for (slot, byte) in id[8..].iter_mut().zip(random) {
@@ -462,7 +560,9 @@ fn push_id(now_ms: i64) -> String {
 fn session_id() -> String {
     let mut bytes = [0u8; 6];
     if getrandom::fill(&mut bytes).is_err() {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
         bytes.copy_from_slice(&nanos.to_le_bytes()[..6]);
     }
     bytes.iter().map(|b| format!("{b:02x}")).collect()

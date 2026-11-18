@@ -16,7 +16,11 @@ pub const DEFAULT_CATEGORY: &str = "lives";
 /// Canais que existem sempre, sem registro no banco: (id, nome, descrição).
 pub const SYSTEM_CHANNELS: [(&str, &str, &str); 2] = [
     ("geral", "Geral", "Jogos, lives e conversa"),
-    ("competitivo", "Competitivo", "Partidas e comunicação de equipe"),
+    (
+        "competitivo",
+        "Competitivo",
+        "Partidas e comunicação de equipe",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,7 +55,9 @@ impl Level {
 
     /// Uma restrição de nível `self` deixa passar quem tem o nível `mine`?
     fn admits(self, mine: Level) -> bool {
-        self == Level::Member || mine == Level::Owner || (self == Level::Admin && mine == Level::Admin)
+        self == Level::Member
+            || mine == Level::Owner
+            || (self == Level::Admin && mine == Level::Admin)
     }
 }
 
@@ -121,22 +127,36 @@ impl Snapshot {
 
     /// Só o proprietário passa por cima dos cargos; administrador segue os grupos como todo mundo.
     fn roles_ok(&self, required: Option<&Vec<String>>, uid: &str) -> bool {
-        let Some(required) = required.filter(|list| !list.is_empty()) else { return true };
+        let Some(required) = required.filter(|list| !list.is_empty()) else {
+            return true;
+        };
         if self.level_of(uid) == Level::Owner {
             return true;
         }
         let mine = self.member_roles.get(uid);
-        required.iter().any(|role| mine.is_some_and(|set| set.contains(role)))
+        required
+            .iter()
+            .any(|role| mine.is_some_and(|set| set.contains(role)))
     }
 
     pub fn category_allowed(&self, category_id: &str, uid: &str) -> bool {
-        self.category_access.get(category_id).copied().unwrap_or_default().admits(self.level_of(uid))
+        self.category_access
+            .get(category_id)
+            .copied()
+            .unwrap_or_default()
+            .admits(self.level_of(uid))
             && self.roles_ok(self.category_roles.get(category_id), uid)
     }
 
     pub fn channel_allowed(&self, channel_id: &str, uid: &str) -> bool {
-        let Some(channel) = self.channels.get(channel_id).filter(|c| c.enabled) else { return false };
-        self.channel_access.get(channel_id).copied().unwrap_or_default().admits(self.level_of(uid))
+        let Some(channel) = self.channels.get(channel_id).filter(|c| c.enabled) else {
+            return false;
+        };
+        self.channel_access
+            .get(channel_id)
+            .copied()
+            .unwrap_or_default()
+            .admits(self.level_of(uid))
             && self.roles_ok(self.channel_roles.get(channel_id), uid)
             && self.category_allowed(&channel.category_id, uid)
     }
@@ -163,13 +183,19 @@ impl Snapshot {
         } else {
             String::new()
         };
-        [by_level.to_owned(), by_role].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ")
+        [by_level.to_owned(), by_role]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     /// Cor do primeiro cargo conhecido da pessoa, como no site.
     pub fn role_color(&self, uid: &str) -> Option<&str> {
         let mine = self.member_roles.get(uid)?;
-        mine.iter().find_map(|role| self.role_defs.get(role)).map(|def| def.color.as_str())
+        mine.iter()
+            .find_map(|role| self.role_defs.get(role))
+            .map(|def| def.color.as_str())
     }
 
     /// Canais na ordem do site: os padrão primeiro, depois os criados (o id cresce com a data de criação).
@@ -193,25 +219,39 @@ fn text(value: &Json, key: &str) -> String {
 }
 
 fn keys(value: &Json) -> BTreeSet<String> {
-    value.as_object().map(|map| map.keys().cloned().collect()).unwrap_or_default()
+    value
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn levels(value: &Json) -> BTreeMap<String, Level> {
     value
         .as_object()
-        .map(|map| map.iter().filter_map(|(k, v)| Some((k.clone(), Level::parse(v)?))).collect())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| Some((k.clone(), Level::parse(v)?)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn texts(value: &Json) -> BTreeMap<String, String> {
     value
         .as_object()
-        .map(|map| map.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned()))).collect())
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 fn display_name(value: &Json) -> Option<String> {
-    value["displayName"].as_str().filter(|name| !name.is_empty()).map(str::to_owned)
+    value["displayName"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 fn role_def(value: &Json) -> Option<RoleDef> {
@@ -229,18 +269,29 @@ fn role_lists(value: &Json) -> BTreeMap<String, Vec<String>> {
             .as_object()
             .map(|map| {
                 map.iter()
-                    .filter_map(|(k, v)| Some((k.parse().ok()?, v.as_str().filter(|s| !s.is_empty())?.to_owned())))
+                    .filter_map(|(k, v)| {
+                        Some((
+                            k.parse().ok()?,
+                            v.as_str().filter(|s| !s.is_empty())?.to_owned(),
+                        ))
+                    })
                     .collect()
             })
             .unwrap_or_default();
         pairs.sort();
         pairs.into_iter().map(|(_, id)| id).collect()
     };
-    value.as_object().map(|map| map.iter().map(|(k, v)| (k.clone(), list(v))).collect()).unwrap_or_default()
+    value
+        .as_object()
+        .map(|map| map.iter().map(|(k, v)| (k.clone(), list(v))).collect())
+        .unwrap_or_default()
 }
 
 fn sets(value: &Json) -> BTreeMap<String, BTreeSet<String>> {
-    value.as_object().map(|map| map.iter().map(|(k, v)| (k.clone(), keys(v))).collect()).unwrap_or_default()
+    value
+        .as_object()
+        .map(|map| map.iter().map(|(k, v)| (k.clone(), keys(v))).collect())
+        .unwrap_or_default()
 }
 
 fn streams(value: &Json) -> BTreeMap<String, Live> {
@@ -249,7 +300,15 @@ fn streams(value: &Json) -> BTreeMap<String, Live> {
         .as_object()
         .map(|map| {
             map.iter()
-                .map(|(uid, kinds)| (uid.clone(), Live { screen: on(&kinds["screen"]), camera: on(&kinds["camera"]) }))
+                .map(|(uid, kinds)| {
+                    (
+                        uid.clone(),
+                        Live {
+                            screen: on(&kinds["screen"]),
+                            camera: on(&kinds["camera"]),
+                        },
+                    )
+                })
                 .filter(|(_, live)| live.screen || live.camera)
                 .collect()
         })
@@ -326,7 +385,10 @@ impl Community {
             state: Mutex::new(State {
                 raw: Raw::default(),
                 subs: Subs::default(),
-                snapshot: Snapshot { uid: uid.to_owned(), ..Snapshot::default() },
+                snapshot: Snapshot {
+                    uid: uid.to_owned(),
+                    ..Snapshot::default()
+                },
             }),
             notify: Box::new(notify),
         });
@@ -334,17 +396,30 @@ impl Community {
             inner.hook(format!("community/roles/{uid}"), |raw, v| {
                 raw.level = Some(v.and_then(Level::parse).unwrap_or_default());
             }),
-            inner.hook("community/channelAccess".into(), |raw, v| raw.channel_access = v.map(levels).unwrap_or_default()),
-            inner.hook("community/categoryAccess".into(), |raw, v| raw.category_access = v.map(levels).unwrap_or_default()),
-            inner.hook("community/categoryRoles".into(), |raw, v| raw.category_roles = v.map(role_lists).unwrap_or_default()),
-            inner.hook("community/channelRoles".into(), |raw, v| raw.channel_roles = v.map(role_lists).unwrap_or_default()),
+            inner.hook("community/channelAccess".into(), |raw, v| {
+                raw.channel_access = v.map(levels).unwrap_or_default()
+            }),
+            inner.hook("community/categoryAccess".into(), |raw, v| {
+                raw.category_access = v.map(levels).unwrap_or_default()
+            }),
+            inner.hook("community/categoryRoles".into(), |raw, v| {
+                raw.category_roles = v.map(role_lists).unwrap_or_default()
+            }),
+            inner.hook("community/channelRoles".into(), |raw, v| {
+                raw.channel_roles = v.map(role_lists).unwrap_or_default()
+            }),
         ];
         inner.state.lock().expect("estado da comunidade").subs.base = base;
         Community { inner }
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        self.inner.state.lock().expect("estado da comunidade").snapshot.clone()
+        self.inner
+            .state
+            .lock()
+            .expect("estado da comunidade")
+            .snapshot
+            .clone()
     }
 }
 
@@ -370,7 +445,11 @@ impl Drop for Community {
 
 impl Inner {
     /// Acompanha um caminho; `apply` recebe o valor (ou `None` quando a leitura foi recusada).
-    fn hook(self: &Arc<Self>, path: String, apply: impl Fn(&mut Raw, Option<&Json>) + Send + 'static) -> ListenId {
+    fn hook(
+        self: &Arc<Self>,
+        path: String,
+        apply: impl Fn(&mut Raw, Option<&Json>) + Send + 'static,
+    ) -> ListenId {
         let weak: Weak<Inner> = Arc::downgrade(self);
         self.db.listen(&path, move |event| {
             let Some(inner) = weak.upgrade() else { return };
@@ -395,7 +474,11 @@ impl Inner {
 
     /// Depois de cada mudança: ajusta o que precisa ser acompanhado e refaz o retrato.
     fn reconcile(self: &Arc<Self>, state: &mut State) {
-        let State { raw, subs, snapshot } = state;
+        let State {
+            raw,
+            subs,
+            snapshot,
+        } = state;
         let uid = self.uid.as_str();
         let Some(level) = raw.level else { return };
         let owner = level == Level::Owner;
@@ -416,17 +499,31 @@ impl Inner {
                     self.hook("community/profiles".into(), |raw, v| {
                         let all = v.and_then(Json::as_object);
                         raw.profiles = Some(
-                            all.map(|map| map.iter().filter_map(|(k, p)| Some((k.clone(), display_name(p)?))).collect())
-                                .unwrap_or_default(),
+                            all.map(|map| {
+                                map.iter()
+                                    .filter_map(|(k, p)| Some((k.clone(), display_name(p)?)))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         );
                     }),
-                    self.hook("community/roles".into(), |raw, v| raw.all_roles = v.map(levels).unwrap_or_default()),
-                    self.hook("community/avatars".into(), |raw, v| raw.avatars = v.map(texts).unwrap_or_default()),
-                    self.hook("community/netAdmins".into(), |raw, v| raw.net_admins = v.map(keys).unwrap_or_default()),
+                    self.hook("community/roles".into(), |raw, v| {
+                        raw.all_roles = v.map(levels).unwrap_or_default()
+                    }),
+                    self.hook("community/avatars".into(), |raw, v| {
+                        raw.avatars = v.map(texts).unwrap_or_default()
+                    }),
+                    self.hook("community/netAdmins".into(), |raw, v| {
+                        raw.net_admins = v.map(keys).unwrap_or_default()
+                    }),
                     self.hook("community/roleDefs".into(), |raw, v| {
                         raw.all_defs = v
                             .and_then(Json::as_object)
-                            .map(|map| map.iter().filter_map(|(k, d)| Some((k.clone(), role_def(d)?))).collect())
+                            .map(|map| {
+                                map.iter()
+                                    .filter_map(|(k, d)| Some((k.clone(), role_def(d)?)))
+                                    .collect()
+                            })
                             .unwrap_or_default();
                     }),
                     self.hook("community/memberRoles".into(), |raw, v| {
@@ -438,22 +535,42 @@ impl Inner {
                 let (me_profile, me_avatar, me_net) = (me.clone(), me.clone(), me.clone());
                 vec![
                     self.hook(format!("community/profiles/{uid}"), move |raw, v| {
-                        raw.profiles = Some(v.and_then(display_name).map(|name| (me_profile.clone(), name)).into_iter().collect());
+                        raw.profiles = Some(
+                            v.and_then(display_name)
+                                .map(|name| (me_profile.clone(), name))
+                                .into_iter()
+                                .collect(),
+                        );
                     }),
                     self.hook(format!("community/avatars/{uid}"), move |raw, v| {
-                        raw.avatars = v.and_then(Json::as_str).map(|photo| (me_avatar.clone(), photo.to_owned())).into_iter().collect();
+                        raw.avatars = v
+                            .and_then(Json::as_str)
+                            .map(|photo| (me_avatar.clone(), photo.to_owned()))
+                            .into_iter()
+                            .collect();
                     }),
                     self.hook(format!("community/netAdmins/{uid}"), move |raw, v| {
-                        raw.net_admins = v.filter(|flag| flag.as_bool() == Some(true)).map(|_| me_net.clone()).into_iter().collect();
+                        raw.net_admins = v
+                            .filter(|flag| flag.as_bool() == Some(true))
+                            .map(|_| me_net.clone())
+                            .into_iter()
+                            .collect();
                     }),
-                    self.hook(format!("community/memberRoles/{uid}"), |raw, v| raw.own_roles = v.map(keys).unwrap_or_default()),
+                    self.hook(format!("community/memberRoles/{uid}"), |raw, v| {
+                        raw.own_roles = v.map(keys).unwrap_or_default()
+                    }),
                 ]
             };
         }
 
         // Quem não é proprietário: nome, cor e colegas de cada cargo que tem (e só desses).
         if !owner {
-            let gone: Vec<String> = subs.groups.keys().filter(|id| !raw.own_roles.contains(*id)).cloned().collect();
+            let gone: Vec<String> = subs
+                .groups
+                .keys()
+                .filter(|id| !raw.own_roles.contains(*id))
+                .cloned()
+                .collect();
             for id in gone {
                 self.drop_all(subs.groups.remove(&id).unwrap_or_default());
                 raw.group_defs.remove(&id);
@@ -467,20 +584,31 @@ impl Inner {
                 subs.groups.insert(
                     id.clone(),
                     vec![
-                        self.hook(format!("community/roleDefs/{id}"), move |raw, v| match v.and_then(role_def) {
-                            Some(def) => drop(raw.group_defs.insert(def_id.clone(), def)),
-                            None => drop(raw.group_defs.remove(&def_id)),
+                        self.hook(format!("community/roleDefs/{id}"), move |raw, v| {
+                            match v.and_then(role_def) {
+                                Some(def) => drop(raw.group_defs.insert(def_id.clone(), def)),
+                                None => drop(raw.group_defs.remove(&def_id)),
+                            }
                         }),
                         self.hook(format!("community/roleMembers/{id}"), move |raw, v| {
-                            raw.group_members.insert(members_id.clone(), v.map(keys).unwrap_or_default());
+                            raw.group_members
+                                .insert(members_id.clone(), v.map(keys).unwrap_or_default());
                         }),
                     ],
                 );
             }
         }
 
-        let roles = if owner { raw.all_roles.clone() } else { BTreeMap::from([(uid.to_owned(), level)]) };
-        let role_defs = if owner { raw.all_defs.clone() } else { raw.group_defs.clone() };
+        let roles = if owner {
+            raw.all_roles.clone()
+        } else {
+            BTreeMap::from([(uid.to_owned(), level)])
+        };
+        let role_defs = if owner {
+            raw.all_defs.clone()
+        } else {
+            raw.group_defs.clone()
+        };
         let member_roles = if owner {
             raw.all_member_roles.clone()
         } else {
@@ -513,12 +641,21 @@ impl Inner {
             // O que já estava na tela fica até a resposta nova chegar; o que for recusado sai sozinho.
             if subs.index.is_empty() {
                 subs.index = vec![
-                    self.hook("community/categoryIds".into(), |raw, v| raw.category_ids = v.map(keys).unwrap_or_default()),
-                    self.hook("community/channelIds".into(), |raw, v| raw.channel_ids = v.map(keys).unwrap_or_default()),
+                    self.hook("community/categoryIds".into(), |raw, v| {
+                        raw.category_ids = v.map(keys).unwrap_or_default()
+                    }),
+                    self.hook("community/channelIds".into(), |raw, v| {
+                        raw.channel_ids = v.map(keys).unwrap_or_default()
+                    }),
                 ];
             }
         }
-        let gone: Vec<String> = subs.categories.keys().filter(|id| !raw.category_ids.contains(*id)).cloned().collect();
+        let gone: Vec<String> = subs
+            .categories
+            .keys()
+            .filter(|id| !raw.category_ids.contains(*id))
+            .cloned()
+            .collect();
         for id in gone {
             self.drop_all(subs.categories.remove(&id));
             raw.categories.remove(&id);
@@ -528,18 +665,26 @@ impl Inner {
                 continue;
             }
             let key = id.clone();
-            let listen = self.hook(format!("community/categories/{id}"), move |raw, v| {
-                match v.filter(|item| item.is_object()) {
-                    Some(item) => drop(raw.categories.insert(
-                        key.clone(),
-                        Category { name: text(item, "name"), order: item["order"].as_f64().unwrap_or(0.0) },
-                    )),
-                    None => drop(raw.categories.remove(&key)),
-                }
+            let listen = self.hook(format!("community/categories/{id}"), move |raw, v| match v
+                .filter(|item| item.is_object())
+            {
+                Some(item) => drop(raw.categories.insert(
+                    key.clone(),
+                    Category {
+                        name: text(item, "name"),
+                        order: item["order"].as_f64().unwrap_or(0.0),
+                    },
+                )),
+                None => drop(raw.categories.remove(&key)),
             });
             subs.categories.insert(id.clone(), listen);
         }
-        let gone: Vec<String> = subs.channels.keys().filter(|id| !raw.channel_ids.contains(*id)).cloned().collect();
+        let gone: Vec<String> = subs
+            .channels
+            .keys()
+            .filter(|id| !raw.channel_ids.contains(*id))
+            .cloned()
+            .collect();
         for id in gone {
             self.drop_all(subs.channels.remove(&id));
             raw.channels.remove(&id);
@@ -551,15 +696,20 @@ impl Inner {
             let key = id.clone();
             let listen = self.hook(format!("community/channels/{id}"), move |raw, v| {
                 match v.filter(|item| item.is_object()) {
-                    Some(item) => drop(raw.channels.insert(
-                        key.clone(),
-                        Channel {
-                            name: text(item, "name"),
-                            description: text(item, "description"),
-                            category_id: item["categoryId"].as_str().unwrap_or(DEFAULT_CATEGORY).to_owned(),
-                            enabled: item["enabled"].as_bool().unwrap_or(false),
-                        },
-                    )),
+                    Some(item) => drop(
+                        raw.channels.insert(
+                            key.clone(),
+                            Channel {
+                                name: text(item, "name"),
+                                description: text(item, "description"),
+                                category_id: item["categoryId"]
+                                    .as_str()
+                                    .unwrap_or(DEFAULT_CATEGORY)
+                                    .to_owned(),
+                                enabled: item["enabled"].as_bool().unwrap_or(false),
+                            },
+                        ),
+                    ),
                     None => drop(raw.channels.remove(&key)),
                 }
             });
@@ -586,21 +736,41 @@ impl Inner {
             resolving: BTreeSet::new(),
             presence: BTreeMap::new(),
         };
-        next.categories.insert(DEFAULT_CATEGORY.into(), Category { name: "Lives".into(), order: 0.0 });
+        next.categories.insert(
+            DEFAULT_CATEGORY.into(),
+            Category {
+                name: "Lives".into(),
+                order: 0.0,
+            },
+        );
         for (id, name, description) in SYSTEM_CHANNELS {
             next.channels.insert(
                 id.into(),
-                Channel { name: name.into(), description: description.into(), category_id: DEFAULT_CATEGORY.into(), enabled: true },
+                Channel {
+                    name: name.into(),
+                    description: description.into(),
+                    category_id: DEFAULT_CATEGORY.into(),
+                    enabled: true,
+                },
             );
         }
 
         // Presença: só dos canais que a conta pode ver (os outros o servidor recusaria).
         let allowed: BTreeSet<String> = if next.loaded {
-            next.channels.keys().filter(|id| next.channel_allowed(id, uid)).cloned().collect()
+            next.channels
+                .keys()
+                .filter(|id| next.channel_allowed(id, uid))
+                .cloned()
+                .collect()
         } else {
             BTreeSet::new()
         };
-        let gone: Vec<String> = subs.rooms.keys().filter(|id| !allowed.contains(*id)).cloned().collect();
+        let gone: Vec<String> = subs
+            .rooms
+            .keys()
+            .filter(|id| !allowed.contains(*id))
+            .cloned()
+            .collect();
         for id in gone {
             self.drop_all(subs.rooms.remove(&id).unwrap_or_default());
             raw.rooms.remove(&id);
@@ -618,7 +788,8 @@ impl Inner {
                             v.map(keys).unwrap_or_default().into_iter().collect();
                     }),
                     self.hook(format!("rooms/{id}/streams"), move |raw, v| {
-                        raw.rooms.entry(streams_room.clone()).or_default().streams = v.map(streams).unwrap_or_default();
+                        raw.rooms.entry(streams_room.clone()).or_default().streams =
+                            v.map(streams).unwrap_or_default();
                     }),
                 ],
             );
@@ -629,11 +800,20 @@ impl Inner {
         // nos canais visíveis.
         if !owner {
             let seen: BTreeSet<String> = if next.loaded {
-                raw.rooms.values().flat_map(|room| room.members.iter().chain(room.streams.keys())).cloned().collect()
+                raw.rooms
+                    .values()
+                    .flat_map(|room| room.members.iter().chain(room.streams.keys()))
+                    .cloned()
+                    .collect()
             } else {
                 BTreeSet::new()
             };
-            let gone: Vec<String> = subs.people.keys().filter(|id| !seen.contains(*id)).cloned().collect();
+            let gone: Vec<String> = subs
+                .people
+                .keys()
+                .filter(|id| !seen.contains(*id))
+                .cloned()
+                .collect();
             for id in gone {
                 self.drop_all(subs.people.remove(&id).unwrap_or_default());
                 raw.people.remove(&id);
@@ -648,23 +828,35 @@ impl Inner {
                     id.clone(),
                     vec![
                         self.hook(format!("community/profiles/{id}"), move |raw, v| {
-                            raw.people.insert(profile_id.clone(), v.and_then(display_name));
+                            raw.people
+                                .insert(profile_id.clone(), v.and_then(display_name));
                         }),
-                        self.hook(format!("community/avatars/{id}"), move |raw, v| match v.and_then(Json::as_str) {
-                            Some(photo) => drop(raw.people_avatars.insert(avatar_id.clone(), photo.to_owned())),
-                            None => drop(raw.people_avatars.remove(&avatar_id)),
+                        self.hook(format!("community/avatars/{id}"), move |raw, v| {
+                            match v.and_then(Json::as_str) {
+                                Some(photo) => drop(
+                                    raw.people_avatars
+                                        .insert(avatar_id.clone(), photo.to_owned()),
+                                ),
+                                None => drop(raw.people_avatars.remove(&avatar_id)),
+                            }
                         }),
                     ],
                 );
             }
             for id in &seen {
                 match raw.people.get(id) {
-                    Some(Some(name)) => drop(next.profiles.entry(id.clone()).or_insert_with(|| name.clone())),
+                    Some(Some(name)) => drop(
+                        next.profiles
+                            .entry(id.clone())
+                            .or_insert_with(|| name.clone()),
+                    ),
                     Some(None) => {}
                     None => drop(next.resolving.insert(id.clone())),
                 }
                 if let Some(photo) = raw.people_avatars.get(id) {
-                    next.avatars.entry(id.clone()).or_insert_with(|| photo.clone());
+                    next.avatars
+                        .entry(id.clone())
+                        .or_insert_with(|| photo.clone());
                 }
             }
         }

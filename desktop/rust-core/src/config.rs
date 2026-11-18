@@ -33,9 +33,15 @@ impl Project {
     /// `NIMBO_EMULATOR_AUTH`, no formato `host:porta`.
     pub fn emulator() -> Self {
         let address = |name: &str, default: &str| {
-            std::env::var(name).ok().filter(|value| !value.trim().is_empty()).unwrap_or_else(|| default.to_owned())
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| default.to_owned())
         };
-        let (db, auth) = (address("NIMBO_EMULATOR_DB", "127.0.0.1:9000"), address("NIMBO_EMULATOR_AUTH", "127.0.0.1:9099"));
+        let (db, auth) = (
+            address("NIMBO_EMULATOR_DB", "127.0.0.1:9000"),
+            address("NIMBO_EMULATOR_AUTH", "127.0.0.1:9099"),
+        );
         Self {
             api_key: "demo-key".into(),
             db_host: db,

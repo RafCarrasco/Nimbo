@@ -84,11 +84,19 @@ type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 enum Cmd {
     Token(Option<String>),
-    Listen { id: u64, path: String, cb: Callback },
+    Listen {
+        id: u64,
+        path: String,
+        cb: Callback,
+    },
     Unlisten(u64),
     RetryDenied,
     Status(StatusCallback),
-    Request { action: &'static str, body: Json, done: Option<Done> },
+    Request {
+        action: &'static str,
+        body: Json,
+        done: Option<Done>,
+    },
     /// Só para testes: derruba a conexão atual, como se a rede tivesse caído.
     Drop,
     Close,
@@ -134,7 +142,11 @@ impl Db {
     /// conhecido para o caminho, ele chega na hora.
     pub fn listen(&self, path: &str, cb: impl FnMut(&Event) + Send + 'static) -> ListenId {
         let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = self.tx.send(Cmd::Listen { id, path: path.into(), cb: Box::new(cb) });
+        let _ = self.tx.send(Cmd::Listen {
+            id,
+            path: path.into(),
+            cb: Box::new(cb),
+        });
         ListenId(id)
     }
 
@@ -168,13 +180,15 @@ impl Db {
     }
 
     pub fn set(&self, path: &str, value: Json) -> Result<(), DbError> {
-        self.wait("p", json!({ "p": clean(path), "d": value })).map(drop)
+        self.wait("p", json!({ "p": clean(path), "d": value }))
+            .map(drop)
     }
 
     /// Grava vários caminhos de uma vez (tudo ou nada). As chaves de `children` são caminhos
     /// relativos a `path`; `Null` apaga.
     pub fn update(&self, path: &str, children: Json) -> Result<(), DbError> {
-        self.wait("m", json!({ "p": clean(path), "d": children })).map(drop)
+        self.wait("m", json!({ "p": clean(path), "d": children }))
+            .map(drop)
     }
 
     pub fn remove(&self, path: &str) -> Result<(), DbError> {
@@ -183,7 +197,8 @@ impl Db {
 
     /// O que o servidor deve gravar quando esta conexão cair (presença).
     pub fn on_disconnect_set(&self, path: &str, value: Json) -> Result<(), DbError> {
-        self.wait("o", json!({ "p": clean(path), "d": value })).map(drop)
+        self.wait("o", json!({ "p": clean(path), "d": value }))
+            .map(drop)
     }
 
     pub fn on_disconnect_remove(&self, path: &str) -> Result<(), DbError> {
@@ -191,12 +206,22 @@ impl Db {
     }
 
     pub fn on_disconnect_cancel(&self, path: &str) -> Result<(), DbError> {
-        self.wait("oc", json!({ "p": clean(path), "d": null })).map(drop)
+        self.wait("oc", json!({ "p": clean(path), "d": null }))
+            .map(drop)
     }
 
     /// Como `set`, sem esperar: o resultado chega em `done`, na thread da conexão.
-    pub fn set_then(&self, path: &str, value: Json, done: impl FnOnce(Result<(), DbError>) + Send + 'static) {
-        self.send("p", json!({ "p": clean(path), "d": value }), Some(Box::new(move |r| done(r.map(drop)))));
+    pub fn set_then(
+        &self,
+        path: &str,
+        value: Json,
+        done: impl FnOnce(Result<(), DbError>) + Send + 'static,
+    ) {
+        self.send(
+            "p",
+            json!({ "p": clean(path), "d": value }),
+            Some(Box::new(move |r| done(r.map(drop)))),
+        );
     }
 
     pub fn close(&self) {
@@ -215,18 +240,28 @@ impl Db {
 
     fn wait(&self, action: &'static str, body: Json) -> Result<Json, DbError> {
         let (tx, rx) = channel();
-        self.send(action, body, Some(Box::new(move |result| drop(tx.send(result)))));
+        self.send(
+            action,
+            body,
+            Some(Box::new(move |result| drop(tx.send(result)))),
+        );
         // A thread da conexão sempre responde (resultado, queda ou prazo); a folga é só garantia.
-        rx.recv_timeout(REQUEST_TIMEOUT + Duration::from_secs(5)).unwrap_or(Err(DbError::Timeout))
+        rx.recv_timeout(REQUEST_TIMEOUT + Duration::from_secs(5))
+            .unwrap_or(Err(DbError::Timeout))
     }
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 fn segments(path: &str) -> Vec<String> {
-    path.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn clean(path: &str) -> String {
@@ -245,19 +280,33 @@ pub fn normalize(value: Json) -> Json {
                 .map(|(i, v)| (i.to_string(), normalize(v)))
                 .filter(|(_, v)| !v.is_null())
                 .collect();
-            if map.is_empty() { Json::Null } else { Json::Object(map) }
+            if map.is_empty() {
+                Json::Null
+            } else {
+                Json::Object(map)
+            }
         }
         Json::Object(fields) => {
-            let map: Map<String, Json> =
-                fields.into_iter().map(|(k, v)| (k, normalize(v))).filter(|(_, v)| !v.is_null()).collect();
-            if map.is_empty() { Json::Null } else { Json::Object(map) }
+            let map: Map<String, Json> = fields
+                .into_iter()
+                .map(|(k, v)| (k, normalize(v)))
+                .filter(|(_, v)| !v.is_null())
+                .collect();
+            if map.is_empty() {
+                Json::Null
+            } else {
+                Json::Object(map)
+            }
         }
         other => other,
     }
 }
 
 fn get_at(root: &Json, rel: &[String]) -> Json {
-    rel.iter().try_fold(root, |node, key| node.get(key)).cloned().unwrap_or(Json::Null)
+    rel.iter()
+        .try_fold(root, |node, key| node.get(key))
+        .cloned()
+        .unwrap_or(Json::Null)
 }
 
 fn set_at(root: &mut Json, rel: &[String], value: Json) {
@@ -271,7 +320,9 @@ fn set_at(root: &mut Json, rel: &[String], value: Json) {
         }
         *root = Json::Object(Map::new());
     }
-    let Some(map) = root.as_object_mut() else { return };
+    let Some(map) = root.as_object_mut() else {
+        return;
+    };
     if rest.is_empty() {
         if value.is_null() {
             map.remove(key);
@@ -438,7 +489,10 @@ impl Worker {
                 }
             }
             self.expire();
-            if self.ready && self.last_write.elapsed() >= KEEPALIVE && !self.write(socket, "0".into()) {
+            if self.ready
+                && self.last_write.elapsed() >= KEEPALIVE
+                && !self.write(socket, "0".into())
+            {
                 return End::Lost;
             }
             let text = match socket.read() {
@@ -472,7 +526,9 @@ impl Worker {
                     _ => text,
                 },
             };
-            let Ok(message) = serde_json::from_str::<Json>(&whole) else { return End::Lost };
+            let Ok(message) = serde_json::from_str::<Json>(&whole) else {
+                return End::Lost;
+            };
             match self.message(socket, &message) {
                 Ok(None) => {}
                 Ok(Some(end)) => return end,
@@ -511,7 +567,9 @@ impl Worker {
                 let seed = self
                     .listens
                     .values()
-                    .filter(|l| l.complete && parts.len() > l.path.len() && parts.starts_with(&l.path))
+                    .filter(|l| {
+                        l.complete && parts.len() > l.path.len() && parts.starts_with(&l.path)
+                    })
                     .max_by_key(|l| l.path.len())
                     .map(|l| get_at(&l.value, &parts[l.path.len()..]));
                 let mut listen = Listen {
@@ -557,7 +615,12 @@ impl Worker {
                 if live && let Some(socket) = socket.as_deref_mut() {
                     return self.request(socket, action, body, Pending::Request(done));
                 }
-                self.outbox.push_back(Queued { action, body, done, deadline: Instant::now() + REQUEST_TIMEOUT });
+                self.outbox.push_back(Queued {
+                    action,
+                    body,
+                    done,
+                    deadline: Instant::now() + REQUEST_TIMEOUT,
+                });
             }
         }
         true
@@ -577,14 +640,19 @@ impl Worker {
     fn expire(&mut self) {
         let now = Instant::now();
         while self.outbox.front().is_some_and(|q| q.deadline <= now) {
-            if let Some(Queued { done: Some(done), .. }) = self.outbox.pop_front() {
+            if let Some(Queued {
+                done: Some(done), ..
+            }) = self.outbox.pop_front()
+            {
                 done(Err(DbError::Timeout));
             }
         }
         let late: Vec<u64> = self
             .pending
             .iter()
-            .filter(|(_, (kind, since))| matches!(kind, Pending::Request(_)) && now - *since >= REQUEST_TIMEOUT)
+            .filter(|(_, (kind, since))| {
+                matches!(kind, Pending::Request(_)) && now - *since >= REQUEST_TIMEOUT
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in late {
@@ -631,7 +699,9 @@ impl Worker {
             rest = tail;
         }
         socket.send(Message::text(chunks.len().to_string())).is_ok()
-            && chunks.into_iter().all(|chunk| socket.send(Message::text(chunk)).is_ok())
+            && chunks
+                .into_iter()
+                .all(|chunk| socket.send(Message::text(chunk)).is_ok())
     }
 
     fn request(&mut self, socket: &mut Socket, action: &str, body: Json, pending: Pending) -> bool {
@@ -652,7 +722,12 @@ impl Worker {
         if let Some(listen) = self.listens.get_mut(key) {
             listen.state = ListenState::Sent;
         }
-        self.request(socket, "q", json!({ "p": key, "h": "" }), Pending::Listen(key.to_owned()))
+        self.request(
+            socket,
+            "q",
+            json!({ "p": key, "h": "" }),
+            Pending::Listen(key.to_owned()),
+        )
     }
 
     fn message(&mut self, socket: &mut Socket, message: &Json) -> Result<Option<End>, ()> {
@@ -705,8 +780,16 @@ impl Worker {
         }
         let data = &body["b"];
         match body["a"].as_str() {
-            Some("d") => self.apply(&segments(data["p"].as_str().unwrap_or("")), &data["d"], false),
-            Some("m") => self.apply(&segments(data["p"].as_str().unwrap_or("")), &data["d"], true),
+            Some("d") => self.apply(
+                &segments(data["p"].as_str().unwrap_or("")),
+                &data["d"],
+                false,
+            ),
+            Some("m") => self.apply(
+                &segments(data["p"].as_str().unwrap_or("")),
+                &data["d"],
+                true,
+            ),
             Some("c") => {
                 let key = clean(data["p"].as_str().unwrap_or(""));
                 if let Some(listen) = self.listens.get_mut(&key) {
@@ -716,7 +799,11 @@ impl Worker {
                 }
             }
             Some("ac") => {
-                let reason = data["d"].as_str().or(data["s"].as_str()).unwrap_or("expired").to_owned();
+                let reason = data["d"]
+                    .as_str()
+                    .or(data["s"].as_str())
+                    .unwrap_or("expired")
+                    .to_owned();
                 self.status(&Status::AuthRejected(reason));
             }
             _ => {}
@@ -729,7 +816,9 @@ impl Worker {
             // Boas-vindas: a conexão está pronta. Refaz o login e as escutas e solta o que esperava.
             Some("h") => {
                 if let Some(server) = body["d"]["ts"].as_i64() {
-                    self.shared.offset_ms.store(server - now_ms(), Ordering::Relaxed);
+                    self.shared
+                        .offset_ms
+                        .store(server - now_ms(), Ordering::Relaxed);
                 }
                 self.ready = true;
                 self.shared.connected.store(true, Ordering::Relaxed);
@@ -739,7 +828,12 @@ impl Worker {
                     ok = ok && self.send_listen(socket, &key);
                 }
                 while ok && let Some(queued) = self.outbox.pop_front() {
-                    ok = self.request(socket, queued.action, queued.body, Pending::Request(queued.done));
+                    ok = self.request(
+                        socket,
+                        queued.action,
+                        queued.body,
+                        Pending::Request(queued.done),
+                    );
                 }
                 if !ok {
                     return Err(());
@@ -753,7 +847,10 @@ impl Worker {
             }
             Some("s") => return Ok(Some(End::Lost)),
             Some("p") => {
-                if !self.write(socket, json!({ "t": "c", "d": { "t": "o", "d": {} } }).to_string()) {
+                if !self.write(
+                    socket,
+                    json!({ "t": "c", "d": { "t": "o", "d": {} } }).to_string(),
+                ) {
                     return Err(());
                 }
             }
@@ -856,8 +953,14 @@ mod tests {
 
     #[test]
     fn normalize_turns_lists_into_maps_and_drops_empties() {
-        assert_eq!(normalize(json!(["a", null, "c"])), json!({ "0": "a", "2": "c" }));
-        assert_eq!(normalize(json!({ "a": {}, "b": [null], "c": 1 })), json!({ "c": 1 }));
+        assert_eq!(
+            normalize(json!(["a", null, "c"])),
+            json!({ "0": "a", "2": "c" })
+        );
+        assert_eq!(
+            normalize(json!({ "a": {}, "b": [null], "c": 1 })),
+            json!({ "c": 1 })
+        );
         assert_eq!(normalize(json!({ "a": { "b": null } })), Json::Null);
     }
 

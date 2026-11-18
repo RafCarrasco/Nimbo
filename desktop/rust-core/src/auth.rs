@@ -55,12 +55,19 @@ pub fn dev_credential(name: &str) -> String {
 }
 
 /// Entra com a credencial do Google (`id_token` e, se houver, `access_token`).
-pub fn sign_in_google(project: &Project, id_token: &str, access_token: &str) -> Result<Session, AuthError> {
+pub fn sign_in_google(
+    project: &Project,
+    id_token: &str,
+    access_token: &str,
+) -> Result<Session, AuthError> {
     let mut post = format!("id_token={}&providerId=google.com", encode(id_token));
     if !access_token.is_empty() {
         post.push_str(&format!("&access_token={}", encode(access_token)));
     }
-    let url = format!("{}/v1/accounts:signInWithIdp?key={}", project.identity_base, project.api_key);
+    let url = format!(
+        "{}/v1/accounts:signInWithIdp?key={}",
+        project.identity_base, project.api_key
+    );
     let body = json!({
         "postBody": post,
         "requestUri": "http://localhost",
@@ -68,15 +75,32 @@ pub fn sign_in_google(project: &Project, id_token: &str, access_token: &str) -> 
         "returnIdpCredential": true,
     });
     let reply = call(|agent| agent.post(&url).send_json(&body))?;
-    session(&reply, "localId", "idToken", "refreshToken", "expiresIn", reply["email"].as_str().unwrap_or(""))
+    session(
+        &reply,
+        "localId",
+        "idToken",
+        "refreshToken",
+        "expiresIn",
+        reply["email"].as_str().unwrap_or(""),
+    )
 }
 
 /// Troca o token de renovação por um token novo da mesma conta.
 pub fn refresh(project: &Project, old: &Session) -> Result<Session, AuthError> {
     let url = format!("{}/v1/token?key={}", project.token_base, project.api_key);
-    let form = [("grant_type", "refresh_token"), ("refresh_token", old.refresh_token.as_str())];
+    let form = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", old.refresh_token.as_str()),
+    ];
     let reply = call(|agent| agent.post(&url).send_form(form))?;
-    session(&reply, "user_id", "id_token", "refresh_token", "expires_in", &old.email)
+    session(
+        &reply,
+        "user_id",
+        "id_token",
+        "refresh_token",
+        "expires_in",
+        &old.email,
+    )
 }
 
 /// Volta a entrar com um token de renovação guardado de uma abertura anterior.
@@ -99,11 +123,20 @@ fn session(
     expires: &str,
     email: &str,
 ) -> Result<Session, AuthError> {
-    let text = |key: &str| reply[key].as_str().filter(|v| !v.is_empty()).map(str::to_owned);
-    let (Some(uid), Some(id_token), Some(refresh_token)) = (text(uid), text(token), text(refresh)) else {
+    let text = |key: &str| {
+        reply[key]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let (Some(uid), Some(id_token), Some(refresh_token)) = (text(uid), text(token), text(refresh))
+    else {
         return Err(AuthError::Rejected("resposta sem a conta".into()));
     };
-    let seconds = reply[expires].as_str().and_then(|v| v.parse().ok()).unwrap_or(3600u64);
+    let seconds = reply[expires]
+        .as_str()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600u64);
     Ok(Session {
         uid,
         email: email.to_owned(),
@@ -121,18 +154,28 @@ fn call(
         // Erro do servidor vem com explicação no corpo: lemos em vez de receber só o código.
         .http_status_as_error(false)
         .tls_config(
-            ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build(),
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
         )
         .build()
         .into();
     let mut response = send(&agent).map_err(|e| AuthError::Network(e.to_string()))?;
     let status = response.status();
-    let reply: Json = response.body_mut().read_json().map_err(|e| AuthError::Network(e.to_string()))?;
+    let reply: Json = response
+        .body_mut()
+        .read_json()
+        .map_err(|e| AuthError::Network(e.to_string()))?;
     if status.is_success() {
         return Ok(reply);
     }
-    let message = reply["error"]["message"].as_str().unwrap_or("erro desconhecido");
-    Err(AuthError::Rejected(format!("{message} ({})", status.as_u16())))
+    let message = reply["error"]["message"]
+        .as_str()
+        .unwrap_or("erro desconhecido");
+    Err(AuthError::Rejected(format!(
+        "{message} ({})",
+        status.as_u16()
+    )))
 }
 
 /// Codifica um valor para ir dentro de `chave=valor&...`.
@@ -140,7 +183,9 @@ fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             other => out.push_str(&format!("%{other:02X}")),
         }
     }

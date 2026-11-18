@@ -21,8 +21,14 @@ const WAIT: Duration = Duration::from_secs(8);
 /// papel do proprietário aprovando alguém.
 fn admin(method: &str, path: &str, body: &Json) -> Result<(), AnyError> {
     let project = Project::emulator();
-    let url = format!("http://{}/{path}.json?ns={}", project.db_host, project.db_namespace);
-    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let url = format!(
+        "http://{}/{path}.json?ns={}",
+        project.db_host, project.db_namespace
+    );
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
     let request = ureq::http::Request::builder()
         .method(method)
         .uri(&url)
@@ -42,7 +48,11 @@ fn watch(db: &Db, path: &str) -> Receiver<Event> {
     rx
 }
 
-fn expect(rx: &Receiver<Event>, what: &str, pass: impl Fn(&Event) -> bool) -> Result<Event, AnyError> {
+fn expect(
+    rx: &Receiver<Event>,
+    what: &str,
+    pass: impl Fn(&Event) -> bool,
+) -> Result<Event, AnyError> {
     let until = Instant::now() + WAIT;
     let mut seen = Vec::new();
     while let Ok(event) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
@@ -85,7 +95,12 @@ pub fn run() -> Result<(), AnyError> {
     let (b, db_b) = account(&project, &name_b)?;
     let result = checks(&project, &a, &db_a, &b, &db_b);
     for uid in [&a.uid, &b.uid] {
-        for path in ["community/approved", "community/requests", "community/avatars", "rooms/geral/members"] {
+        for path in [
+            "community/approved",
+            "community/requests",
+            "community/avatars",
+            "rooms/geral/members",
+        ] {
             let _ = admin("DELETE", &format!("{path}/{uid}"), &Json::Null);
         }
     }
@@ -94,8 +109,17 @@ pub fn run() -> Result<(), AnyError> {
     Ok(())
 }
 
-fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> Result<(), AnyError> {
-    if a.uid.is_empty() || a.uid == b.uid || a.email != format!("{}@nimbo.test", a.email.split('@').next().unwrap_or("")) {
+fn checks(
+    project: &Project,
+    a: &Session,
+    db_a: &Db,
+    b: &Session,
+    db_b: &Db,
+) -> Result<(), AnyError> {
+    if a.uid.is_empty()
+        || a.uid == b.uid
+        || a.email != format!("{}@nimbo.test", a.email.split('@').next().unwrap_or(""))
+    {
         return Err("contas de teste inesperadas".into());
     }
     step("login de duas contas de teste no emulador");
@@ -109,16 +133,22 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     let (tx, status) = channel();
     db_a.on_status(move |s| drop(tx.send(s.clone())));
     let until = Instant::now() + WAIT;
-    while status.recv_timeout(until.saturating_duration_since(Instant::now()))? != Status::Connected(true) {}
+    while status.recv_timeout(until.saturating_duration_since(Instant::now()))?
+        != Status::Connected(true)
+    {}
     step("conexão pronta");
-    let drift = (db_a.server_now_ms() - SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64).abs();
+    let drift = (db_a.server_now_ms()
+        - SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64)
+        .abs();
     if drift > 5_000 {
         return Err(format!("relógio do servidor fora: {drift} ms").into());
     }
 
     // Antes de aprovada, a conta lê só a própria aprovação.
     let approval = watch(db_a, &format!("community/approved/{}", a.uid));
-    expect(&approval, "aprovação vazia", |e| *e == Event::Value(Json::Null))?;
+    expect(&approval, "aprovação vazia", |e| {
+        *e == Event::Value(Json::Null)
+    })?;
     let members = watch(db_a, "rooms/geral/members");
     expect(&members, "sala recusada", |e| matches!(e, Event::Denied(_)))?;
     if db_a.get("community/profiles") != Err(DbError::Denied) {
@@ -126,7 +156,10 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     }
     step("leituras recusadas pelas regras chegam como recusa");
 
-    db_a.set(&format!("community/requests/{}", a.uid), json!({ "email": a.email, "createdAt": db_a.server_now_ms() }))?;
+    db_a.set(
+        &format!("community/requests/{}", a.uid),
+        json!({ "email": a.email, "createdAt": db_a.server_now_ms() }),
+    )?;
     if db_a.set(&format!("community/approved/{}", a.uid), json!(true)) != Err(DbError::Denied) {
         return Err("a conta não pode aprovar a si mesma".into());
     }
@@ -136,7 +169,9 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     for uid in [&a.uid, &b.uid] {
         admin("PUT", &format!("community/approved/{uid}"), &json!(true))?;
     }
-    expect(&approval, "aprovação", |e| *e == Event::Value(json!(true)))?;
+    expect(&approval, "aprovação", |e| {
+        *e == Event::Value(json!(true))
+    })?;
     db_a.retry_denied();
     expect(&members, "sala liberada", |e| matches!(e, Event::Value(_)))?;
     step("mudança feita por outra conexão chega; leitura recusada volta depois de liberada");
@@ -144,10 +179,21 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     // Presença: A entra na sala e pede ao servidor para tirá-la se a conexão cair.
     let me = format!("rooms/geral/members/{}", a.uid);
     db_a.on_disconnect_remove(&me)?;
-    db_a.set(&me, json!({ "joinedAt": db_a.server_now_ms(), "app": "nimbo-core", "sid": "teste" }))?;
-    expect(&members, "a própria gravação de volta", |e| matches!(e, Event::Value(v) if v[&a.uid]["sid"] == "teste"))?;
+    db_a.set(
+        &me,
+        json!({ "joinedAt": db_a.server_now_ms(), "app": "nimbo-core", "sid": "teste" }),
+    )?;
+    expect(
+        &members,
+        "a própria gravação de volta",
+        |e| matches!(e, Event::Value(v) if v[&a.uid]["sid"] == "teste"),
+    )?;
     let seen_by_b = watch(db_b, "rooms/geral/members");
-    expect(&seen_by_b, "B vê A na sala", |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "nimbo-core"))?;
+    expect(
+        &seen_by_b,
+        "B vê A na sala",
+        |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "nimbo-core"),
+    )?;
     step("a própria gravação volta do servidor e a outra conta vê");
 
     // Várias gravações de uma vez, e uma leitura única.
@@ -169,11 +215,24 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
 
     // Queda da conexão: o servidor tira A da sala, e A volta sozinha a acompanhar o que acompanhava.
     db_a.debug_drop_connection();
-    expect(&seen_by_b, "A some da sala", |e| matches!(e, Event::Value(v) if v[&a.uid].is_null()))?;
+    expect(
+        &seen_by_b,
+        "A some da sala",
+        |e| matches!(e, Event::Value(v) if v[&a.uid].is_null()),
+    )?;
     let until = Instant::now() + WAIT;
-    while status.recv_timeout(until.saturating_duration_since(Instant::now()))? != Status::Connected(true) {}
-    db_b.set(&format!("rooms/geral/members/{}", b.uid), json!({ "joinedAt": db_b.server_now_ms() }))?;
-    expect(&members, "A, reconectada, vê B", |e| matches!(e, Event::Value(v) if v[&b.uid].is_object()))?;
+    while status.recv_timeout(until.saturating_duration_since(Instant::now()))?
+        != Status::Connected(true)
+    {}
+    db_b.set(
+        &format!("rooms/geral/members/{}", b.uid),
+        json!({ "joinedAt": db_b.server_now_ms() }),
+    )?;
+    expect(
+        &members,
+        "A, reconectada, vê B",
+        |e| matches!(e, Event::Value(v) if v[&b.uid].is_object()),
+    )?;
     step("queda: o servidor remove a presença, a conexão volta e as escutas continuam");
 
     db_b.remove(&format!("rooms/geral/members/{}", b.uid))?;
@@ -182,7 +241,11 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     // tira a sessão antiga; sair remove a presença.
     let room = Room::join(db_a, &a.uid, "competitivo", "teste (nativo)", || {})?;
     let in_room = watch(db_b, "rooms/competitivo/members");
-    expect(&in_room, "B vê A no canal, com a versão do app", |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "teste (nativo)" && v[&a.uid]["joinedAt"].is_number()))?;
+    expect(
+        &in_room,
+        "B vê A no canal, com a versão do app",
+        |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "teste (nativo)" && v[&a.uid]["joinedAt"].is_number()),
+    )?;
     if !room.snapshot().joined || room.snapshot().issue.is_some() {
         return Err("a sala deveria estar aberta e sem problema".into());
     }
@@ -196,9 +259,17 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
         std::thread::sleep(Duration::from_millis(50));
     }
     room.leave();
-    expect(&in_room, "a presença continua sendo da sessão nova", |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "outra sessão"))?;
+    expect(
+        &in_room,
+        "a presença continua sendo da sessão nova",
+        |e| matches!(e, Event::Value(v) if v[&a.uid]["app"] == "outra sessão"),
+    )?;
     second.leave();
-    expect(&in_room, "A some do canal ao sair", |e| matches!(e, Event::Value(v) if v[&a.uid].is_null()))?;
+    expect(
+        &in_room,
+        "A some do canal ao sair",
+        |e| matches!(e, Event::Value(v) if v[&a.uid].is_null()),
+    )?;
     other.close();
     step("sala: entrar, ser trocada por outra sessão da mesma conta e sair");
 
@@ -207,7 +278,14 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     let room_a = Room::join(db_a, &a.uid, "competitivo", "teste (nativo)", || {})?;
     let room_b = Room::join(db_b, &b.uid, "competitivo", "teste (nativo)", || {})?;
     room_b.publish_stream("screen", "tela-de-b", true)?;
-    let live_of_b = || room_a.snapshot().broadcasts.get(&b.uid).and_then(|kinds| kinds.get("screen")).cloned();
+    let live_of_b = || {
+        room_a
+            .snapshot()
+            .broadcasts
+            .get(&b.uid)
+            .and_then(|kinds| kinds.get("screen"))
+            .cloned()
+    };
     wait_until("A vê a live nativa de B", || {
         live_of_b().is_some_and(|live| live.native && live.sound && live.stream_id == "tela-de-b")
     })?;
@@ -216,7 +294,13 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
         return Err(format!("anúncio da live fora do formato do site: {announced}").into());
     }
     let (tx, sent) = channel();
-    room_a.send_native_offer(&b.uid, "screen", "v=0 oferta de teste", "codigo-1", move |result| drop(tx.send(result)));
+    room_a.send_native_offer(
+        &b.uid,
+        "screen",
+        "v=0 oferta de teste",
+        "codigo-1",
+        move |result| drop(tx.send(result)),
+    );
     sent.recv_timeout(WAIT)??;
     let mut got = Vec::new();
     wait_until("a oferta chega na caixa de B", || {
@@ -234,13 +318,20 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
         return Err(format!("sinal inesperado: {got:?}").into());
     }
     wait_until("a mensagem entregue é apagada", || {
-        db_b.get(&format!("rooms/competitivo/signals/{}", b.uid)).is_ok_and(|inbox| inbox.is_null())
+        db_b.get(&format!("rooms/competitivo/signals/{}", b.uid))
+            .is_ok_and(|inbox| inbox.is_null())
     })?;
     if !room_b.take_signals().is_empty() {
         return Err("a mesma mensagem foi entregue duas vezes".into());
     }
     let (tx, sent) = channel();
-    room_b.send_native_answer(&a.uid, "screen", "v=0 resposta de teste", "codigo-1", move |result| drop(tx.send(result)));
+    room_b.send_native_answer(
+        &a.uid,
+        "screen",
+        "v=0 resposta de teste",
+        "codigo-1",
+        move |result| drop(tx.send(result)),
+    );
     sent.recv_timeout(WAIT)??;
     wait_until("a resposta chega na caixa de A", || {
         got = room_a.take_signals();
@@ -261,12 +352,16 @@ fn checks(project: &Project, a: &Session, db_a: &Db, b: &Session, db_b: &Db) -> 
     // Queda de quem transmite: o servidor tira a live, e ela é reanunciada quando a conexão volta.
     db_b.debug_drop_connection();
     wait_until("a live de B some na queda", || live_of_b().is_none())?;
-    wait_until("a live de B volta, reanunciada", || live_of_b().is_some_and(|live| live.stream_id == "tela-de-b"))?;
+    wait_until("a live de B volta, reanunciada", || {
+        live_of_b().is_some_and(|live| live.stream_id == "tela-de-b")
+    })?;
     wait_until("B conta a reconexão", || room_b.snapshot().reconnects == 1)?;
     room_b.unpublish_stream("screen");
     wait_until("a live de B some ao ser retirada", || live_of_b().is_none())?;
     room_b.publish_stream("screen", "tela-de-b-2", false)?;
-    wait_until("a live nova de B aparece, sem som", || live_of_b().is_some_and(|live| live.stream_id == "tela-de-b-2" && !live.sound))?;
+    wait_until("a live nova de B aparece, sem som", || {
+        live_of_b().is_some_and(|live| live.stream_id == "tela-de-b-2" && !live.sound)
+    })?;
     room_b.leave();
     wait_until("sair do canal tira a live", || live_of_b().is_none())?;
     room_a.leave();
