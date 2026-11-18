@@ -387,17 +387,17 @@ Peças novas:
 
 | # | Entrega | Estado |
 |---|---|---|
-| N1 | Cliente do banco e login no miolo | **Feito**: `nimbo-core selftest`, 13 passos contra o emulador com as regras de verdade |
-| N2 | Modelo da comunidade (níveis, cargos, quem vê o quê, presença) | **Feito**: conferido com 5 contas (proprietário, administrador, um membro de cada grupo, conta sem aprovação) |
+| N1 | Cliente do banco e login no miolo | **Feito**: `nimbo-core selftest`, 17 passos contra o emulador com as regras de verdade (desde 17/11/2026 também plateia, prévia e administração) |
+| N2 | Modelo da comunidade (níveis, cargos, quem vê o quê, presença) | **Feito**: conferido com 5 contas (proprietário, administrador, um membro de cada grupo, conta sem aprovação). Desde 17/11/2026 cargos são segredo do proprietário: quem não é proprietário não acompanha `roleDefs/{id}` nem `roleMembers/{id}` e não recebe nome, cor nem cadeado de cargo (conferido no `selftest` e nas fotos) |
 | N3 | Janela: entrada, espera de aprovação, barra lateral, tela inicial | **Feito**, só com contas de teste do emulador; comparado com o site na mesma conta |
 | N4 | Entrar e sair de canal | **Feito**: aparece para os outros com a versão do app, some ao fechar, e a sessão antiga sai quando a mesma conta entra em outro lugar |
 | N5 | Player: receber, decodificar e tocar a live | **Feito** (`nimbo_media::viewer`). Contra o servidor de teste do motor, na mesma máquina: 48 q/s recebidos, decodificados e desenhados, sem perda; 0,17 ms por quadro sem cópia e 1,55 ms com a cópia para a memória; 3,3% e 7,3% de um núcleo; 71 e 92 MB. Não testado com perda de rede, fora da rede local, nem em placa Intel/AMD |
-| N6 | Sinalização das lives no miolo (`native.ts` e o resto de `room.ts`) | **Feito para lives nativas** (as do motor), nos dois sentidos, no formato do site: anúncio da live, oferta com código, resposta com o mesmo código, cada mensagem entregue uma vez e apagada, live reanunciada depois de uma queda. Conferido no `selftest` e entre dois apps nativos. **Não testado contra o site nem contra o app atual.** Falta atender as lives de navegador (N10) |
-| N7 | Assistir dentro do app nativo (palco, várias lives, tela cheia) | **Feito o essencial**: as lives nativas abrem no palco (sozinhas ao entrar, pelo nome na barra ou pela etiqueta do topo), uma ou várias em grade, com som; "conectando", "não conectou" e "Tentar de novo". Falta: volume por live e silenciar, tela cheia, destaque de uma live, diagnóstico, servidor de retransmissão (TURN) |
-| N8 | Transmitir tela pelo motor, com o seletor | **Feito o essencial**: botão "Tela" abre a lista de telas e janelas (sem miniaturas), o motor captura e responde a cada pessoa que pede para assistir, "Encerrar" e sair do canal acabam com a live, e ela acaba sozinha se a janela fecha. O clique no seletor não foi testado (os testes começam a live por argumento). Falta: prévia da própria live, qualidade e som à escolha, trocar de fonte sem encerrar, pausa quando o jogo sai da frente |
+| N6 | Sinalização das lives no miolo (`native.ts` e o resto de `room.ts`) | **Feito para lives nativas** (as do motor), nos dois sentidos, no formato do site: anúncio da live (com `startedAt` na hora do servidor e `game`), oferta com código, resposta com o mesmo código, cada mensagem entregue uma vez e apagada, live reanunciada depois de uma queda; plateia (`watching/`) e prévias (`previews/`). Conferido no `selftest`, entre apps nativos e (a live) contra o site e o app atual em 15/11. Plateia e prévias **não foram conferidas com o site lendo** (o formato é o mesmo, conferido byte a byte no `selftest`). Falta atender as lives de navegador (N10) |
+| N7 | Assistir dentro do app nativo (palco, várias lives, tela cheia) | **Feito**: as lives nativas abrem no palco (sozinhas ao entrar, pelo nome na barra ou pela etiqueta do topo), uma ou várias em grade, com som; "conectando", "não conectou" e "Tentar de novo". Desde 17/11/2026: tempo no ar, jogo, plateia (olho com número e nomes), "1032p · 60 fps", cartões "Ao vivo agora" com a prévia, prévia ao parar o mouse em quem está ao vivo na barra, aviso "Fulano começou uma live" com Assistir, tela cheia por duplo clique ou botão (Esc sai). A tela cheia de verdade (sem borda, cobrindo o monitor) **não foi testada**: os testes usam `--fullscreen-in-window` para não cobrir a tela de quem usa. Falta: volume por live e silenciar, destaque de uma live, diagnóstico, servidor de retransmissão (TURN) |
+| N8 | Transmitir tela pelo motor, com o seletor | **Feito o essencial**: botão "Tela" abre a lista de telas e janelas (sem miniaturas), o motor captura e responde a cada pessoa que pede para assistir, "Encerrar" e sair do canal acabam com a live, e ela acaba sozinha se a janela fecha. O clique no seletor não foi testado (os testes começam a live por argumento). Desde 17/11/2026: prévia da própria live gravada no canal (3 s depois de começar e a cada 45 s; 16 a 20 ms por foto) e mostrada no próprio ladrilho; som padrão do seletor igual ao do site (só o do programa escolhido; na tela inteira, o do computador menos o do Nimbo), **sem teste com som de jogo de verdade**. Falta: qualidade e som à escolha, trocar de fonte sem encerrar, pausa quando o jogo sai da frente |
 | N9 | Login de verdade do Google e sessão guardada entre aberturas | **Feito no emulador**: o app abre a página `/desktop-login` no navegador (mesmo módulo do app atual), recebe a credencial, e ao reabrir entra sozinho com a sessão guardada (cifrada pelo Windows, DPAPI). Falta um login real do Google (`--production`), que só o dono pode fazer |
 | N10 | Webcam (enviar) e lives vindas de navegador (receber) | Falta |
-| N11 | Apelido, perfil e foto; administração (no app ou só pelo site) | Falta |
+| N11 | Apelido, perfil e foto; administração (no app ou só pelo site) | **Administração feita** (17/11/2026), igual ao site: menu do botão direito na pessoa (cargos, nível, revogar, remover sessão), no canal e na categoria; janela de configurações (Visão geral, Permissões, Excluir, barra de alterações não salvas); "Gerenciar comunidade" com Solicitações, Membros, Cargos (editor no estilo do Discord) e Canais. Fotos de perfil aparecem (data URL e Google). Clicado de verdade (roteiro `--clicks`) e conferido no banco: dar cargo pelo menu, salvar cargos e nível do canal, aprovar já num cargo, criar e renomear cargo, pôr pessoa no cargo, criar e excluir canal, remover sessão. Falta: apelido e foto (editar), aba Rede e quem pode configurar a rede |
 | N12 | Atualização automática, instalador, instância única | Falta |
 | N13 | Troca: o nativo vira o Nimbo | Falta (só com o OK do dono) |
 
@@ -412,6 +412,35 @@ Medido em 15/11/2026 (i5-14600KF + RTX 5070), app nativo parado na tela inicial,
 A memória ficou menor que a do app atual, mas longe de "leve": quase tudo é da placa de vídeo (o driver e o
 wgpu), não da interface. Fica para otimizar depois que o player entrar, porque é ele que decide como a placa
 é usada. Ainda não mede nada de vídeo.
+
+### Recursos de live e cargos no app nativo (medido em 17/11/2026)
+
+Emulador próprio (banco 9001, login 9098) com as regras do repositório, 4 apps nativos na mesma máquina
+(i5-14600KF + RTX 5070), compilados em modo otimizado, janela de teste com movimento (1920x1032, fora da
+tela). Bia transmite; Caio e Ana já estavam no canal; o Dono entra e abre tudo.
+
+| Medida | Resultado |
+| --- | --- |
+| Prévia da própria live (foto pelo GDI, JPEG, base64) | 20,2 ms a primeira e 15,7 ms a segunda; 12823 e 10827 caracteres (limite 14000); uma a cada 45 s, ou seja, perto de 0,04% de um núcleo |
+| Quem assiste (Dono, uma live) | 60 quadros por segundo recebidos, decodificados e desenhados, "1032p · 60 fps" no ladrilho, 7,0% a 8,6% de um núcleo |
+| Plateia | o olho mostrou 1 e depois 2 pessoas nos ladrilhos e nos cartões, com os nomes ao passar o mouse |
+| Aviso de live nova | Caio (já no canal) recebeu "Bia começou uma live" com Assistir; Ana (idem) viu o cartão com a prévia de verdade |
+| Prévia na barra | Ana, fora do canal, parou o mouse na Bia: a foto apareceu ao lado da barra (lida uma vez do banco) |
+| Tela cheia | duplo clique abriu a live sozinha na janela; Esc voltou para o palco |
+
+Cargos e permissões, clicados pelo roteiro `--clicks` (cliques e teclas entram no egui como se fossem
+do mouse) e conferidos no banco por leitura direta: dar cargo pelo menu (as duas gravações,
+`memberRoles` e `roleMembers`), marcar cargo num canal e salvar, administrador mudar o nível mínimo e
+salvar, aprovar uma solicitação já num cargo, criar cargo, renomear e trocar a cor, pôr uma pessoa no
+cargo pela busca, criar canal pela caixa de nome, excluir canal pela confirmação, remover sessão sem
+perfil, e fechar a janela com alteração pendente (pede confirmação). O que o administrador não pode, o
+banco recusa (no `selftest`): dar cargo, promover alguém, pôr "só o proprietário", marcar cargo,
+aprovar, editar canal que não vê.
+
+Não testado: o site lendo a plateia e as prévias gravadas pelo nativo (e o contrário); a tela cheia que
+cobre o monitor; som de jogo de verdade no padrão novo; escala de tela diferente de 100%; as regras
+endurecidas do site (`roleDefs` e `roleMembers` só para o proprietário), que o nativo já não lê para quem
+não é proprietário.
 
 ### Live nativa de ponta a ponta (medido em 15/11/2026)
 
@@ -485,8 +514,14 @@ pedido (os testes usam fora da tela); `--stats` imprime os números a cada 2 s; 
 pela conversão na CPU. Outro par de emuladores (para dois testes não dividirem o banco) entra por
 `NIMBO_EMULATOR_DB` e `NIMBO_EMULATOR_AUTH` (`host:porta`).
 
+Telas abertas sem clicar, para fotos de teste: `--open-admin solicitacoes|membros|cargos|canais`,
+`--open-role <nome do cargo>` com `--role-tab exibicao|acesso|membros`, `--open-settings canal:<id ou
+nome>[:permissoes]` (ou `categoria:`), `--open-menu <nome da pessoa | sem-perfil>`, `--no-auto-open`
+(para ver os cartões) e `--fullscreen-in-window`. `--clicks "1500:dir:78,173;2500:esq:297,377"` clica e
+digita sozinho (`esq`, `dir`, `duplo`, `mover`, `tecla:Enter`, `texto:...`, `tudo`).
+
 `--dev-user nome` entra na mesma conta que `?devUser=nome` no site. O que ainda não existe no nativo não faz
-nada ao clicar (perfil, administração, criar canal).
+nada ao clicar (editar o perfil).
 
 Banco de verdade: `nimbo-core probe` abre a conexão sem conta nenhuma (não lê nem grava nada). Em 15/11/2026
 conectou em 0,5 s e a leitura sem login foi recusada pelas regras, como deve ser; o relógio do servidor estava

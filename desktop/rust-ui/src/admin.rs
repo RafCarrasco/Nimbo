@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use egui::{Align2, Color32, CursorIcon, Rect, Sense, Ui, pos2, vec2};
 use lucide_icons::Icon;
 use nimbo_core::admin::{ROLE_SLOTS, is_system_channel, role_name_error, valid_color};
-use nimbo_core::community::{DEFAULT_CATEGORY, Level, Snapshot};
+use nimbo_core::community::{DEFAULT_CATEGORY, Level, RoleDef, Snapshot};
 
 use crate::dialogs::{Dialog, Then};
 use crate::images::Images;
@@ -654,9 +654,37 @@ impl Admin {
             theme::bold(10.5),
             theme::MUTED,
         );
-        let mut y = create.bottom() + 36.0;
-        for (id, def) in &roles {
-            let row = Rect::from_min_size(pos2(list.left(), y), vec2(list.width() - 12.0, 34.0));
+        let y = create.bottom() + 36.0;
+        // A lista rola quando os cargos não cabem na altura.
+        let rows = Rect::from_min_max(pos2(list.left(), y), pos2(list.right(), list.bottom()));
+        let mut rows_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rows)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("lista-de-cargos")
+            .auto_shrink([false, false])
+            .show(&mut rows_ui, |ui| self.role_rows(ui, data, &roles));
+        if roles.is_empty() {
+            let hint = painter.layout(
+                "Cargos são grupos de amigos que não se enxergam. Crie um, coloque as pessoas e marque o que ele vê.".to_owned(),
+                theme::regular(12.5),
+                theme::MUTED,
+                list.width() - 16.0,
+            );
+            painter.galley(pos2(list.left() + 4.0, y + 4.0), hint, theme::MUTED);
+        }
+        self.role_editor(ui, area, list, data, images, actions);
+    }
+
+    /// Linhas da lista de cargos (bolinha, nome e quantas pessoas), dentro da rolagem.
+    fn role_rows(&mut self, ui: &mut Ui, data: &Snapshot, roles: &[(&String, &RoleDef)]) {
+        let painter = ui.painter().clone();
+        for (id, def) in roles {
+            let (row, _) =
+                ui.allocate_exact_size(vec2(ui.available_width() - 12.0, 34.0), Sense::hover());
+            ui.add_space(2.0);
             let response = ui.interact(
                 row,
                 ui.scope_id().with(("cargo-lista", *id)),
@@ -705,19 +733,21 @@ impl Admin {
                 self.role = Some((*id).clone());
                 self.draft = None;
             }
-            y += 36.0;
         }
-        if roles.is_empty() {
-            let hint = painter.layout(
-                "Cargos são grupos de amigos que não se enxergam. Crie um, coloque as pessoas e marque o que ele vê.".to_owned(),
-                theme::regular(12.5),
-                theme::MUTED,
-                list.width() - 16.0,
-            );
-            painter.galley(pos2(list.left() + 4.0, y + 4.0), hint, theme::MUTED);
-        }
-        painter.vline(list.right(), list.y_range(), (1.0, theme::BORDER));
-        // Editor à direita.
+    }
+
+    /// Editor do cargo selecionado, à direita da lista.
+    fn role_editor(
+        &mut self,
+        ui: &mut Ui,
+        area: Rect,
+        list: Rect,
+        data: &Snapshot,
+        images: &mut Images,
+        actions: &mut Vec<Action>,
+    ) {
+        ui.painter()
+            .vline(list.right(), list.y_range(), (1.0, theme::BORDER));
         let editor = Rect::from_min_max(pos2(list.right() + 24.0, area.top()), area.max);
         let Some(id) = self.role.clone() else { return };
         let Some(def) = data.role_defs.get(&id).cloned() else {
