@@ -7,49 +7,66 @@ export const DEFAULT_CATEGORIES: Record<string, Category> = {
 };
 // Categorias e canais são lidos um a um a partir de um índice só com ids: os que a pessoa não pode
 // ver são recusados pelo servidor e simplesmente não aparecem.
+//
+// A leitura fica no ar enquanto a pessoa está no app. Quando cargos ou permissões mudam, `retry` pede
+// de novo só o que tinha sido recusado (pode ter sido liberado agora). O que já estava carregado não
+// é desligado: refazer tudo do zero deixava a lista por um instante só com os canais padrão, e quem
+// estava num canal criado era tirado dele (medido em 17/11/2026: dar um cargo derrubava todo mundo).
+export type IndexedWatch = { off: () => void; retry: () => void };
 function watchIndexed<T>(
   index: string,
   items: string,
   base: Record<string, T>,
   cb: (v: Record<string, T>) => void,
-) {
+): IndexedWatch {
   const loaded: Record<string, T> = {};
   const subs = new Map<string, () => void>();
-  const emit = () => cb({ ...base, ...loaded });
+  let ids: string[] = [];
+  let closed = false;
+  const emit = () => !closed && cb({ ...base, ...loaded });
+  const attach = (id: string) =>
+    subs.set(
+      id,
+      onValue(
+        ref(db, `${items}/${id}`),
+        (item) => {
+          if (item.exists()) loaded[id] = item.val();
+          else delete loaded[id];
+          emit();
+        },
+        // Recusado (sem acesso, ou o acesso acabou): sai da lista e pode ser pedido de novo em retry.
+        () => {
+          subs.delete(id);
+          delete loaded[id];
+          emit();
+        },
+      ),
+    );
   const offIndex = onValue(
     ref(db, index),
     (snap) => {
-      const ids = Object.keys(snap.val() || {});
+      ids = Object.keys(snap.val() || {});
       for (const [id, off] of subs)
         if (!ids.includes(id)) {
           off();
           subs.delete(id);
           delete loaded[id];
         }
-      for (const id of ids)
-        if (!subs.has(id))
-          subs.set(
-            id,
-            onValue(
-              ref(db, `${items}/${id}`),
-              (item) => {
-                if (item.exists()) loaded[id] = item.val();
-                else delete loaded[id];
-                emit();
-              },
-              () => {
-                delete loaded[id];
-                emit();
-              },
-            ),
-          );
+      for (const id of ids) if (!subs.has(id)) attach(id);
       emit();
     },
     () => emit(),
   );
-  return () => {
-    offIndex();
-    subs.forEach((off) => off());
+  return {
+    off: () => {
+      closed = true;
+      offIndex();
+      subs.forEach((off) => off());
+      subs.clear();
+    },
+    retry: () => {
+      for (const id of ids) if (!subs.has(id)) attach(id);
+    },
   };
 }
 

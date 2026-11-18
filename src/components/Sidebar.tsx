@@ -14,6 +14,8 @@ import { Avatar } from './Avatar';
 import { categoryAllowed, channelAllowed, isStaff, loadPreviews, type AccessLevel } from '../community';
 import { validPreview } from '../live/preview';
 import type { CommunityData, RoomPresence } from '../hooks/useCommunity';
+import type { SettingsTarget } from './ChannelSettings';
+import type { MenuTarget } from './Menus';
 
 const COLLAPSE_KEY = 'nimbo.collapsed';
 
@@ -51,7 +53,8 @@ export function Sidebar({
   onJoin,
   onWatch,
   onOpenAdmin,
-  onPermission,
+  onSettings,
+  onMenu,
   onCreateChannel,
   onRemoveSession,
   footer,
@@ -65,7 +68,9 @@ export function Sidebar({
   onJoin: (channelId: string) => void;
   onWatch: (channelId: string, memberId: string) => void;
   onOpenAdmin: () => void;
-  onPermission: (target: { kind: 'category' | 'channel'; id: string }) => void;
+  onSettings: (target: SettingsTarget) => void;
+  // Botão direito numa pessoa, canal ou categoria.
+  onMenu: (event: React.MouseEvent, target: MenuTarget) => void;
   onCreateChannel: (categoryId: string) => void;
   onRemoveSession: (channelId: string, memberId: string) => void;
   footer: React.ReactNode;
@@ -103,6 +108,7 @@ export function Sidebar({
   const categories = Object.entries(data.categories).sort((a, b) => a[1].order - b[1].order);
   // Texto do cadeado. O proprietário vê todos os cargos; os demais só conhecem o nome dos que têm.
   const restrictedLabel = (level?: AccessLevel, roleIds?: string[]) => {
+    if (!owner) return '';
     const names = (roleIds || []).map((r) => data.roleDefs[r]?.name || (owner ? 'removido' : '')).filter(Boolean);
     return [
       level === 'owner' ? 'Somente proprietário' : level === 'admin' ? 'Somente administradores' : '',
@@ -113,6 +119,7 @@ export function Sidebar({
   };
   // Cor do primeiro cargo da pessoa, como no Discord.
   const colorOf = (memberId: string) => {
+    if (!owner) return undefined;
     const first = Object.keys(data.memberRoles[memberId] || {}).find((r) => data.roleDefs[r]);
     return first ? data.roleDefs[first].color : undefined;
   };
@@ -150,7 +157,10 @@ export function Sidebar({
           );
           return (
             <div className="category" key={categoryId}>
-              <div className="category-row">
+              <div
+                className="category-row"
+                onContextMenu={(e) => staff && onMenu(e, { kind: 'category', id: categoryId })}
+              >
                 <button
                   className="category-toggle"
                   aria-expanded={!isCollapsed}
@@ -172,9 +182,9 @@ export function Sidebar({
                     </button>
                     <button
                       className="icon-button tiny"
-                      title={'Permissões de ' + category.name}
-                      aria-label={'Permissões de ' + category.name}
-                      onClick={() => onPermission({ kind: 'category', id: categoryId })}
+                      title={'Editar categoria ' + category.name}
+                      aria-label={'Editar categoria ' + category.name}
+                      onClick={() => onSettings({ kind: 'category', id: categoryId })}
                     >
                       <Settings size={13} />
                     </button>
@@ -199,6 +209,7 @@ export function Sidebar({
                         className={
                           'channel-row' + (room === id ? ' active' : '') + (allowed ? '' : ' locked')
                         }
+                        onContextMenu={(e) => staff && onMenu(e, { kind: 'channel', id })}
                       >
                         <button
                           className="channel-button"
@@ -221,9 +232,9 @@ export function Sidebar({
                         {staff && (
                           <button
                             className="icon-button tiny row-actions"
-                            title={'Permissões do canal ' + channel.name}
-                            aria-label={'Permissões do canal ' + channel.name}
-                            onClick={() => onPermission({ kind: 'channel', id })}
+                            title={'Editar canal ' + channel.name}
+                            aria-label={'Editar canal ' + channel.name}
+                            onClick={() => onSettings({ kind: 'channel', id })}
                           >
                             <Settings size={13} />
                           </button>
@@ -238,7 +249,13 @@ export function Sidebar({
                             const kinds = streams[memberId] || {};
                             const stream = Boolean(kinds.screen || kinds.camera);
                             return (
-                              <li key={memberId}>
+                              <li
+                                key={memberId}
+                                onContextMenu={(e) => {
+                                  hover(null);
+                                  onMenu(e, { kind: 'member', memberId, channelId: id, live: stream && allowed });
+                                }}
+                              >
                                 <button
                                   className={'participant' + (stream ? ' is-live' : '')}
                                   disabled={!stream || !allowed}
