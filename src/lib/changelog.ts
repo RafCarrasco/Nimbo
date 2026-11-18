@@ -4,6 +4,16 @@ export type Release = { version: string; date: string; items: string[] };
 
 export const CHANGELOG: Release[] = [
   {
+    version: '0.5.7',
+    date: '18/11/2026',
+    items: [
+      'Transmitir a tela inteira com o som do computador não leva mais as vozes da chamada: o som do Discord, TeamSpeak, Teams, Zoom e parecidos fica de fora da live, como no Discord.',
+      'Cargos no estilo do Discord: botão direito na pessoa para dar cargo, janela de configurações do canal e da categoria, e um editor de cargos. Só o dono vê os cargos.',
+      'Dar ou tirar um cargo não derruba mais quem está nas lives.',
+      'O aviso de versão nova confere a atualização do app na hora, e o botão de atualizar não fica mais parado sem fazer nada.',
+    ],
+  },
+  {
     version: '0.5.6',
     date: '15/11/2026',
     items: [

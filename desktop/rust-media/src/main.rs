@@ -3,9 +3,9 @@
 //!
 //!   nimbo-media capture [segundos]            mede quadros por segundo e CPU só da captura
 //!   nimbo-media encode  [segundos] [arquivo]  captura + codifica em H.264 para um .mp4
-//!   nimbo-media serve   [porta] [exclude|include <pid>]
+//!   nimbo-media serve   [porta] [exclude|include|system <pid>]
 //!                                             envia a tela por WebRTC para navegadores; com
-//!                                             `exclude`/`include`, envia também o som
+//!                                             `exclude`/`include`/`system`, envia também o som
 //!   nimbo-media hw [s] [largura] [altura] [fps] codifica pela placa direto na GPU e mede
 
 mod hwbench;
@@ -131,7 +131,8 @@ fn main() -> Result<(), AnyError> {
             (None, _) => None,
             (Some("exclude"), Some(pid)) => Some(AudioSource::Exclude(pid)),
             (Some("include"), Some(pid)) => Some(AudioSource::Include(pid)),
-            _ => return Err("áudio: use `exclude <pid>` ou `include <pid>`".into()),
+            (Some("system"), Some(own)) => Some(AudioSource::SystemExcept { own }),
+            _ => return Err("áudio: use `exclude|include|system <pid>`".into()),
         };
         return serve::run(port, audio);
     }

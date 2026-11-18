@@ -314,6 +314,8 @@ mod tests {
         assert!(expected.insert("media"));
         // Versão do app em Rust (o Electron informa a dele pelo user agent).
         assert!(expected.insert("appVersion"));
+        // Conferir atualização na hora (update.rs): o app em Electron não recebe mais versão nova.
+        assert!(expected.insert("checkUpdate"));
         assert_eq!(keys(object, "    "), expected);
 
         // Mesma versão de contrato que o Electron expõe.

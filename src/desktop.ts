@@ -30,7 +30,10 @@ type DesktopBridge = {
   onAudio(id: string, onData: (chunk: Uint8Array) => void, onEnd: (error: string) => void): () => void;
   // A partir do app 0.3.2: aviso de atualização baixada, mostrado pelo site.
   watchUpdate?(onReady: (info: { version: string }) => void): Promise<Result<{ version: string } | null>>;
-  installUpdate?(): Promise<void>;
+  // App em Rust: `false` quando não havia atualização baixada para instalar. Electron: nada.
+  installUpdate?(): Promise<Result<boolean> | void>;
+  // App em Rust 0.5.7+: confere agora e devolve a versão baixada, se houver.
+  checkUpdate?(): Promise<Result<{ version: string } | null>>;
   // A partir do app 0.3.8: progresso do download da atualização (0 a 100).
   onUpdateProgress?(onProgress: (percent: number) => void): () => void;
   // A partir do app 0.3.4: avisa quando o jogo transmitido sai ou volta para a frente.

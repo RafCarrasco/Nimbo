@@ -807,6 +807,10 @@ h2 {
   font-weight: 800;
   letter-spacing: 0.05em;
 }
+.update-problem {
+  color: #ffb4bd;
+  font-size: 12.5px;
+}
 .toast-action {
   flex: none;
   padding: 5px 12px;
