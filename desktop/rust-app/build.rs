@@ -15,6 +15,7 @@ fn main() {
         "media_icon",
         "watch_update",
         "install_update",
+        "check_update",
     ]);
     let attributes = tauri_build::Attributes::new().app_manifest(commands);
     if let Err(e) = tauri_build::try_build(attributes) {

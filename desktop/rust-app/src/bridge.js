@@ -38,6 +38,8 @@
       return invoke('watch_update', { events: updates.channel });
     },
     installUpdate: () => invoke('install_update'),
+    // Confere agora (o site viu que saiu versão nova) e devolve a versão baixada, se houver.
+    checkUpdate: () => invoke('check_update'),
     onUpdateProgress: (onProgress) => {
       updates.progress.add(onProgress);
       return () => updates.progress.delete(onProgress);
