@@ -496,6 +496,11 @@ Compatibilidade com o site e com o app atual, conferida em 15/11/2026 no emulado
 
 Tudo na mesma máquina. Duas máquinas, internet e perda de rede continuam sem teste.
 
+Conferido em 17/11/2026 com as regras de cargo endurecidas (nome, cor e membros de cargo só o proprietário lê):
+`nimbo-core selftest` passa nos 17 passos; o site, assistindo a uma live transmitida pelo app nativo, mostrou o cartão
+com a prévia gravada pelo nativo (12 mil caracteres, 11 ms para tirar) e o tempo no ar, recebeu 1920x1032 a 60 quadros
+por segundo, e a plateia gravada pelo site (`watching`) ficou no formato que o nativo lê.
+
 Como rodar (emuladores; `--production` fala com o Firebase de verdade e ainda está em validação):
 
 ```

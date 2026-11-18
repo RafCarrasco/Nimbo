@@ -1206,16 +1206,10 @@ impl Nimbo {
                         .and_then(|id| data.channels.get(id))
                         .map_or(String::new(), |c| format!("No canal {}", c.name))
                 };
-                let tags = data
-                    .roles_of(uid)
-                    .into_iter()
-                    .map(|(_, def)| {
-                        (
-                            def.name.clone(),
-                            theme::hex(&def.color).unwrap_or(theme::MUTED),
-                        )
-                    })
-                    .collect();
+                // Sem etiquetas de cargo no cabeçalho: os cargos já aparecem como caixas de marcar logo
+                // abaixo, e a etiqueta sumindo ou aparecendo mudava a altura do menu a cada clique (o
+                // clique seguinte caía no cargo errado; visto no site em 17/11/2026).
+                let tags = Vec::new();
                 let texture = data
                     .avatars
                     .get(uid)
