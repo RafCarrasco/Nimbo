@@ -63,8 +63,9 @@ impl QualityArg {
     }
 }
 
-/// `"system"` = todo o som do computador menos o do próprio Nimbo; `{ app: pid }` = só o daquele
-/// programa.
+/// `"system"` = todo o som do computador menos o do próprio Nimbo e o dos apps de chamada de voz
+/// (Discord, Teams...); `{ app: pid }` = só o daquele programa. O formato é o que o site manda desde
+/// a primeira versão do app: o significado de `"system"` mudou aqui, não no site.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AudioArg {
@@ -140,9 +141,12 @@ pub async fn media_start(
             .map_err(|e| e.to_string())?;
         // O som é opcional: se a captura de áudio falhar, a live segue só com a imagem.
         let audio = options.audio.map(|audio| match audio {
-            // Tudo menos o próprio app (e o navegador embutido, que é filho dele): assim as lives
-            // que a pessoa está assistindo não voltam na live dela.
-            AudioArg::System => AudioSource::Exclude(std::process::id()),
+            // Tudo menos o próprio app (e o navegador embutido, que é filho dele), para as lives
+            // que a pessoa está assistindo não voltarem na live dela, e menos os apps de chamada,
+            // para quem está na chamada com ela não se ouvir.
+            AudioArg::System => AudioSource::SystemExcept {
+                own: std::process::id(),
+            },
             AudioArg::App(pid) => AudioSource::Include(pid),
         });
         if let Err(e) = media.engine.set_audio(audio) {
