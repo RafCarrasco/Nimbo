@@ -20,7 +20,7 @@ const fn frames(ms: u64) -> u64 {
 /// período antes do relógio para não passar por cima do som que ainda vai chegar.
 const PERIOD: u64 = frames(10);
 /// Sem pacote há este tempo, o alvo está calado. Menos que isso é só atraso de entrega.
-const IDLE: Duration = Duration::from_millis(30);
+pub(crate) const IDLE: Duration = Duration::from_millis(30);
 /// Buraco maior que isto (computador suspenso, `on_pcm` travado) é pulado, não preenchido: quem
 /// recebe não quer minutos de silêncio de uma vez.
 const MAX_GAP: u64 = frames(1000);
