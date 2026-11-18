@@ -7,6 +7,9 @@ import { useEmulators } from '../firebase';
 import { Modal } from '../ui/Modal';
 
 const CHECK_EVERY = 5 * 60 * 1000;
+type Started = { ok: true; value: boolean } | { ok: false; error: string } | void | undefined;
+// `installUpdate` responde `false` quando não há nada baixado para instalar.
+const started = (r: Started) => !r || (r.ok && r.value !== false);
 // App antigo, feito em Electron (o app novo, em Rust, não leva "Electron" no user agent).
 const LEGACY_APP = /Electron/i.test(navigator.userAgent);
 const SEEN_KEY = 'nimbo.seenVersion';
@@ -71,6 +74,8 @@ export function UpdateBanner({ live }: { live: boolean }) {
   const [updating, setUpdating] = useState('');
   // A atualização não começou (o app continuou aberto ou a página não recarregou): o que fazer.
   const [problem, setProblem] = useState('');
+  // A tela "Atualizando" está baixando a versão nova (antes de instalar).
+  const [downloading, setDownloading] = useState(false);
   // App em Rust mais velho que o site e sem atualização chegando: o app só procura atualização ao
   // abrir e de tempos em tempos, então quem está com ele aberto há horas precisa fechar e abrir.
   const [stale, setStale] = useState(false);
@@ -186,50 +191,55 @@ export function UpdateBanner({ live }: { live: boolean }) {
       // Sem armazenamento.
     }
     setUpdating('');
+    setDownloading(false);
     setBusy(false);
     setCardClosed(false);
     setProblem(message);
   };
+  // App 0.5.7+ consegue procurar e baixar a versão nova na hora (`checkUpdate`).
+  const canFetch = Boolean(desktop?.checkUpdate && desktop.installUpdate);
+  // Um clique faz tudo: se a versão nova já está baixada, instala; se não, baixa agora (com a barra
+  // na tela "Atualizando") e instala em seguida. O app fecha e abre sozinho na versão nova. Antes,
+  // o aviso de app desatualizado pedia para fechar e abrir, e reabrir só baixava: era preciso
+  // reiniciar mais uma vez para instalar (relatado em 17/11/2026).
+  const installApp = async () => {
+    // Um instante para a tela "Atualizando" aparecer antes de o app fechar.
+    await new Promise((done) => setTimeout(done, 700));
+    let result: Started = await desktop?.installUpdate?.();
+    if (!started(result) && desktop?.checkUpdate) {
+      setDownloading(true);
+      const found = await desktop.checkUpdate();
+      setDownloading(false);
+      if (!found.ok) return gaveUp(found.error);
+      if (!found.value)
+        return gaveUp('Não achei a versão nova para baixar agora. Feche e abra o Nimbo para atualizar.');
+      setUpdating(found.value.version);
+      result = await desktop.installUpdate?.();
+    }
+    if (!started(result))
+      return gaveUp(
+        result && !result.ok
+          ? `Não deu para instalar: ${result.error}`
+          : 'A versão nova ainda está baixando. Tente de novo em instantes.',
+      );
+    // O instalador fecha o app em poucos segundos; se depois de 40 s ele continua aberto, não começou.
+    setTimeout(() => gaveUp('A atualização não começou. Feche e abra o Nimbo para atualizar.'), 40000);
+  };
   const update = () => {
     setBusy(true);
     setProblem('');
-    if (!isApp) {
+    if (!isApp && !stale) {
       location.reload();
       // Recarregar some com esta página; se ela continua aqui depois de 10 s, não recarregou.
       setTimeout(() => gaveUp('A página não recarregou. Feche e abra o Nimbo para atualizar.'), 10000);
       return;
     }
-    writePending({ from: APP_VERSION, to: appVersion, at: Date.now() });
-    setUpdating(appVersion);
-    // O instalador fecha o app em poucos segundos; se depois de 40 s ele continua aberto, não começou.
-    const watchdog = setTimeout(
-      () => gaveUp('A atualização não começou. Feche e abra o Nimbo: ela instala ao abrir.'),
-      40000,
+    const target = appVersion || SITE_VERSION;
+    writePending({ from: APP_VERSION, to: target, at: Date.now() });
+    setUpdating(target);
+    installApp().catch((e: unknown) =>
+      gaveUp(`Não deu para instalar: ${e instanceof Error ? e.message : String(e)}`),
     );
-    // Um instante para a tela "Atualizando" aparecer antes de o app fechar.
-    setTimeout(async () => {
-      const started = (r: { ok: true; value: boolean } | { ok: false; error: string } | void | undefined) =>
-        !r || (r.ok && r.value !== false);
-      try {
-        let result = await desktop?.installUpdate?.();
-        // Nada baixado (o download foi descartado, ou outro aviso já instalou): confere de novo e tenta mais uma vez.
-        if (!started(result) && desktop?.checkUpdate) {
-          const again = await desktop.checkUpdate();
-          if (again.ok && again.value) result = await desktop.installUpdate?.();
-        }
-        if (!started(result)) {
-          clearTimeout(watchdog);
-          gaveUp(
-            result && !result.ok
-              ? `Não deu para instalar: ${result.error}`
-              : 'A versão nova ainda não terminou de baixar. Tente de novo em instantes ou feche e abra o Nimbo.',
-          );
-        }
-      } catch (e) {
-        clearTimeout(watchdog);
-        gaveUp(`Não deu para instalar: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }, 700);
   };
 
   return (
@@ -238,9 +248,13 @@ export function UpdateBanner({ live }: { live: boolean }) {
         <div className="updating-screen" role="status">
           <img src="/nimbo-icon-256.png" alt="" />
           <strong>Atualizando o Nimbo</strong>
-          <span>Versão {updating}. O app fecha e abre sozinho em alguns segundos.</span>
-          <div className="updating-bar">
-            <i />
+          <span>
+            {downloading
+              ? `Baixando a versão nova${progress > 0 && progress < 100 ? ` (${progress}%)` : ''}. Depois o app fecha e abre sozinho.`
+              : `Versão ${updating}. O app fecha e abre sozinho em alguns segundos.`}
+          </span>
+          <div className={downloading && progress > 0 && progress < 100 ? 'updating-bar filled' : 'updating-bar'}>
+            <i style={downloading && progress > 0 && progress < 100 ? { width: `${progress}%` } : undefined} />
           </div>
         </div>
       )}
@@ -280,12 +294,20 @@ export function UpdateBanner({ live }: { live: boolean }) {
           <div className="update-text">
             <strong>Seu Nimbo está desatualizado</strong>
             <span>
-              Você está na {APP_VERSION || 'versão antiga'} e a {SITE_VERSION} já saiu. Feche o Nimbo e abra de novo
-              para atualizar. Sem isso, quem assiste suas lives pode não conseguir conectar.
+              Você está na {APP_VERSION || 'versão antiga'} e a {SITE_VERSION} já saiu.
+              {canFetch ? ' Atualize agora: o app baixa, instala e abre de novo sozinho.' : ' Feche o Nimbo e abra de novo para atualizar.'}
+              {canFetch && live && ' Sua live cai por alguns segundos.'}
             </span>
+            {problem && <span className="update-problem">{problem}</span>}
             <div className="update-actions">
+              {canFetch && (
+                <button className="button primary small" disabled={busy} onClick={update}>
+                  <Download size={15} />
+                  Atualizar agora
+                </button>
+              )}
               <button className="button ghost small" onClick={() => setStale(false)}>
-                Entendi
+                {canFetch ? 'Depois' : 'Entendi'}
               </button>
             </div>
           </div>
@@ -308,14 +330,14 @@ export function UpdateBanner({ live }: { live: boolean }) {
           <div className="update-text">
             <strong>{isApp ? `Nimbo ${appVersion} está pronto` : 'Nova versão do Nimbo'}</strong>
             <span>
-              {isApp ? 'Reinicie o app para usar.' : 'Atualize para ter as novidades.'}
+              {isApp ? 'O app instala e abre de novo sozinho.' : 'Atualize para ter as novidades.'}
               {live && ' Sua live cai por alguns segundos.'}
             </span>
             {problem && <span className="update-problem">{problem}</span>}
             <div className="update-actions">
               <button className="button primary small" disabled={busy} onClick={update}>
                 {isApp ? <Download size={15} /> : <RotateCw size={15} />}
-                {isApp ? 'Reiniciar agora' : 'Atualizar'}
+                {isApp ? 'Atualizar agora' : 'Atualizar'}
               </button>
               <button className="button ghost small" onClick={() => setCardClosed(true)}>
                 Depois
