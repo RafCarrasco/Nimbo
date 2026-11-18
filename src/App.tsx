@@ -5,12 +5,9 @@ import {
   createChannel,
   isStaff,
   removeRoomSession,
+  revokeMember,
   roleLabel,
   saveProfile,
-  setCategoryAccess,
-  setCategoryRoles,
-  setChannelAccess,
-  setChannelRoles,
 } from './community';
 import { useAuth } from './hooks/useAuth';
 import { useCommunity, usePeople, useRoomsPresence } from './hooks/useCommunity';
@@ -27,8 +24,11 @@ import { UserPanel } from './components/UserPanel';
 import { AvatarPicker } from './components/Avatar';
 import { UpdateBanner } from './components/UpdateBanner';
 import { Stage } from './components/Stage';
-import { AdminPanel } from './components/AdminPanel';
-import { NicknameForm, PermissionModal, StreamSettingsModal } from './components/Modals';
+import { AdminPanel, type AdminTab } from './components/AdminPanel';
+import { ChannelSettings, type SettingsTarget } from './components/ChannelSettings';
+import { menuItems, type MenuTarget } from './components/Menus';
+import { ContextMenu, menuAt, type MenuAt } from './ui/ContextMenu';
+import { NicknameForm, StreamSettingsModal } from './components/Modals';
 import { Modal, useDialogs } from './ui/Modal';
 import { useToast } from './ui/Toast';
 
@@ -130,7 +130,10 @@ function Community({ uid }: { uid: string }) {
       {sidebarHidden ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
     </button>
   );
-  const [permission, setPermission] = useState<{ kind: 'category' | 'channel'; id: string } | null>(null);
+  // Configurações de canal ou categoria abertas, menu do botão direito aberto e a aba inicial do painel.
+  const [settings, setSettings] = useState<SettingsTarget | null>(null);
+  const [menu, setMenu] = useState<{ at: MenuAt; target: MenuTarget } | null>(null);
+  const [adminTab, setAdminTab] = useState<AdminTab | undefined>(undefined);
   const [showStreamSettings, setShowStreamSettings] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [capture, setCapture] = useState(loadCaptureSettings);
@@ -220,12 +223,17 @@ function Community({ uid }: { uid: string }) {
   }, [autoJoined, data.loaded, nickname, allowedChannels, join, toast]);
 
   // Permissão retirada enquanto conectado: sai do canal (o servidor também já bloqueia a leitura).
+  // Só depois de 3 s sem acesso: enquanto cargos e permissões estão sendo gravados, os dados chegam
+  // aos pedaços e o canal pode parecer fechado por um instante.
+  const roomAllowed = !room || !data.loaded || allowedChannels.includes(room);
   useEffect(() => {
-    if (room && data.loaded && !allowedChannels.includes(room)) {
+    if (roomAllowed) return;
+    const timer = setTimeout(() => {
       void live.leave();
       toast.error('Você não tem mais acesso a este canal.');
-    }
-  }, [room, data.loaded, allowedChannels, live, toast]);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [roomAllowed, live, toast]);
 
   const toggleBroadcast = async (kind: StreamKind) => {
     try {
@@ -294,15 +302,6 @@ function Community({ uid }: { uid: string }) {
     );
 
   const channelName = data.channels[room]?.name || room;
-  const permissionLevel = permission
-    ? (permission.kind === 'category' ? data.categoryAccess : data.channelAccess)[permission.id] || 'member'
-    : 'member';
-  const permissionName = permission
-    ? (permission.kind === 'category'
-        ? data.categories[permission.id]?.name
-        : data.channels[permission.id]?.name) || ''
-    : '';
-
   return (
     <div className={'app' + (menuOpen ? ' menu-open' : '') + (sidebarHidden ? ' sidebar-hidden' : '')}>
       <UpdateBanner live={Object.keys(snapshot.local).length > 0} />
@@ -327,7 +326,8 @@ function Community({ uid }: { uid: string }) {
           setMenuOpen(false);
           setAdminOpen((v) => !v);
         }}
-        onPermission={setPermission}
+        onSettings={setSettings}
+        onMenu={(event, target) => setMenu({ at: menuAt(event), target })}
         onCreateChannel={(id) => void createChannelIn(id)}
         onRemoveSession={(id, member) =>
           void removeRoomSession(id, member).then(
@@ -371,10 +371,16 @@ function Community({ uid }: { uid: string }) {
         </header>
         {adminOpen && (staff || data.netAdmins[uid]) ? (
           <AdminPanel
+            key={adminTab || 'admin'}
             uid={uid}
             data={data}
-            onClose={() => setAdminOpen(false)}
-            onPermission={setPermission}
+            initialTab={adminTab}
+            onClose={() => {
+              setAdminOpen(false);
+              setAdminTab(undefined);
+            }}
+            onSettings={setSettings}
+            onMemberMenu={(event, memberId) => setMenu({ at: menuAt(event), target: { kind: 'member', memberId } })}
             onCreateChannel={(id) => void createChannelIn(id)}
           />
         ) : snapshot.joined ? (
@@ -400,37 +406,61 @@ function Community({ uid }: { uid: string }) {
         )}
       </main>
 
-      {permission && (
-        <PermissionModal
-          key={permission.kind + permission.id}
-          title={(permission.kind === 'category' ? 'Categoria ' : 'Canal ') + permissionName}
-          kind={permission.kind}
-          current={permissionLevel}
-          allowOwner={role === 'owner'}
-          roleDefs={data.roleDefs}
-          selectedRoles={
-            (permission.kind === 'category' ? data.categoryRoles : data.channelRoles)[permission.id] || []
-          }
-          canEditRoles={role === 'owner'}
-          onClose={() => setPermission(null)}
-          onSave={async (level) => {
-            try {
-              if (permission.kind === 'category') await setCategoryAccess(permission.id, level);
-              else await setChannelAccess(permission.id, level);
-              toast.success('Permissão atualizada');
-            } catch (e) {
-              toast.error(e);
-            }
-          }}
-          onSaveRoles={async (roleIds) => {
-            try {
-              if (permission.kind === 'category') await setCategoryRoles(permission.id, roleIds);
-              else await setChannelRoles(permission.id, roleIds);
-              toast.success('Cargos atualizados');
-            } catch (e) {
-              toast.error(e);
-            }
-          }}
+      {settings && (
+        <ChannelSettings
+          key={settings.kind + settings.id + (settings.tab || '')}
+          uid={uid}
+          data={data}
+          target={settings}
+          onClose={() => setSettings(null)}
+        />
+      )}
+      {menu && (
+        <ContextMenu
+          {...menu.at}
+          onClose={() => setMenu(null)}
+          items={menuItems(menu.target, uid, data, {
+            watch: (channelId, memberId) => {
+              setMenu(null);
+              void join(channelId, memberId);
+            },
+            settings: (target) => {
+              setMenu(null);
+              setSettings(target);
+            },
+            createChannel: (categoryId) => {
+              setMenu(null);
+              void createChannelIn(categoryId);
+            },
+            removeSession: (channelId, memberId) => {
+              setMenu(null);
+              void removeRoomSession(channelId, memberId).then(
+                () => toast.success('Sessão removida'),
+                (e) => toast.error(e),
+              );
+            },
+            revoke: async (memberId) => {
+              setMenu(null);
+              const name = data.profiles[memberId]?.displayName || 'Esta pessoa';
+              const ok = await dialogs.confirm({
+                title: 'Revogar acesso?',
+                message: `${name} sai da comunidade imediatamente, perde o nível e os cargos e precisará de uma nova aprovação.`,
+                confirmLabel: 'Revogar',
+                danger: true,
+              });
+              if (ok)
+                await revokeMember(memberId, data.memberRoles[memberId]).then(
+                  () => toast.success('Acesso revogado'),
+                  (e) => toast.error(e),
+                );
+            },
+            manageRoles: () => {
+              setMenu(null);
+              setAdminTab('roles');
+              setAdminOpen(true);
+            },
+            toast,
+          })}
         />
       )}
       {showStreamSettings && (

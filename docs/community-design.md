@@ -28,10 +28,18 @@ Vale o que está em `scripts/build-rules.mjs` (gera `database.rules.json`); a in
   (`categoryRoles`, `channelRoles`): só quem tem um deles lê os metadados e a sala. Sem cargo marcado,
   vale só o nível mínimo (`categoryAccess`, `channelAccess`).
 - **Um grupo não enumera o outro.** Só o proprietário lê as listas inteiras de `profiles`, `avatars`,
-  `roles`, `netAdmins`, `roleDefs`, `memberRoles` e `roleMembers`. Os demais leem: o próprio nível e os
-  próprios cargos; nome e cor só dos cargos que têm; os colegas só desses cargos; e perfil e foto de uma
-  pessoa por vez, pelo id (o id só aparece para quem divide um canal ou um grupo com ela). No site isso
-  é `useCommunity` (lista para o proprietário, item a item para os demais) e `usePeople`.
+  `roles`, `netAdmins`, `roleDefs`, `memberRoles` e `roleMembers`. Os demais leem: o próprio nível, os
+  ids dos próprios cargos e perfil e foto de uma pessoa por vez, pelo id (o id só aparece para quem divide um
+  canal com ela). No site isso é `useCommunity` (lista para o proprietário, item a item para os demais) e
+  `usePeople`.
+- **Só o proprietário vê o sistema de cargos** (pedido do dono em 17/11/2026). Nome, cor e quem tem cada cargo
+  (`roleDefs`, `roleMembers`) só ele lê, nem quem tem o cargo. Na tela, os demais não veem cadeado, nome de cargo
+  nem cor de cargo, e o administrador configura canais só pela visão geral e pelo nível mínimo.
+- **Interface** (estilo Discord): botão direito na pessoa (cargos, nível, revogar), no canal e na categoria
+  (editar, permissões, excluir); engrenagem abre a janela de configurações (`ChannelSettings.tsx`, com rascunho e
+  barra de salvar); Gerenciar comunidade → Cargos é o editor (`RoleEditor.tsx`: Exibição, Acesso, Membros).
+- **Mudar permissão não derruba ninguém**: a leitura dos canais não é refeita do zero quando cargos mudam (só o
+  que tinha sido recusado é pedido de novo), e o app só tira alguém do canal depois de 3 s sem acesso.
 - Continuam legíveis por qualquer membro aprovado, por conterem só ids: `categoryIds`, `channelIds`,
   `categoryRoles`, `channelRoles`, `categoryAccess`, `channelAccess`.
 
