@@ -14,7 +14,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import type { StreamKind } from '../live/capture';
-import { SITE_VERSION } from '../lib/version';
+import { APP_VERSION, SITE_VERSION } from '../lib/version';
 
 // Navegadores de celular não têm captura de tela: lá só a webcam.
 const canShareScreen = typeof navigator.mediaDevices?.getDisplayMedia === 'function';
@@ -144,7 +144,9 @@ export function UserPanel({
           <LogOut size={16} />
         </button>
       </div>
-      <div className="version-line">Nimbo {SITE_VERSION}</div>
+      <div className="version-line" title={APP_VERSION ? `App ${APP_VERSION} · site ${SITE_VERSION}` : undefined}>
+        Nimbo {APP_VERSION || SITE_VERSION}
+      </div>
     </footer>
   );
 }

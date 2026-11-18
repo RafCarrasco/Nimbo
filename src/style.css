@@ -1841,6 +1841,11 @@ h2 {
   background: var(--primary);
   animation: updating-slide 1.1s ease-in-out infinite;
 }
+/* Baixando com o tamanho conhecido: a barra mostra quanto já veio. */
+.updating-bar.filled i {
+  animation: none;
+  transition: width 0.3s ease;
+}
 @keyframes updating-slide {
   from {
     transform: translateX(-100%);
