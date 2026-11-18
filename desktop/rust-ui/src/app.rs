@@ -1026,7 +1026,9 @@ impl Nimbo {
             }
             if let Some(window) = args.broadcast.filter(|_| !*auto_broadcast) {
                 *auto_broadcast = true;
-                let audio = args.sound.then(|| AudioSource::Exclude(std::process::id()));
+                let audio = args.sound.then(|| AudioSource::SystemExcept {
+                    own: std::process::id(),
+                });
                 let capture = Capture {
                     source: Source::Window(window),
                     audio,

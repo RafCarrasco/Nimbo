@@ -64,13 +64,15 @@ fn source_for(source: &PickerSource) -> Source {
 /// Som padrão da live no app, o mesmo do site (`src/live/audioDefault.ts`): só o som do programa
 /// escolhido (com o som do computador inteiro, a voz da chamada entra na live e quem fala se ouve
 /// com atraso); na tela inteira não há programa escolhido, e vai o som do computador, menos o do
-/// próprio Nimbo.
+/// próprio Nimbo e o dos apps de chamada de voz (como no Discord; app atual 0.5.7).
 fn default_audio(source: &PickerSource) -> AudioSource {
     match source.kind {
         SourceKind::Window | SourceKind::Game if source.pid != 0 => {
             AudioSource::Include(source.pid)
         }
-        _ => AudioSource::Exclude(std::process::id()),
+        _ => AudioSource::SystemExcept {
+            own: std::process::id(),
+        },
     }
 }
 
