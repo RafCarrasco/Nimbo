@@ -11,6 +11,11 @@
 //! Live própria: `publish_stream` anuncia no canal a live que o motor está enviando (`native: true`),
 //! no formato que o site e o app atual leem; ela some sozinha se a conexão cair e é reanunciada quando
 //! a conexão volta.
+//!
+//! Plateia e prévias, como no site (`setWatching`/`onWatching`/`watchPreviews` de `room.ts`): cada
+//! sessão avisa o que tem aberto no palco (`watching/{eu}/{quem transmite}/{tipo}: true`, que some
+//! sozinho se a conexão cair), e quem transmite grava de tempos em tempos uma foto pequena da live
+//! (`previews/{eu}/{tipo}`), lida só enquanto a interface vai mostrá-la.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -18,7 +23,7 @@ use std::sync::{Arc, Mutex, Weak};
 use serde_json::json;
 
 use crate::Json;
-use crate::rtdb::{Db, DbError, Event, ListenId, Status};
+use crate::rtdb::{Db, DbError, Event, ListenId, Status, push_id};
 
 pub const MAX_MEMBERS: usize = 20;
 
@@ -36,6 +41,40 @@ pub struct Broadcast {
     /// Enviada pelo motor do app (uma conexão só de recepção, direto com ele), e não pelo navegador.
     pub native: bool,
     pub sound: bool,
+    /// Início da live na hora do servidor, em ms (0 se não veio).
+    pub started_at: i64,
+    /// Nome do jogo transmitido (vazio quando a fonte não é um jogo).
+    pub game: String,
+}
+
+/// Tamanho máximo da prévia gravada (as regras do banco conferem o mesmo número).
+pub const PREVIEW_LIMIT: usize = 14_000;
+
+/// Só imagens pequenas em data URL viram prévia: o que vem do banco não é confiável por si só.
+pub fn valid_preview(value: &str) -> bool {
+    value.len() <= PREVIEW_LIMIT
+        && (value.starts_with("data:image/webp;base64,")
+            || value.starts_with("data:image/jpeg;base64,"))
+}
+
+/// Prévias de uma pessoa num canal (uma leitura só, quando o mouse passa em cima dela na barra
+/// lateral). Bloqueia até a resposta: chame fora da thread que desenha.
+pub fn load_previews(db: &Db, room: &str, uid: &str) -> BTreeMap<String, String> {
+    let value = db
+        .get(&format!("rooms/{room}/previews/{uid}"))
+        .unwrap_or(Json::Null);
+    ["screen", "camera"]
+        .into_iter()
+        .filter_map(|kind| {
+            Some((
+                kind.to_owned(),
+                value[kind]
+                    .as_str()
+                    .filter(|data| valid_preview(data))?
+                    .to_owned(),
+            ))
+        })
+        .collect()
 }
 
 /// Lives por pessoa e por tipo ("screen" ou "camera").
@@ -64,6 +103,10 @@ pub struct RoomSnapshot {
     /// Versão do app de cada pessoa no canal, como ela mesma informou ao entrar.
     pub apps: BTreeMap<String, String>,
     pub broadcasts: Broadcasts,
+    /// Quem está assistindo cada live ("uid:tipo" → pessoas), como cada uma informou.
+    pub watchers: BTreeMap<String, Vec<String>>,
+    /// Prévia de cada live ("uid:tipo" → data URL). Só vem enquanto a interface pede (`watch_previews`).
+    pub previews: BTreeMap<String, String>,
     /// Quantas vezes a presença foi refeita depois de uma queda da conexão. Quem cuida das lives
     /// refaz as conexões quando este número muda: as ofertas feitas durante a queda se perderam.
     pub reconnects: u64,
@@ -76,6 +119,7 @@ struct Local {
     started_at: i64,
     stream_id: String,
     sound: bool,
+    game: String,
 }
 
 struct State {
@@ -92,6 +136,10 @@ struct State {
     /// Mensagens já tratadas e ainda não apagadas ("quem mandou/id").
     seen: BTreeSet<String>,
     signals: Vec<Signal>,
+    /// O que esta sessão está assistindo ("uid:tipo", em ordem), como foi avisado ao canal.
+    watching: Vec<String>,
+    /// Escuta das prévias, ligada só enquanto a interface pede.
+    previews: Option<ListenId>,
 }
 
 struct Inner {
@@ -103,6 +151,8 @@ struct Inner {
     /// sinalização: a mais nova fica, a antiga percebe e sai).
     sid: String,
     state: Mutex<State>,
+    /// Uma gravação da plateia por vez, sempre com o valor mais recente.
+    watching_lock: Mutex<()>,
     notify: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -126,6 +176,7 @@ impl Room {
             room: room.to_owned(),
             app: app.to_owned(),
             sid: session_id(),
+            watching_lock: Mutex::new(()),
             state: Mutex::new(State {
                 snapshot: RoomSnapshot {
                     room: room.to_owned(),
@@ -140,6 +191,8 @@ impl Room {
                 pending_inbox: None,
                 seen: BTreeSet::new(),
                 signals: Vec::new(),
+                watching: Vec::new(),
+                previews: None,
             }),
             notify: Box::new(notify),
         });
@@ -174,7 +227,10 @@ impl Room {
             if again {
                 let retry = inner.clone();
                 std::thread::spawn(move || {
-                    let done = retry.register_presence().and_then(|()| retry.republish());
+                    let done = retry
+                        .register_presence()
+                        .and_then(|()| retry.republish())
+                        .and_then(|()| retry.publish_watching());
                     if let Err(e) = done {
                         retry.issue(format!("Não deu para voltar ao canal: {e}"), false);
                     }
@@ -214,6 +270,21 @@ impl Room {
             (inner.notify)();
         });
         let weak: Weak<Inner> = Arc::downgrade(&inner);
+        let watching = db.listen(&inner.path("watching"), move |event| {
+            let Some(inner) = weak.upgrade() else { return };
+            let value = match event {
+                Event::Value(value) => watchers(value),
+                Event::Denied(_) => BTreeMap::new(),
+            };
+            inner
+                .state
+                .lock()
+                .expect("estado da sala")
+                .snapshot
+                .watchers = value;
+            (inner.notify)();
+        });
+        let weak: Weak<Inner> = Arc::downgrade(&inner);
         let inbox = db.listen(&inner.path(&format!("signals/{uid}")), move |event| {
             let (Some(inner), Event::Value(data)) = (weak.upgrade(), event) else {
                 return;
@@ -226,7 +297,7 @@ impl Room {
             .lock()
             .expect("estado da sala")
             .listens
-            .extend([listen, streams, inbox]);
+            .extend([listen, streams, watching, inbox]);
         Ok(Room { inner })
     }
 
@@ -292,12 +363,21 @@ impl Room {
 
     /// Anuncia no canal uma live desta conta enviada pelo motor do app (`native: true`): quem
     /// assiste vê o anúncio e manda a oferta. `stream_id` identifica esta live (muda a cada começo);
-    /// `sound` diz se há som para pedir. Bloqueia até o servidor confirmar.
-    pub fn publish_stream(&self, kind: &str, stream_id: &str, sound: bool) -> Result<(), DbError> {
+    /// `sound` diz se há som para pedir; `game` é o nome do jogo, quando a fonte é um jogo (até 48
+    /// caracteres, como no site). O início vai na hora do servidor. Bloqueia até o servidor confirmar.
+    pub fn publish_stream(
+        &self,
+        kind: &str,
+        stream_id: &str,
+        sound: bool,
+        game: &str,
+    ) -> Result<(), DbError> {
+        let game: String = game.trim().chars().take(48).collect();
         let local = Local {
             started_at: self.inner.db.server_now_ms(),
             stream_id: stream_id.to_owned(),
             sound,
+            game,
         };
         self.inner
             .state
@@ -317,7 +397,7 @@ impl Room {
         done
     }
 
-    /// Tira o anúncio de uma live desta conta. Bloqueia até o servidor confirmar.
+    /// Tira o anúncio de uma live desta conta (e a prévia dela). Bloqueia até o servidor confirmar.
     pub fn unpublish_stream(&self, kind: &str) {
         self.inner
             .state
@@ -330,6 +410,96 @@ impl Room {
                 .inner
                 .path(&format!("streams/{}/{kind}", self.inner.uid)),
         );
+        let _ = self.inner.db.remove(
+            &self
+                .inner
+                .path(&format!("previews/{}/{kind}", self.inner.uid)),
+        );
+    }
+
+    /// Grava a prévia (foto pequena, data URL) de uma live própria que está no ar. Ela some sozinha
+    /// se a conexão cair. Bloqueia até o servidor confirmar.
+    pub fn publish_preview(&self, kind: &str, data: &str) -> Result<(), DbError> {
+        if !valid_preview(data) {
+            return Err(DbError::Server("prévia inválida".into()));
+        }
+        if !self
+            .inner
+            .state
+            .lock()
+            .expect("estado da sala")
+            .locals
+            .contains_key(kind)
+        {
+            return Ok(());
+        }
+        let previews = self.inner.path(&format!("previews/{}", self.inner.uid));
+        self.inner.db.on_disconnect_remove(&previews)?;
+        self.inner
+            .db
+            .set(&format!("{previews}/{kind}"), json!(data))
+    }
+
+    /// Avisa ao canal quais lives esta sessão está assistindo ("uid:tipo"). Só grava quando muda; a
+    /// gravação sai numa thread (não bloqueia quem desenha) e some sozinha se a conexão cair.
+    pub fn set_watching(&self, keys: &[String]) {
+        let mut next: Vec<String> = keys
+            .iter()
+            .filter(|key| {
+                key.rsplit_once(':').is_some_and(|(uid, kind)| {
+                    uid != self.inner.uid && (kind == "screen" || kind == "camera")
+                })
+            })
+            .cloned()
+            .collect();
+        next.sort();
+        next.dedup();
+        {
+            let mut state = self.inner.state.lock().expect("estado da sala");
+            if state.watching == next {
+                return;
+            }
+            state.watching = next;
+            if !state.snapshot.joined || state.replaced {
+                return;
+            }
+        }
+        let inner = self.inner.clone();
+        std::thread::spawn(move || drop(inner.publish_watching()));
+    }
+
+    /// Liga ou desliga a leitura das prévias do canal (cartões "Ao vivo agora"): ninguém baixa foto
+    /// que não vai ver.
+    pub fn watch_previews(&self, on: bool) {
+        let mut state = self.inner.state.lock().expect("estado da sala");
+        if on == state.previews.is_some() || (on && !state.snapshot.joined) {
+            return;
+        }
+        if let Some(id) = state.previews.take() {
+            self.inner.db.unlisten(id);
+            state.snapshot.previews.clear();
+            drop(state);
+            (self.inner.notify)();
+            return;
+        }
+        let weak: Weak<Inner> = Arc::downgrade(&self.inner);
+        state.previews = Some(
+            self.inner
+                .db
+                .listen(&self.inner.path("previews"), move |event| {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let value = match event {
+                        Event::Value(value) => previews(value),
+                        Event::Denied(_) => BTreeMap::new(),
+                    };
+                    let mut state = inner.state.lock().expect("estado da sala");
+                    if state.previews.is_some() {
+                        state.snapshot.previews = value;
+                    }
+                    drop(state);
+                    (inner.notify)();
+                }),
+        );
     }
 
     /// Sai do canal. Bloqueia até o servidor confirmar: chame fora da thread que desenha.
@@ -337,24 +507,28 @@ impl Room {
         let (listens, replaced, locals) = {
             let mut state = self.inner.state.lock().expect("estado da sala");
             state.snapshot.joined = false;
-            (
-                std::mem::take(&mut state.listens),
-                state.replaced,
-                std::mem::take(&mut state.locals),
-            )
+            let mut listens = std::mem::take(&mut state.listens);
+            listens.extend(state.previews.take());
+            (listens, state.replaced, std::mem::take(&mut state.locals))
         };
         for id in listens {
             self.inner.db.unlisten(id);
         }
         let streams = self.inner.path(&format!("streams/{}", self.inner.uid));
+        let previews = self.inner.path(&format!("previews/{}", self.inner.uid));
         for kind in locals.keys() {
             let _ = self.inner.db.remove(&format!("{streams}/{kind}"));
+            let _ = self.inner.db.remove(&format!("{previews}/{kind}"));
         }
         let _ = self.inner.db.on_disconnect_cancel(&streams);
+        let _ = self.inner.db.on_disconnect_cancel(&previews);
         let member = self.inner.member();
+        let watching = self.inner.watching();
+        let _ = self.inner.db.on_disconnect_cancel(&watching);
         let _ = self.inner.db.on_disconnect_cancel(&member);
         // Trocada por outra sessão da mesma conta: o registro de presença agora é dela.
         if !replaced {
+            let _ = self.inner.db.remove(&watching);
             let _ = self.inner.db.remove(&member);
         }
         (self.inner.notify)();
@@ -368,6 +542,42 @@ impl Inner {
 
     fn member(&self) -> String {
         self.path(&format!("members/{}", self.uid))
+    }
+
+    fn watching(&self) -> String {
+        self.path(&format!("watching/{}", self.uid))
+    }
+
+    /// Grava a plateia desta sessão com o valor mais recente (uma gravação por vez).
+    fn publish_watching(&self) -> Result<(), DbError> {
+        let _one = self.watching_lock.lock().expect("plateia");
+        let (keys, joined) = {
+            let state = self.state.lock().expect("estado da sala");
+            (
+                state.watching.clone(),
+                state.snapshot.joined && !state.replaced,
+            )
+        };
+        if !joined {
+            return Ok(());
+        }
+        let mut value = serde_json::Map::new();
+        for key in &keys {
+            if let Some((uid, kind)) = key.rsplit_once(':') {
+                let entry = value.entry(uid.to_owned()).or_insert_with(|| json!({}));
+                entry[kind] = json!(true);
+            }
+        }
+        let path = self.watching();
+        self.db.on_disconnect_remove(&path)?;
+        self.db.set(
+            &path,
+            if value.is_empty() {
+                Json::Null
+            } else {
+                Json::Object(value)
+            },
+        )
     }
 
     fn issue(&self, message: String, fatal: bool) {
@@ -417,6 +627,9 @@ impl Inner {
             json!({ "startedAt": local.started_at, "streamId": local.stream_id, "native": true });
         if local.sound {
             live["sound"] = json!(true);
+        }
+        if !local.game.is_empty() {
+            live["game"] = json!(local.game);
         }
         self.db.set(&format!("{streams}/{kind}"), live)
     }
@@ -526,6 +739,13 @@ fn broadcasts(value: &Json) -> Broadcasts {
                     stream_id: stream_id.to_owned(),
                     native: live["native"].as_bool() == Some(true),
                     sound: live["sound"].as_bool() == Some(true),
+                    started_at: live["startedAt"].as_f64().map_or(0, |at| at.round() as i64),
+                    game: live["game"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(48)
+                        .collect(),
                 },
             );
         }
@@ -533,27 +753,34 @@ fn broadcasts(value: &Json) -> Broadcasts {
     all
 }
 
-/// Chave nova para uma lista do banco, no formato do `push()` do Firebase: 8 caracteres com a hora
-/// (para as chaves saírem em ordem) e 12 ao acaso.
-fn push_id(now_ms: i64) -> String {
-    const CHARS: &[u8; 64] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
-    let mut id = [0u8; 20];
-    let mut time = now_ms.max(0) as u64;
-    for slot in id[..8].iter_mut().rev() {
-        *slot = CHARS[(time % 64) as usize];
-        time /= 64;
+/// `watching/{quem assiste}/{quem transmite}/{tipo}` → quem assiste cada live ("uid:tipo").
+fn watchers(value: &Json) -> BTreeMap<String, Vec<String>> {
+    let mut all: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (viewer, lives) in value.as_object().into_iter().flatten() {
+        for (uid, kinds) in lives.as_object().into_iter().flatten() {
+            for kind in ["screen", "camera"] {
+                if kinds[kind].as_bool() == Some(true) {
+                    all.entry(format!("{uid}:{kind}"))
+                        .or_default()
+                        .push(viewer.clone());
+                }
+            }
+        }
     }
-    let mut random = [0u8; 12];
-    if getrandom::fill(&mut random).is_err() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        random.copy_from_slice(&nanos.to_le_bytes()[..12]);
+    all
+}
+
+/// `previews/{uid}/{tipo}` → prévia válida de cada live ("uid:tipo").
+fn previews(value: &Json) -> BTreeMap<String, String> {
+    let mut all = BTreeMap::new();
+    for (uid, kinds) in value.as_object().into_iter().flatten() {
+        for kind in ["screen", "camera"] {
+            if let Some(data) = kinds[kind].as_str().filter(|data| valid_preview(data)) {
+                all.insert(format!("{uid}:{kind}"), data.to_owned());
+            }
+        }
     }
-    for (slot, byte) in id[8..].iter_mut().zip(random) {
-        *slot = CHARS[(byte % 64) as usize];
-    }
-    String::from_utf8_lossy(&id).into_owned()
+    all
 }
 
 /// Doze caracteres ao acaso, como o `crypto.randomUUID().slice(0, 12)` do site.

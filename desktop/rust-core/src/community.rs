@@ -1,7 +1,11 @@
 //! Estado da comunidade para a interface: categorias, canais, níveis, cargos, perfis e quem está
 //! em cada canal. Espelha `src/hooks/useCommunity.ts` e `src/community.ts` do site, com as mesmas
-//! leituras: o proprietário lê as listas inteiras; os demais leem o que é deles, os grupos de que
-//! fazem parte e, uma a uma, as pessoas que encontram nos canais que enxergam.
+//! leituras: o proprietário lê as listas inteiras; os demais leem o que é deles e, uma a uma, as
+//! pessoas que encontram nos canais que enxergam.
+//!
+//! Cargos são segredo do proprietário (pedido do dono em 17/11/2026: "senão o pessoal vai saber que
+//! tem mais cargo"): quem não é proprietário lê só os próprios cargos (`memberRoles/{eu}`, que decide
+//! o que ele vê), nunca nome, cor nem colegas de cargo nenhum.
 //!
 //! Quem garante o acesso são as regras do banco. As contas daqui (`channel_allowed` etc.) só decidem
 //! o que a interface mostra.
@@ -82,6 +86,13 @@ pub struct RoleDef {
     pub created_at: f64,
 }
 
+/// Pedido de acesso de quem ainda não foi aprovado (só o proprietário lê).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Request {
+    pub email: String,
+    pub created_at: f64,
+}
+
 /// Lives que uma pessoa tem no ar num canal.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Live {
@@ -115,6 +126,9 @@ pub struct Snapshot {
     pub role_defs: BTreeMap<String, RoleDef>,
     pub member_roles: BTreeMap<String, BTreeSet<String>>,
     pub net_admins: BTreeSet<String>,
+    /// Pedidos de acesso e quem está aprovado (só o proprietário recebe).
+    pub requests: BTreeMap<String, Request>,
+    pub approved: BTreeSet<String>,
     /// Pessoas cujo perfil ainda está sendo buscado.
     pub resolving: BTreeSet<String>,
     pub presence: BTreeMap<String, RoomPresence>,
@@ -161,8 +175,12 @@ impl Snapshot {
             && self.category_allowed(&channel.category_id, uid)
     }
 
-    /// Texto do cadeado. O proprietário vê todos os cargos; os demais só conhecem o nome dos que têm.
+    /// Texto do cadeado. Só o proprietário vê cadeados (e os nomes dos cargos); para os demais é
+    /// sempre vazio, para a interface não contar que existe restrição nenhuma.
     pub fn restricted_label(&self, level: Option<Level>, role_ids: Option<&Vec<String>>) -> String {
+        if !self.owner {
+            return String::new();
+        }
         let ids = role_ids.map(Vec::as_slice).unwrap_or_default();
         let names: Vec<&str> = ids
             .iter()
@@ -190,12 +208,63 @@ impl Snapshot {
             .join(" · ")
     }
 
-    /// Cor do primeiro cargo conhecido da pessoa, como no site.
+    /// Cor do primeiro cargo da pessoa (o mais antigo), como no Discord. Só o proprietário vê cores
+    /// de cargo: para os demais, cargos não existem na interface.
     pub fn role_color(&self, uid: &str) -> Option<&str> {
-        let mine = self.member_roles.get(uid)?;
-        mine.iter()
-            .find_map(|role| self.role_defs.get(role))
-            .map(|def| def.color.as_str())
+        if !self.owner {
+            return None;
+        }
+        self.roles_of(uid)
+            .first()
+            .map(|(_, def)| def.color.as_str())
+    }
+
+    /// Cargos de uma pessoa, do mais antigo ao mais novo (só o proprietário conhece).
+    pub fn roles_of(&self, uid: &str) -> Vec<(&String, &RoleDef)> {
+        let Some(mine) = self.member_roles.get(uid).filter(|_| self.owner) else {
+            return Vec::new();
+        };
+        let mut list: Vec<_> = mine
+            .iter()
+            .filter_map(|id| Some((id, self.role_defs.get(id)?)))
+            .collect();
+        list.sort_by(|a, b| {
+            a.1.created_at
+                .total_cmp(&b.1.created_at)
+                .then_with(|| a.0.cmp(b.0))
+        });
+        list
+    }
+
+    /// Todos os cargos, do mais antigo ao mais novo (vazio para quem não é proprietário).
+    pub fn ordered_roles(&self) -> Vec<(&String, &RoleDef)> {
+        let mut list: Vec<_> = self.role_defs.iter().collect();
+        list.sort_by(|a, b| {
+            a.1.created_at
+                .total_cmp(&b.1.created_at)
+                .then_with(|| a.0.cmp(b.0))
+        });
+        list
+    }
+
+    /// Quantas pessoas têm o cargo.
+    pub fn role_count(&self, role: &str) -> usize {
+        self.member_roles
+            .values()
+            .filter(|set| set.contains(role))
+            .count()
+    }
+
+    /// Nomes dos canais que uma pessoa enxerga, para o proprietário conferir os grupos de relance.
+    pub fn visible_channel_names(&self, uid: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .channels
+            .iter()
+            .filter(|(id, _)| self.channel_allowed(id, uid))
+            .map(|(_, channel)| channel.name.clone())
+            .collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        names
     }
 
     /// Canais na ordem do site: os padrão primeiro, depois os criados (o id cresce com a data de criação).
@@ -331,8 +400,8 @@ struct Raw {
     all_defs: BTreeMap<String, RoleDef>,
     all_member_roles: BTreeMap<String, BTreeSet<String>>,
     own_roles: BTreeSet<String>,
-    group_defs: BTreeMap<String, RoleDef>,
-    group_members: BTreeMap<String, BTreeSet<String>>,
+    requests: BTreeMap<String, Request>,
+    approved: BTreeSet<String>,
     category_ids: BTreeSet<String>,
     channel_ids: BTreeSet<String>,
     categories: BTreeMap<String, Category>,
@@ -349,7 +418,6 @@ struct Subs {
     /// `Some(true)` com as leituras de proprietário no ar, `Some(false)` com as de quem não é.
     mode: Option<bool>,
     mode_subs: Vec<ListenId>,
-    groups: HashMap<String, Vec<ListenId>>,
     index: Vec<ListenId>,
     categories: HashMap<String, ListenId>,
     channels: HashMap<String, ListenId>,
@@ -432,7 +500,6 @@ impl Drop for Community {
             .into_iter()
             .chain(subs.mode_subs)
             .chain(subs.index)
-            .chain(subs.groups.into_values().flatten())
             .chain(subs.categories.into_values())
             .chain(subs.channels.into_values())
             .chain(subs.people.into_values().flatten())
@@ -486,11 +553,15 @@ impl Inner {
         // Proprietário lê as listas inteiras; os demais, só o que é deles.
         if subs.mode != Some(owner) {
             self.drop_all(subs.mode_subs.drain(..));
-            self.drop_all(subs.groups.drain().flat_map(|(_, ids)| ids));
             self.drop_all(subs.people.drain().flat_map(|(_, ids)| ids));
             raw.profiles = None;
             raw.avatars.clear();
             raw.net_admins.clear();
+            raw.all_roles.clear();
+            raw.all_defs.clear();
+            raw.all_member_roles.clear();
+            raw.requests.clear();
+            raw.approved.clear();
             raw.people.clear();
             raw.people_avatars.clear();
             subs.mode = Some(owner);
@@ -529,6 +600,35 @@ impl Inner {
                     self.hook("community/memberRoles".into(), |raw, v| {
                         raw.all_member_roles = v.map(sets).unwrap_or_default();
                     }),
+                    self.hook("community/requests".into(), |raw, v| {
+                        raw.requests = v
+                            .and_then(Json::as_object)
+                            .map(|map| {
+                                map.iter()
+                                    .map(|(k, r)| {
+                                        (
+                                            k.clone(),
+                                            Request {
+                                                email: text(r, "email"),
+                                                created_at: r["createdAt"].as_f64().unwrap_or(0.0),
+                                            },
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }),
+                    self.hook("community/approved".into(), |raw, v| {
+                        raw.approved = v
+                            .and_then(Json::as_object)
+                            .map(|map| {
+                                map.iter()
+                                    .filter(|(_, on)| on.as_bool() == Some(true))
+                                    .map(|(k, _)| k.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }),
                 ]
             } else {
                 let me = uid.to_owned();
@@ -563,42 +663,8 @@ impl Inner {
             };
         }
 
-        // Quem não é proprietário: nome, cor e colegas de cada cargo que tem (e só desses).
-        if !owner {
-            let gone: Vec<String> = subs
-                .groups
-                .keys()
-                .filter(|id| !raw.own_roles.contains(*id))
-                .cloned()
-                .collect();
-            for id in gone {
-                self.drop_all(subs.groups.remove(&id).unwrap_or_default());
-                raw.group_defs.remove(&id);
-                raw.group_members.remove(&id);
-            }
-            for id in &raw.own_roles {
-                if subs.groups.contains_key(id) {
-                    continue;
-                }
-                let (def_id, members_id) = (id.clone(), id.clone());
-                subs.groups.insert(
-                    id.clone(),
-                    vec![
-                        self.hook(format!("community/roleDefs/{id}"), move |raw, v| {
-                            match v.and_then(role_def) {
-                                Some(def) => drop(raw.group_defs.insert(def_id.clone(), def)),
-                                None => drop(raw.group_defs.remove(&def_id)),
-                            }
-                        }),
-                        self.hook(format!("community/roleMembers/{id}"), move |raw, v| {
-                            raw.group_members
-                                .insert(members_id.clone(), v.map(keys).unwrap_or_default());
-                        }),
-                    ],
-                );
-            }
-        }
-
+        // Quem não é proprietário só conhece os próprios cargos (os ids, que decidem o que ele vê);
+        // nome, cor e colegas de cargo nenhum chegam a ele.
         let roles = if owner {
             raw.all_roles.clone()
         } else {
@@ -607,21 +673,14 @@ impl Inner {
         let role_defs = if owner {
             raw.all_defs.clone()
         } else {
-            raw.group_defs.clone()
+            BTreeMap::new()
         };
         let member_roles = if owner {
             raw.all_member_roles.clone()
+        } else if raw.own_roles.is_empty() {
+            BTreeMap::new()
         } else {
-            let mut all: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-            if !raw.own_roles.is_empty() {
-                all.insert(uid.to_owned(), raw.own_roles.clone());
-            }
-            for (role, members) in &raw.group_members {
-                for member in members {
-                    all.entry(member.clone()).or_default().insert(role.clone());
-                }
-            }
-            all
+            BTreeMap::from([(uid.to_owned(), raw.own_roles.clone())])
         };
 
         // O servidor só entrega as categorias e canais que a conta pode ver, e uma leitura recusada
@@ -733,6 +792,8 @@ impl Inner {
             role_defs,
             member_roles,
             net_admins: raw.net_admins.clone(),
+            requests: raw.requests.clone(),
+            approved: raw.approved.clone(),
             resolving: BTreeSet::new(),
             presence: BTreeMap::new(),
         };

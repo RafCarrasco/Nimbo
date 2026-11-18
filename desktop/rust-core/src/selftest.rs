@@ -105,8 +105,234 @@ pub fn run() -> Result<(), AnyError> {
         }
     }
     result?;
+    admin_checks(&project, stamp)?;
     println!("tudo certo");
     Ok(())
+}
+
+/// O que o proprietário lê da administração (a raiz `community` inteira ninguém lê).
+fn owner_view(db: &Db) -> Result<Json, AnyError> {
+    let mut all = serde_json::Map::new();
+    for path in [
+        "approved",
+        "requests",
+        "roleDefs",
+        "memberRoles",
+        "roleMembers",
+    ] {
+        all.insert(path.to_owned(), db.get(&format!("community/{path}"))?);
+    }
+    Ok(Json::Object(all))
+}
+
+/// Administração com as regras de verdade: o que o proprietário pode, o que o administrador pode e o
+/// que o banco recusa, e o que cada um enxerga de cargos (só o proprietário conhece).
+fn admin_checks(project: &Project, stamp: u128) -> Result<(), AnyError> {
+    use nimbo_core::admin;
+    use nimbo_core::community::{Community, Level};
+
+    let (owner, db_o) = account(project, &format!("core-o{stamp}"))?;
+    let (moderator, db_m) = account(project, &format!("core-m{stamp}"))?;
+    let (member, db_x) = account(project, &format!("core-x{stamp}"))?;
+    let (newcomer, db_n) = account(project, &format!("core-n{stamp}"))?;
+    let people = [&owner.uid, &moderator.uid, &member.uid, &newcomer.uid];
+    for uid in &people[..3] {
+        admin("PUT", &format!("community/approved/{uid}"), &json!(true))?;
+    }
+    admin(
+        "PUT",
+        &format!("community/roles/{}", owner.uid),
+        &json!("owner"),
+    )?;
+    admin(
+        "PUT",
+        &format!("community/roles/{}", moderator.uid),
+        &json!("admin"),
+    )?;
+    let result = (|| -> Result<(), AnyError> {
+        let denied = |result: Result<(), DbError>, what: &str| -> Result<(), AnyError> {
+            match result {
+                Err(DbError::Denied) => Ok(()),
+                other => Err(format!("{what} devia ser recusado, deu {other:?}").into()),
+            }
+        };
+        // Cargos: só o proprietário cria e dá; o administrador é recusado.
+        let role = admin::create_role(&db_o, "Teste", "#4cc3f5")
+            .map_err(|e| format!("create_role: {e}"))?;
+        admin::update_role(&db_o, &role, "Grupo de teste", "#ff7ac6")
+            .map_err(|e| format!("update_role: {e}"))?;
+        admin::set_member_role(&db_o, &member.uid, &role, true)
+            .map_err(|e| format!("set_member_role: {e}"))?;
+        denied(
+            admin::set_member_role(&db_m, &moderator.uid, &role, true),
+            "administrador se dar cargo",
+        )?;
+        denied(
+            admin::set_level(&db_m, &member.uid, Level::Admin),
+            "administrador promover alguém",
+        )?;
+        let both = owner_view(&db_o)?;
+        if both["memberRoles"][&member.uid][&role] != true
+            || both["roleMembers"][&role][&member.uid] != true
+        {
+            return Err("memberRoles e roleMembers não foram gravados juntos".into());
+        }
+        // O que cada um enxerga: o membro conhece o próprio cargo (o id), nunca nome nem cor.
+        let seen_by_member = Community::start(&db_x, &member.uid, || {});
+        let seen_by_owner = Community::start(&db_o, &owner.uid, || {});
+        wait_until("o membro carrega a comunidade com o próprio cargo", || {
+            let data = seen_by_member.snapshot();
+            data.loaded
+                && data
+                    .member_roles
+                    .get(&member.uid)
+                    .is_some_and(|set| set.contains(&role))
+        })?;
+        let data = seen_by_member.snapshot();
+        if !data.role_defs.is_empty()
+            || data.role_color(&member.uid).is_some()
+            || !data.restricted_label(Some(Level::Admin), None).is_empty()
+        {
+            return Err("quem não é proprietário recebeu nome, cor ou cadeado de cargo".into());
+        }
+        wait_until(
+            "o proprietário vê o cargo com nome, cor e uma pessoa",
+            || {
+                let data = seen_by_owner.snapshot();
+                data.role_defs
+                    .get(&role)
+                    .is_some_and(|def| def.name == "Grupo de teste")
+                    && data.role_count(&role) == 1
+                    && data.role_color(&member.uid) == Some("#ff7ac6")
+            },
+        )?;
+        step(
+            "cargos: o proprietário cria e dá; o administrador é recusado; só o proprietário vê nome e cor",
+        );
+
+        // Canais: o administrador cria, edita, muda o nível e exclui; "só o proprietário" e cargos, não.
+        let channel = admin::create_channel(&db_m, &moderator.uid, "canal de teste", "", "lives")
+            .map_err(|e| format!("create_channel: {e}"))?;
+        admin::edit_channel(&db_m, &channel, "canal editado", "descrição nova", "lives")
+            .map_err(|e| format!("edit_channel: {e}"))?;
+        admin::set_access(&db_m, false, &channel, Level::Admin)
+            .map_err(|e| format!("set_access: {e}"))?;
+        denied(
+            admin::set_access(&db_m, false, &channel, Level::Owner),
+            "administrador pôr 'só o proprietário'",
+        )?;
+        denied(
+            admin::set_roles(&db_m, false, &channel, std::slice::from_ref(&role)),
+            "administrador marcar cargo",
+        )?;
+        admin::set_access(&db_m, false, &channel, Level::Member)
+            .map_err(|e| format!("set_access: {e}"))?;
+        // Canal privado do cargo: quem tem vê; o administrador sem o cargo deixa de ver.
+        admin::set_roles(&db_o, false, &channel, std::slice::from_ref(&role))
+            .map_err(|e| format!("set_roles: {e}"))?;
+        if db_x.get(&format!("community/channels/{channel}"))?["name"] != "canal editado" {
+            return Err("quem tem o cargo não leu o canal privado".into());
+        }
+        if db_m.get(&format!("community/channels/{channel}")) != Err(DbError::Denied) {
+            return Err("administrador sem o cargo leu o canal privado".into());
+        }
+        denied(
+            admin::edit_channel(&db_m, &channel, "às cegas", "", "lives"),
+            "administrador editar canal que não vê",
+        )?;
+        if admin::edit_channel(&db_o, "geral", "Outro nome", "", "lives").is_ok() {
+            return Err("canal padrão foi editado".into());
+        }
+        admin::set_roles(&db_o, false, &channel, &[]).map_err(|e| format!("set_roles: {e}"))?;
+        admin::delete_channel(&db_m, &channel).map_err(|e| format!("delete_channel: {e}"))?;
+        if !db_o
+            .get(&format!("community/channels/{channel}"))?
+            .is_null()
+        {
+            return Err("canal excluído continua lá".into());
+        }
+        let category = admin::create_category(&db_m, &moderator.uid, "categoria de teste")
+            .map_err(|e| format!("create_category: {e}"))?;
+        admin::rename_category(&db_m, &category, "categoria renomeada")
+            .map_err(|e| format!("rename_category: {e}"))?;
+        admin::delete_category(&db_m, &category).map_err(|e| format!("delete_category: {e}"))?;
+        step(
+            "canais e categorias: o administrador cria, edita e exclui o que vê; cargo e 'só o proprietário' só o dono",
+        );
+
+        // Aprovação já num cargo, revogação, sessão abandonada e exclusão do cargo.
+        admin(
+            "PUT",
+            &format!("community/requests/{}", newcomer.uid),
+            &json!({ "email": newcomer.email, "createdAt": 1 }),
+        )?;
+        denied(
+            admin::approve_member(&db_m, &newcomer.uid, &[]),
+            "administrador aprovar",
+        )?;
+        admin::approve_member(&db_o, &newcomer.uid, std::slice::from_ref(&role))
+            .map_err(|e| format!("approve_member: {e}"))?;
+        let state = owner_view(&db_o)?;
+        if state["approved"][&newcomer.uid] != true
+            || state["memberRoles"][&newcomer.uid][&role] != true
+            || !state["requests"][&newcomer.uid].is_null()
+        {
+            return Err(
+                format!("aprovação incompleta: {}", state["approved"][&newcomer.uid]).into(),
+            );
+        }
+        admin::revoke_member(
+            &db_o,
+            &newcomer.uid,
+            &std::collections::BTreeSet::from([role.clone()]),
+        )
+        .map_err(|e| format!("revoke_member: {e}"))?;
+        let state = owner_view(&db_o)?;
+        if !state["approved"][&newcomer.uid].is_null()
+            || !state["roleMembers"][&role][&newcomer.uid].is_null()
+        {
+            return Err("revogar não tirou aprovação e cargo".into());
+        }
+        admin(
+            "PUT",
+            "rooms/geral/members/sessao-abandonada",
+            &json!({ "joinedAt": 1, "app": "navegador" }),
+        )?;
+        admin::remove_room_session(&db_m, "geral", "sessao-abandonada")
+            .map_err(|e| format!("remove_room_session: {e}"))?;
+        let data = seen_by_owner.snapshot();
+        admin::delete_role(
+            &db_o,
+            &role,
+            &data.member_roles,
+            &data.category_roles,
+            &data.channel_roles,
+        )
+        .map_err(|e| format!("delete_role: {e}"))?;
+        let state = owner_view(&db_o)?;
+        if !state["roleDefs"][&role].is_null()
+            || !state["memberRoles"][&member.uid][&role].is_null()
+        {
+            return Err("excluir o cargo deixou sobras".into());
+        }
+        drop((seen_by_member, seen_by_owner));
+        step("aprovar já no cargo, revogar, limpar sessão abandonada e excluir cargo sem sobras");
+        Ok(())
+    })();
+    for uid in people {
+        for path in [
+            "community/approved",
+            "community/requests",
+            "community/roles",
+            "community/memberRoles",
+        ] {
+            let _ = admin("DELETE", &format!("{path}/{uid}"), &Json::Null);
+        }
+    }
+    for db in [db_o, db_m, db_x, db_n] {
+        db.close();
+    }
+    result
 }
 
 fn checks(
@@ -277,7 +503,7 @@ fn checks(
     // com o mesmo código, e cada mensagem é entregue uma vez e apagada do banco.
     let room_a = Room::join(db_a, &a.uid, "competitivo", "teste (nativo)", || {})?;
     let room_b = Room::join(db_b, &b.uid, "competitivo", "teste (nativo)", || {})?;
-    room_b.publish_stream("screen", "tela-de-b", true)?;
+    room_b.publish_stream("screen", "tela-de-b", true, "")?;
     let live_of_b = || {
         room_a
             .snapshot()
@@ -349,6 +575,54 @@ fn checks(
     }
     step("sinalização: live anunciada, oferta e resposta entregues uma vez e apagadas");
 
+    // Plateia e prévia, no formato do site: A avisa o que assiste (a própria live não conta), B vê;
+    // a prévia de B chega a A por leitura única e pela escuta dos cartões.
+    let key_b = format!("{}:screen", b.uid);
+    room_a.set_watching(&[key_b.clone(), format!("{}:screen", a.uid)]);
+    wait_until("B vê A na plateia", || {
+        room_b
+            .snapshot()
+            .watchers
+            .get(&key_b)
+            .is_some_and(|who| *who == vec![a.uid.clone()])
+    })?;
+    let raw = db_b.get(&format!("rooms/competitivo/watching/{}", a.uid))?;
+    if raw != json!({ b.uid.clone(): { "screen": true } }) {
+        return Err(format!("plateia fora do formato do site: {raw}").into());
+    }
+    let preview = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ==";
+    room_b.publish_preview("screen", preview)?;
+    if nimbo_core::room::load_previews(db_a, "competitivo", &b.uid)
+        .get("screen")
+        .map(String::as_str)
+        != Some(preview)
+    {
+        return Err("a prévia de B não chegou a A".into());
+    }
+    if room_b
+        .publish_preview("screen", "data:image/svg+xml;base64,PHN2Zz4=")
+        .is_ok()
+    {
+        return Err("prévia em formato não aceito foi gravada".into());
+    }
+    room_a.watch_previews(true);
+    wait_until("os cartões de A recebem a prévia", || {
+        room_a
+            .snapshot()
+            .previews
+            .get(&key_b)
+            .is_some_and(|data| data == preview)
+    })?;
+    room_a.watch_previews(false);
+    wait_until("sem cartões, a prévia sai da memória", || {
+        room_a.snapshot().previews.is_empty()
+    })?;
+    room_a.set_watching(&[]);
+    wait_until("A sai da plateia", || {
+        !room_b.snapshot().watchers.contains_key(&key_b)
+    })?;
+    step("plateia e prévia: gravadas no formato do site, lidas só quando pedidas");
+
     // Queda de quem transmite: o servidor tira a live, e ela é reanunciada quando a conexão volta.
     db_b.debug_drop_connection();
     wait_until("a live de B some na queda", || live_of_b().is_none())?;
@@ -358,10 +632,20 @@ fn checks(
     wait_until("B conta a reconexão", || room_b.snapshot().reconnects == 1)?;
     room_b.unpublish_stream("screen");
     wait_until("a live de B some ao ser retirada", || live_of_b().is_none())?;
-    room_b.publish_stream("screen", "tela-de-b-2", false)?;
+    let game = "Jogo de teste com um nome comprido demais para caber no limite do site";
+    room_b.publish_stream("screen", "tela-de-b-2", false, game)?;
     wait_until("a live nova de B aparece, sem som", || {
         live_of_b().is_some_and(|live| live.stream_id == "tela-de-b-2" && !live.sound)
     })?;
+    let live = live_of_b().ok_or("live de B sumiu")?;
+    let late = (db_a.server_now_ms() - live.started_at).abs();
+    if live.game.chars().count() != 48 || !game.starts_with(&live.game) || late > 5_000 {
+        return Err(format!(
+            "jogo ou início fora do esperado: {:?}, {late} ms",
+            live.game
+        )
+        .into());
+    }
     room_b.leave();
     wait_until("sair do canal tira a live", || live_of_b().is_none())?;
     room_a.leave();

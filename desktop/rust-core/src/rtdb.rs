@@ -251,6 +251,29 @@ impl Db {
     }
 }
 
+/// Chave nova para uma lista do banco, no formato do `push()` do Firebase: 8 caracteres com a hora
+/// (para as chaves saírem em ordem) e 12 ao acaso.
+pub fn push_id(now_ms: i64) -> String {
+    const CHARS: &[u8; 64] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+    let mut id = [0u8; 20];
+    let mut time = now_ms.max(0) as u64;
+    for slot in id[..8].iter_mut().rev() {
+        *slot = CHARS[(time % 64) as usize];
+        time /= 64;
+    }
+    let mut random = [0u8; 12];
+    if getrandom::fill(&mut random).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        random.copy_from_slice(&nanos.to_le_bytes()[..12]);
+    }
+    for (slot, byte) in id[8..].iter_mut().zip(random) {
+        *slot = CHARS[(byte % 64) as usize];
+    }
+    String::from_utf8_lossy(&id).into_owned()
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -612,7 +635,7 @@ impl Worker {
                 }
             }
             Cmd::Request { action, body, done } => {
-                if live && let Some(socket) = socket.as_deref_mut() {
+                if live && let Some(socket) = socket {
                     return self.request(socket, action, body, Pending::Request(done));
                 }
                 self.outbox.push_back(Queued {
@@ -846,13 +869,13 @@ impl Worker {
                 }
             }
             Some("s") => return Ok(Some(End::Lost)),
-            Some("p") => {
+            Some("p")
                 if !self.write(
                     socket,
                     json!({ "t": "c", "d": { "t": "o", "d": {} } }).to_string(),
-                ) {
-                    return Err(());
-                }
+                ) =>
+            {
+                return Err(());
             }
             _ => {}
         }

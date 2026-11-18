@@ -2,6 +2,7 @@
 //! É a base do app nativo (`desktop/rust-ui`); o site continua usando o SDK do Firebase.
 //! Ver `docs/rust-app.md` (seção "App full Rust") para o plano e o estado de cada etapa.
 
+pub mod admin;
 pub mod auth;
 pub mod community;
 pub mod config;
