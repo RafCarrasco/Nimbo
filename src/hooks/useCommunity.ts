@@ -20,6 +20,7 @@ import {
   watchRoleDefs,
   watchRoleMembers,
   type AccessData,
+  type IndexedWatch,
   type AccessLevel,
   type Category,
   type Channel,
@@ -65,14 +66,12 @@ export function useCommunity(uid: string): CommunityData {
   const [profiles, setProfiles] = useState<Record<string, Profile> | null>(null);
   const [avatars, setAvatars] = useState<Record<string, string>>({});
   const [netAdmins, setNetAdmins] = useState<Flags>({});
-  // Proprietário: árvores inteiras. Demais: os próprios cargos e os grupos de que fazem parte.
+  // Proprietário: árvores inteiras. Demais: só os próprios cargos (ids).
   const [allRoles, setAllRoles] = useState<Record<string, CommunityRole>>({});
   const [allDefs, setAllDefs] = useState<Record<string, RoleDef>>({});
   const [allMemberRoles, setAllMemberRoles] = useState<Record<string, Flags> | null>(null);
   const [roleMembers, setRoleMembers] = useState<Record<string, Flags> | null>(null);
   const [ownRoles, setOwnRoles] = useState<Flags>({});
-  const [groupDefs, setGroupDefs] = useState<Record<string, RoleDef>>({});
-  const [groupMembers, setGroupMembers] = useState<Record<string, Flags>>({});
 
   useEffect(() => {
     const unsubs = [
@@ -106,17 +105,6 @@ export function useCommunity(uid: string): CommunityData {
     return () => unsubs.forEach((u) => u());
   }, [uid, level, owner]);
 
-  // Quem não é proprietário: nome, cor e colegas de cada cargo que tem (e só desses).
-  const ownRoleIds = Object.keys(ownRoles).sort().join('|');
-  useEffect(() => {
-    if (level === undefined || owner) return;
-    const unsubs = (ownRoleIds ? ownRoleIds.split('|') : []).flatMap((id) => [
-      watchOne<RoleDef>(`community/roleDefs/${id}`, (v) => setGroupDefs((old) => patch(old, id, v))),
-      watchOne<Flags>(`community/roleMembers/${id}`, (v) => setGroupMembers((old) => patch(old, id, v))),
-    ]);
-    return () => unsubs.forEach((u) => u());
-  }, [level, owner, ownRoleIds]);
-
   // Proprietário: mantém o índice cargo → pessoas igual aos cargos de cada um.
   useEffect(() => {
     if (owner && allMemberRoles && roleMembers)
@@ -127,19 +115,13 @@ export function useCommunity(uid: string): CommunityData {
     () => (owner ? allRoles : level ? { [uid]: level } : {}),
     [owner, allRoles, level, uid],
   );
-  // Um cargo perdido pode deixar dados antigos guardados: só valem os dos cargos que a pessoa tem agora.
-  const roleDefs = useMemo(
-    () => (owner ? allDefs : Object.fromEntries(Object.entries(groupDefs).filter(([id]) => ownRoles[id]))),
-    [owner, allDefs, groupDefs, ownRoles],
-  );
+  // Nomes, cores e colegas dos cargos: só o proprietário lê (regras do banco). Os demais sabem só os
+  // próprios cargos (ids), que servem para a interface decidir o que mostrar, e nada disso aparece na tela.
+  const roleDefs = useMemo(() => (owner ? allDefs : {}), [owner, allDefs]);
   const memberRoles = useMemo(() => {
     if (owner) return allMemberRoles || {};
-    const all: Record<string, Flags> = Object.keys(ownRoles).length ? { [uid]: ownRoles } : {};
-    for (const [roleId, members] of Object.entries(groupMembers))
-      if (ownRoles[roleId])
-        for (const member of Object.keys(members)) all[member] = { ...all[member], [roleId]: true };
-    return all;
-  }, [owner, allMemberRoles, ownRoles, groupMembers, uid]);
+    return Object.keys(ownRoles).length ? { [uid]: ownRoles } : {};
+  }, [owner, allMemberRoles, ownRoles, uid]);
 
   // O servidor só entrega as categorias e canais que a pessoa pode ver, e um pedido recusado não é
   // refeito sozinho. Quando cargos ou permissões mudam, as leituras são refeitas para refletir o
@@ -152,11 +134,20 @@ export function useCommunity(uid: string): CommunityData {
     channelRoles,
     categoryRoles,
   ]);
+  const indexed = useRef<IndexedWatch[]>([]);
   useEffect(() => {
     if (level === undefined) return;
-    const unsubs = [watchChannels(setChannels), watchCategories(setCategories)];
-    return () => unsubs.forEach((u) => u());
-  }, [permissions, level]);
+    const watches = [watchChannels(setChannels), watchCategories(setCategories)];
+    indexed.current = watches;
+    return () => {
+      indexed.current = [];
+      watches.forEach((w) => w.off());
+    };
+  }, [uid, level]);
+  // Mudou alguma permissão: pede de novo só o que tinha sido recusado, sem derrubar o resto.
+  useEffect(() => {
+    indexed.current.forEach((w) => w.retry());
+  }, [permissions]);
 
   return useMemo(
     () => ({

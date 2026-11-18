@@ -212,7 +212,6 @@
       "roleDefs": {
         ".read": "((auth != null && auth.token.firebase.sign_in_provider === 'google.com' && root.child('community/approved').child(auth.uid).val() === true) && root.child('community/roles').child(auth.uid).val() === 'owner')",
         "$roleId": {
-          ".read": "((auth != null && auth.token.firebase.sign_in_provider === 'google.com' && root.child('community/approved').child(auth.uid).val() === true) && root.child('community/memberRoles').child(auth.uid).child($roleId).exists())",
           ".write": "((auth != null && auth.token.firebase.sign_in_provider === 'google.com' && root.child('community/approved').child(auth.uid).val() === true) && root.child('community/roles').child(auth.uid).val() === 'owner')",
           ".validate": "(newData.hasChildren(['name','color','createdAt']) && (newData.child('name').isString() && newData.child('name').val().length >= 2 && newData.child('name').val().length <= 24) && newData.child('color').isString() && newData.child('color').val().matches(/^#[0-9a-fA-F]{6}$/) && newData.child('createdAt').isNumber())",
           "name": {
@@ -242,7 +241,6 @@
       "roleMembers": {
         ".read": "((auth != null && auth.token.firebase.sign_in_provider === 'google.com' && root.child('community/approved').child(auth.uid).val() === true) && root.child('community/roles').child(auth.uid).val() === 'owner')",
         "$roleId": {
-          ".read": "((auth != null && auth.token.firebase.sign_in_provider === 'google.com' && root.child('community/approved').child(auth.uid).val() === true) && root.child('community/memberRoles').child(auth.uid).child($roleId).exists())",
           ".write": "((auth != null && auth.token.firebase.sign_in_provider === 'google.com' && root.child('community/approved').child(auth.uid).val() === true) && root.child('community/roles').child(auth.uid).val() === 'owner')",
           "$uid": {
             ".validate": "newData.val() === true"

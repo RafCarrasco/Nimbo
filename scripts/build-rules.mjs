@@ -380,10 +380,11 @@ const rules = {
       },
       // Nome e cor de um cargo: só quem tem o cargo (e o proprietário) lê. Quem é de um grupo não
       // descobre o nome dos outros grupos.
+      // Nomes e cores dos cargos: só o proprietário. Quem tem um cargo não sabe nem o nome dele, e assim
+      // ninguém descobre que existem outros grupos (pedido do dono em 17/11/2026).
       roleDefs: {
         '.read': approvedOwner,
         $roleId: {
-          '.read': and(approved, hasRole('$roleId')),
           '.write': approvedOwner,
           '.validate': and(
             "newData.hasChildren(['name','color','createdAt'])",
@@ -409,10 +410,10 @@ const rules = {
       },
       // O mesmo dado ao contrário (cargo → pessoas), gravado junto pelo proprietário: quem tem o cargo
       // vê os colegas daquele grupo (a cor do nome), e só daquele.
+      // Quem tem cada cargo: só o proprietário (ver roleDefs).
       roleMembers: {
         '.read': approvedOwner,
         $roleId: {
-          '.read': and(approved, hasRole('$roleId')),
           '.write': approvedOwner,
           $uid: { '.validate': 'newData.val() === true' },
         },

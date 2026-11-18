@@ -9,7 +9,6 @@ import {
   Settings,
   Tag,
   Trash2,
-  Users,
   UserX,
   X,
 } from 'lucide-react';
@@ -18,11 +17,7 @@ import { NetworkSettings } from './NetworkSettings';
 import {
   approveMember,
   assignRole,
-  createRole,
-  deleteRole,
   setMemberRole,
-  updateRole,
-  ROLE_COLORS,
   createCategory,
   deleteCategory,
   deleteChannel,
@@ -42,10 +37,13 @@ import {
   type CommunityRole,
 } from '../community';
 import type { CommunityData } from '../hooks/useCommunity';
+import type { SettingsTarget } from './ChannelSettings';
+import { RoleEditor } from './RoleEditor';
 import { useDialogs } from '../ui/Modal';
 import { useToast } from '../ui/Toast';
 
-type Tab = 'members' | 'requests' | 'roles' | 'channels' | 'network';
+export type AdminTab = 'members' | 'requests' | 'roles' | 'channels' | 'network';
+type Tab = AdminTab;
 const nameRule = (v: string) =>
   v.trim().length < 2 || v.trim().length > 32 ? 'Use de 2 a 32 caracteres.' : '';
 
@@ -53,24 +51,27 @@ export function AdminPanel({
   uid,
   data,
   onClose,
-  onPermission,
+  onSettings,
+  onMemberMenu,
   onCreateChannel,
+  initialTab,
 }: {
   uid: string;
   data: CommunityData;
   onClose: () => void;
-  onPermission: (target: { kind: 'category' | 'channel'; id: string }) => void;
+  onSettings: (target: SettingsTarget) => void;
+  // Menu da pessoa (o mesmo do botão direito na barra lateral).
+  onMemberMenu: (event: React.MouseEvent, memberId: string) => void;
   onCreateChannel: (categoryId: string) => void;
+  initialTab?: Tab;
 }) {
   const owner = data.roles[uid] === 'owner';
   const staff = isStaff(data.roles[uid] || 'member');
   const network = owner || Boolean(data.netAdmins[uid]);
-  const [tab, setTab] = useState<Tab>(owner ? 'requests' : staff ? 'channels' : 'network');
+  const [tab, setTab] = useState<Tab>(initialTab ?? (owner ? 'requests' : staff ? 'channels' : 'network'));
   const [requests, setRequests] = useState<Record<string, AccessRequest>>({});
   const [approved, setApproved] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState('');
-  // Cargo com a lista de pessoas aberta, na aba Cargos.
-  const [openRole, setOpenRole] = useState('');
   // Grupos marcados em cada solicitação, para aprovar a pessoa já dentro deles.
   const [picked, setPicked] = useState<Record<string, Record<string, true>>>({});
   const toast = useToast();
@@ -105,26 +106,9 @@ export function AdminPanel({
     ...(network ? ([['network', 'Rede']] as Array<[Tab, string]>) : []),
   ];
   const roleEntries = Object.entries(data.roleDefs).sort((a, b) => a[1].createdAt - b[1].createdAt);
-  const nextColor = ROLE_COLORS[roleEntries.length % ROLE_COLORS.length];
-  const roleNameRule = (v: string) =>
-    v.trim().length < 2 || v.trim().length > 24 ? 'Use de 2 a 24 caracteres.' : '';
   const nameOfMember = (id: string) =>
     data.profiles[id]?.displayName || requests[id]?.email || 'Ainda sem nickname';
   const sortedMembers = [...memberIds].sort((a, b) => nameOfMember(a).localeCompare(nameOfMember(b)));
-  // Onde um cargo está marcado (categorias e canais que ele libera).
-  const usedIn = (roleId: string) => [
-    ...Object.entries(data.categoryRoles)
-      .filter(([, list]) => list.includes(roleId))
-      .map(([id]) => data.categories[id]?.name)
-      .filter(Boolean)
-      .map((name) => 'categoria ' + name),
-    ...Object.entries(data.channelRoles)
-      .filter(([, list]) => list.includes(roleId))
-      .map(([id]) => data.channels[id]?.name)
-      .filter(Boolean)
-      .map((name) => 'canal ' + name),
-  ];
-
   return (
     <section className="admin">
       <header className="admin-head">
@@ -249,7 +233,7 @@ export function AdminPanel({
             const name = nameOfMember(id);
             const sees = visibleChannelNames(id, data);
             return (
-              <div className="admin-row" key={id}>
+              <div className="admin-row" key={id} onContextMenu={(e) => onMemberMenu(e, id)}>
                 <Avatar photo={data.avatars[id]} name={name} />
                 <div className="admin-row-text">
                   <strong>
@@ -354,145 +338,11 @@ export function AdminPanel({
       {tab === 'network' && network && <NetworkSettings uid={uid} owner={owner} data={data} />}
 
       {tab === 'roles' && owner && (
-        <div className="admin-list">
-          <p className="muted admin-note">
-            Cargos são grupos de amigos que não se enxergam. <strong>1.</strong> Crie o cargo.{' '}
-            <strong>2.</strong> Em Pessoas, marque quem faz parte. <strong>3.</strong> Na engrenagem de uma
-            categoria ou canal, marque o cargo: só quem tem um dos cargos marcados vê aquela parte. Quem é de
-            um grupo não vê os canais, as pessoas nem o nome do outro. Só você vê tudo.
-          </p>
-          <button
-            className="button ghost align-start"
-            onClick={async () => {
-              const name = await dialogs.prompt({
-                title: 'Novo cargo',
-                label: 'Nome (ex.: Faculdade, Trampo)',
-                validate: roleNameRule,
-                confirmLabel: 'Criar',
-              });
-              if (name)
-                await run(
-                  'newrole',
-                  async () => setOpenRole(await createRole(name, nextColor)),
-                  'Cargo criado. Agora marque quem faz parte.',
-                );
-            }}
-          >
-            <Tag size={16} /> Novo cargo
-          </button>
-          {roleEntries.length === 0 && <p className="empty muted">Nenhum cargo criado ainda.</p>}
-          {roleEntries.map(([roleId, def]) => {
-            const count = Object.values(data.memberRoles).filter((r) => r[roleId]).length;
-            const nextIndex = (ROLE_COLORS.indexOf(def.color) + 1) % ROLE_COLORS.length;
-            const places = usedIn(roleId);
-            const open = openRole === roleId;
-            return (
-              <div className="role-card" key={roleId}>
-                <div className="admin-row">
-                  <button
-                    className="role-swatch"
-                    style={{ background: def.color }}
-                    title="Trocar cor"
-                    aria-label={'Trocar cor de ' + def.name}
-                    disabled={busy !== ''}
-                    onClick={() =>
-                      void run(
-                        'color',
-                        () => updateRole(roleId, { color: ROLE_COLORS[nextIndex] }),
-                        'Cor atualizada',
-                      )
-                    }
-                  />
-                  <div className="admin-row-text">
-                    <strong style={{ color: def.color }}>{def.name}</strong>
-                    <small className="muted">
-                      {count === 1 ? '1 pessoa' : `${count} pessoas`} ·{' '}
-                      {places.length
-                        ? 'libera ' + places.join(', ')
-                        : 'ainda não marcado em nenhuma categoria ou canal'}
-                    </small>
-                  </div>
-                  <button
-                    className={'button ghost' + (open ? ' on' : '')}
-                    aria-expanded={open}
-                    onClick={() => setOpenRole(open ? '' : roleId)}
-                  >
-                    <Users size={16} /> Pessoas
-                  </button>
-                  <button
-                    className="icon-button tiny"
-                    title="Renomear"
-                    aria-label={'Renomear ' + def.name}
-                    onClick={async () => {
-                      const name = await dialogs.prompt({
-                        title: 'Renomear cargo',
-                        label: 'Nome',
-                        initial: def.name,
-                        validate: roleNameRule,
-                      });
-                      if (name) await run('rrole', () => updateRole(roleId, { name }), 'Cargo atualizado');
-                    }}
-                  >
-                    <Pencil size={14} />
-                  </button>
-                  <button
-                    className="icon-button tiny danger"
-                    title="Excluir"
-                    aria-label={'Excluir ' + def.name}
-                    onClick={async () => {
-                      const ok = await dialogs.confirm({
-                        title: 'Excluir cargo?',
-                        message: `${def.name} sai de todas as pessoas, categorias e canais. Áreas que só esse cargo via passam a ser visíveis para todos.`,
-                        confirmLabel: 'Excluir',
-                        danger: true,
-                      });
-                      if (ok)
-                        await run(
-                          'drole',
-                          () => deleteRole(roleId, data.memberRoles, data.categoryRoles, data.channelRoles),
-                          'Cargo excluído',
-                        );
-                    }}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-                {open && (
-                  <div className="role-people">
-                    <small className="muted">Clique para colocar ou tirar de {def.name}.</small>
-                    <div className="role-chips">
-                      {sortedMembers
-                        .filter((id) => (data.roles[id] || 'member') !== 'owner')
-                        .map((id) => {
-                          const on = Boolean(data.memberRoles[id]?.[roleId]);
-                          const name = nameOfMember(id);
-                          return (
-                            <button
-                              key={id}
-                              className={'role-chip' + (on ? ' on' : '')}
-                              style={{ '--role': def.color } as React.CSSProperties}
-                              aria-pressed={on}
-                              disabled={busy !== ''}
-                              onClick={() =>
-                                void run(
-                                  'mrole:' + id,
-                                  () => setMemberRole(id, roleId, !on),
-                                  on ? `${def.name} removido de ${name}` : `${name} agora é ${def.name}`,
-                                )
-                              }
-                            >
-                              <span className="role-dot" />
-                              {name}
-                            </button>
-                          );
-                        })}
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
+        <RoleEditor
+          data={data}
+          members={sortedMembers.filter((id) => (data.roles[id] || 'member') !== 'owner')}
+          nameOf={nameOfMember}
+        />
       )}
 
       {tab === 'channels' && staff && (
@@ -534,7 +384,7 @@ export function AdminPanel({
                         className="icon-button tiny"
                         title="Permissões"
                         aria-label={'Permissões de ' + category.name}
-                        onClick={() => onPermission({ kind: 'category', id: categoryId })}
+                        onClick={() => onSettings({ kind: 'category', id: categoryId })}
                       >
                         <Settings size={14} />
                       </button>
@@ -613,7 +463,7 @@ export function AdminPanel({
                         className="icon-button tiny"
                         title="Permissões"
                         aria-label={'Permissões de ' + channel.name}
-                        onClick={() => onPermission({ kind: 'channel', id })}
+                        onClick={() => onSettings({ kind: 'channel', id })}
                       >
                         <Settings size={14} />
                       </button>

@@ -559,14 +559,14 @@ describe('cargos personalizados (grupos)', () => {
     await assertFails(get(ref(member(), 'community/memberRoles')));
     await assertFails(get(ref(admin(), 'community/memberRoles')));
     await assertSucceeds(get(ref(owner(), 'community/memberRoles')));
-    // Colegas do próprio grupo, sim; do outro, não.
-    await assertSucceeds(get(ref(member(), 'community/roleMembers/faculdade')));
+    // Quem tem cada cargo: só o proprietário, nem os colegas do mesmo grupo.
+    await assertFails(get(ref(member(), 'community/roleMembers/faculdade')));
     await assertFails(get(ref(member(), 'community/roleMembers/trampo')));
     await assertFails(get(ref(member(), 'community/roleMembers')));
     await assertFails(get(ref(admin(), 'community/roleMembers/faculdade')));
     await assertSucceeds(get(ref(owner(), 'community/roleMembers')));
-    // Nome e cor do cargo: só de quem tem.
-    await assertSucceeds(get(ref(member(), 'community/roleDefs/faculdade')));
+    // Nome e cor do cargo: só o proprietário, nem quem tem o cargo (ninguém descobre que há outros grupos).
+    await assertFails(get(ref(member(), 'community/roleDefs/faculdade')));
     await assertFails(get(ref(member(), 'community/roleDefs/trampo')));
     await assertFails(get(ref(member(), 'community/roleDefs')));
     await assertFails(get(ref(admin(), 'community/roleDefs')));
@@ -597,7 +597,10 @@ describe('cargos personalizados (grupos)', () => {
         'roleMembers/trampo/member': true,
       }),
     );
-    await assertSucceeds(get(ref(member(), 'community/roleMembers/trampo')));
+    // Ganhar o cargo não dá acesso à lista de quem tem: continua só do proprietário.
+    await assertFails(get(ref(member(), 'community/roleMembers/trampo')));
+    await assertSucceeds(get(ref(member(), 'community/memberRoles/member')));
+    await assertSucceeds(get(ref(owner(), 'community/roleMembers/trampo')));
     await assertSucceeds(
       update(ref(owner(), 'community'), { 'roleDefs/trampo': null, 'roleMembers/trampo': null }),
     );
