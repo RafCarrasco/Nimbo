@@ -12,6 +12,7 @@ import { CaptureCancelled } from '../lib/errors';
 import { newer } from '../lib/changelog';
 import type { Broadcasts } from './room';
 import type { AudioMode, StreamKind } from './capture';
+import { V6_AFTER_MS, v4First } from './iceFamily';
 
 export type NativeQuality = { fps: number; bitrate: number; maxHeight: number };
 // nonce: liga a resposta à oferta que a pediu. Sem isso, com duas ofertas pendentes (nova tentativa),
@@ -270,6 +271,10 @@ type Incoming = {
   timer: ReturnType<typeof setTimeout>;
   // Espera depois de "desconectado" antes de refazer a conexão.
   lost?: ReturnType<typeof setTimeout>;
+  // Espera antes de oferecer os endereços IPv6 do transmissor (ver iceFamily.ts).
+  v6?: ReturnType<typeof setTimeout>;
+  // Anota um acontecimento desta tentativa, com o tempo desde o começo, para o diagnóstico.
+  note: (text: string) => void;
 };
 
 type Deps = {
@@ -365,6 +370,7 @@ export class NativeReceiver {
       attempt,
       offered: 0,
       ending: false,
+      note,
       timer: setTimeout(() => void retry('sem conexão no prazo'), CONNECT_MS),
     };
     this.conns.set(key, conn);
@@ -412,7 +418,16 @@ export class NativeReceiver {
     if (!conn || conn.nonce !== nonce || conn.pc.signalingState !== 'have-local-offer') return;
     conn.attempt.respostaMs = Math.round(performance.now() - conn.offered);
     conn.attempt.resposta = candidateSummary(sdp.sdp);
-    await conn.pc.setRemoteDescription(sdp);
+    // IPv4 primeiro: os endereços IPv6 do transmissor só entram daqui a pouco (ver iceFamily.ts).
+    const { sdp: first, later } = v4First(sdp.sdp || '');
+    const pc = conn.pc;
+    await pc.setRemoteDescription({ type: 'answer', sdp: first });
+    if (!later.length) return;
+    conn.v6 = setTimeout(() => {
+      if (this.conns.get(`${uid}:${kind}`)?.pc !== pc || pc.connectionState === 'connected') return;
+      conn.note('IPv6 oferecido');
+      for (const candidate of later) void pc.addIceCandidate(candidate).catch(() => {});
+    }, V6_AFTER_MS);
   }
 
   // Resumo dos testes de caminho de uma conexão: quais pares foram tentados e no que deram.
@@ -503,6 +518,7 @@ export class NativeReceiver {
     if (!conn) return;
     clearTimeout(conn.timer);
     clearTimeout(conn.lost);
+    clearTimeout(conn.v6);
     this.conns.delete(key);
     conn.pc.onconnectionstatechange = null;
     conn.pc.close();

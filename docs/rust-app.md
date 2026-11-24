@@ -241,6 +241,37 @@ Não resolve: os **dois** lados atrás de roteadores assim (nenhuma ordem serve;
 e NAT simétrico. Não medido: a correção rodando no site entre duas casas de verdade (a bancada mediu o
 mecanismo com uma página de teste, não o `room.ts`), Firefox e Safari, e celular.
 
+### Assistir live do app: IPv4 primeiro, IPv6 depois (site, 23/11/2026)
+
+Relato do dono em 23/11/2026: com o roteador dele em modo AP, o modem da operadora voltou a ser o único
+roteador da casa e ele não conseguia assistir a live de nenhum amigo. No diagnóstico da live, todos os
+caminhos com pedidos enviados e nenhuma resposta, em IPv4 e IPv6.
+
+O que foi medido, do PC dele, contra a live de um amigo (motor 0.5.7), com um participante de teste no canal:
+
+| Espectador de teste | Resultado |
+| --- | --- |
+| Só pacotes UDP, IPv4, mandando assim que a resposta chega (7 rodadas) | 162 pedidos, 162 respostas |
+| Chromium, resposta aplicada inteira (como o site fazia), 3 rodadas | 18 pedidos, 0 respostas em todos os caminhos |
+| Chromium, resposta sem os endereços IPv6 do transmissor | conectou em ~0,2 s, com vídeo |
+| Chromium, resposta sem o endereço privado do transmissor (IPv6 mantido) | não conectou |
+| Chromium, função nova do site (IPv6 oferecido 1 s depois), 4 rodadas | conectou em ~0,2 s, mais de 100 quadros |
+
+- **Causa:** o navegador testa os pares IPv6 antes do endereço público IPv4 (que sai ~0,5 s depois, medido).
+  Na rede dele o IPv6 tem endereço e sai, mas a volta não chega. O pacote IPv6 chega ao motor de quem
+  transmite, que encerra o silêncio inicial (`Quiet`) para **todos** os caminhos e passa a mandar pelo
+  IPv4 com vida normal. Esse pacote IPv4 bate no modem de quem assiste antes do primeiro pacote IPv4 de
+  dentro, e o modem mata a conversa.
+- **Correção no site** (`src/live/iceFamily.ts` + `NativeReceiver.onAnswer`): a resposta é aplicada sem os
+  endereços IPv6 do transmissor; eles são oferecidos ao navegador 1 s depois, se ainda não conectou. Vale
+  para quem assiste, com qualquer versão do app de quem transmite. Quem só conecta por IPv6 espera 1 s a mais.
+- **Falta no motor:** o silêncio deveria acabar por caminho (um pacote IPv6 não libera o IPv4). Enquanto
+  isso, quem assiste por um site antigo, ou pelo app nativo, continua com a falha.
+
+Descartado por medição no mesmo dia: NAT do amigo (porta estável nos três servidores STUN), distância curta
+entre as casas (mais de 5 saltos), duas portas anunciadas com uma só em uso, e travamento do motor ao
+aceitar a oferta (17 ms com o motor local). O modem dele não aceita UPnP nem NAT-PMP.
+
 ### Qualidade com rede apertada (0.5.5)
 
 Bancada de 15/11/2026: janela de teste com movimento fora da tela (1080p, ~48 quadros por segundo), o servidor
