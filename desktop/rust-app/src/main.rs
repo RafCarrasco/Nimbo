@@ -18,6 +18,7 @@ mod bridge;
 mod login;
 mod media;
 mod network;
+mod offline;
 mod selftest;
 mod sources;
 mod update;
@@ -78,6 +79,8 @@ fn main() -> ExitCode {
         }))
         .plugin(update::updater())
         .plugin(update::plugin())
+        // Tela do app para quando o site não abre (offline.rs).
+        .register_uri_scheme_protocol(offline::SCHEME, offline::serve)
         .manage(shell)
         .manage(media::Media::default())
         .manage(sources::Sources::default())
@@ -156,11 +159,12 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
     .disable_drag_drop_handler()
     .additional_browser_args(BROWSER_ARGS)
     .initialization_script(bridge::script(&origin, &app.package_info().version))
-    // A janela nunca sai do Nimbo; link para fora abre no navegador do sistema.
+    // A janela nunca sai do Nimbo (ou da tela sem conexão do próprio app); link para fora abre
+    // no navegador do sistema.
     .on_navigation({
         let origin = origin.clone();
         move |url| {
-            let stays = stays_in_app(url, &origin);
+            let stays = stays_in_window(url, &origin);
             if !stays {
                 open_in_browser(url);
             }
@@ -192,6 +196,8 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
     let window = window.build()?;
     // Lives pelo navegador embutido com os mesmos caminhos de rede do app antigo (ver network.rs).
     network::open_paths(&window, origin.ascii_serialization());
+    // Site fora do ar ou sem internet: a tela do Nimbo no lugar da página de erro do navegador.
+    offline::watch(&window);
     Ok(())
 }
 
@@ -226,6 +232,11 @@ fn valid_identifier(identifier: &str) -> bool {
         && identifier
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// O que a janela aceita carregar: o Nimbo e a tela sem conexão do próprio app.
+fn stays_in_window(url: &Url, app: &Origin) -> bool {
+    stays_in_app(url, app) || offline::is_page(url)
 }
 
 /// A janela só navega dentro da origem do Nimbo.
@@ -290,6 +301,25 @@ mod tests {
             "about:blank",
             "data:text/html,oi",
             "file:///C:/Windows/win.ini",
+        ] {
+            assert!(!stays(outside), "{outside}");
+        }
+    }
+
+    #[test]
+    fn the_window_also_accepts_the_apps_own_offline_screen() {
+        let app = Url::parse(PRODUCTION_URL).unwrap().origin();
+        let stays = |url: &str| stays_in_window(&Url::parse(url).unwrap(), &app);
+        assert!(stays("https://golive-ad118.web.app/canal/abc"));
+        assert!(stays("http://nimbo-offline.localhost/"));
+        assert!(stays("http://nimbo-offline.localhost/#falha"));
+        for outside in [
+            "https://evil.invalid/",
+            "http://nimbo-offline.localhost/outra",
+            "http://nimbo-offline.localhost.evil.invalid/",
+            "https://nimbo-offline.localhost/",
+            "http://tauri.localhost/",
+            "about:blank",
         ] {
             assert!(!stays(outside), "{outside}");
         }
